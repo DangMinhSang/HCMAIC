@@ -1,0 +1,21 @@
+# Large AIC assets are attached as Kaggle inputs; never commit or download them.
+*.npy
+*.mp4
+*.jpg
+*.jpeg
+data/
+datasets/
+input/
+
+# Runtime/model caches
+.cache/
+clip-cache/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local environment and editor files
+.venv/
+.env
+.DS_Store
+.vscode/
