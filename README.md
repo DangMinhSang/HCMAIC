@@ -12,6 +12,7 @@ Web demo cho vòng sơ tuyển AIC 2026, bám theo ba dạng truy vấn trong t�
 2. Tính cosine similarity trực tiếp trên toàn bộ 873 file feature bằng `numpy.memmap`; không làm giảm dữ liệu, không tạo bản sao index lớn.
 3. Tự nhận diện Việt/Anh, dịch tiếng Việt sang tiếng Anh cho CLIP khi dịch vụ sẵn sàng, rồi prompt ensemble.
 4. Rerank nhẹ bằng YouTube metadata/object labels và loại các keyframe quá sát nhau để tăng độ phủ cho tối đa 100 đáp án.
+5. OCR index tùy chọn: OCR keyframe một lần, nạp inverted index text vào RAM, ưu tiên biển báo/subtitle có chữ khớp truy vấn.
 
 ## Không tải dataset
 
@@ -36,6 +37,12 @@ Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần �
 2. Upload/mở `run_kaggle.ipynb`, bật Internet lần đầu rồi Run all.
 3. Mở URL dashboard được in ở cell cuối. Chọn KIS, Q&A hoặc TRAKE; mỗi tab chỉ có một ô truy vấn, hỗ trợ Việt/Anh tự động.
 4. Chọn các keyframe muốn nộp trong lưới ảnh, sau đó bấm **Xuất CSV**. Tab Q&A dùng ViLT để đề xuất answer; hãy kiểm tra keyframe trước khi nộp.
+
+### OCR cho biển báo và chữ trong video
+
+Để truy vấn như “biển cảnh báo sạt lở nguy hiểm” ưu tiên ảnh có đúng nội dung chữ thay vì chỉ cảnh sạt lở, đặt `BUILD_OCR_INDEX = True` trong notebook. Cell này dùng PaddleOCR để tạo một file text-only `aic_ocr_index.jsonl.gz`; dashboard nạp file đó vào RAM khi khởi động. Query không chạy OCR trên ảnh và không tải/copy AIC dataset. Một từ điển nhỏ cho biển báo Việt–Anh (ví dụ `dangerous landslide warning` ↔ `cảnh báo sạt lở nguy hiểm`) cũng chạy hoàn toàn trong RAM.
+
+Pre-OCR toàn bộ keyframe có thể mất đáng kể thời gian. Sau khi hoàn tất, lưu phiên bản Kaggle có file index hoặc đính kèm index ở lần chạy sau, rồi đặt `AIC_OCR_INDEX` trỏ tới file đó. Notebook cũng đặt `AIC_PRELOAD_FEATURES=1`, giữ feature CLIP đã chuẩn hóa trong RAM để giảm thời gian query lặp lại mà không ghi cache feature ra đĩa.
 
 Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount khác bố cục chuẩn, đặt các biến: `AIC_FEATURES_DIR`, `AIC_MAPPING_DIR`, `AIC_KEYFRAMES_DIR`, `AIC_METADATA_DIR`, `AIC_OBJECTS_DIR`, `AIC_VIDEOS_DIR`.
 

@@ -6,6 +6,8 @@
 data/
 datasets/
 input/
+aic_ocr_index.jsonl
+aic_ocr_index.jsonl.gz
 
 # Runtime/model caches
 .cache/

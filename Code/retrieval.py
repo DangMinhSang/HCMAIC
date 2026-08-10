@@ -10,6 +10,7 @@ import csv
 import heapq
 import json
 import math
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -83,6 +84,8 @@ class SearchResult:
     video_path: str | None = None
     answer: str = ""
     qa_confidence: float = 0.0
+    ocr_score: float = 0.0
+    ocr_text: str = ""
 
     def caption(self) -> str:
         labels = ", ".join(self.object_labels[:6]) or "không có object metadata"
@@ -160,6 +163,11 @@ class AICRetrievalEngine:
         self._metadata_tokens: dict[str, Counter[str]] = {}
         self._metadata_ready = False
         self._vector_count: int | None = None
+        self._ram_features: np.ndarray | None = None
+        self._ram_offsets: np.ndarray | None = None
+        self._ram_video_ids: tuple[str, ...] = ()
+        if os.environ.get("AIC_PRELOAD_FEATURES", "0").lower() in {"1", "true", "yes"}:
+            self.preload_features()
 
     @classmethod
     def from_environment(cls, input_root: str | Path | None = None) -> "AICRetrievalEngine":
@@ -177,6 +185,68 @@ class AICRetrievalEngine:
                 int(np.load(path, mmap_mode="r").shape[0]) for path in self._features.values()
             )
         return self._vector_count
+
+    @property
+    def feature_cache_loaded(self) -> bool:
+        return self._ram_features is not None
+
+    def preload_features(self) -> None:
+        """Keep normalized CLIP vectors in RAM for low-latency repeated queries.
+
+        This reads the mounted ``.npy`` files once but never creates a copy on
+        disk. Batch 1 needs roughly 0.4 GB; larger releases can need around
+        1–2 GB, hence this is opt-in through ``AIC_PRELOAD_FEATURES=1``.
+        """
+        if self._ram_features is not None:
+            return
+        video_ids = tuple(self._features)
+        shapes = [np.load(self._features[video_id], mmap_mode="r").shape for video_id in video_ids]
+        if not shapes or any(len(shape) != 2 or shape[1] != 512 for shape in shapes):
+            raise ValueError("Không thể preload feature: cần các mảng CLIP 512 chiều.")
+        offsets = np.zeros(len(video_ids) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum([shape[0] for shape in shapes])
+        matrix = np.empty((int(offsets[-1]), 512), dtype=np.float32)
+        for index, video_id in enumerate(video_ids):
+            values = np.asarray(np.load(self._features[video_id]), dtype=np.float32)
+            values /= np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
+            matrix[offsets[index] : offsets[index + 1]] = values
+        self._ram_features = matrix
+        self._ram_offsets = offsets
+        self._ram_video_ids = video_ids
+
+    def _ram_candidates(
+        self,
+        query_vector: np.ndarray,
+        candidate_pool: int,
+        allowed_video_ids: set[str] | None,
+    ) -> list[_Candidate]:
+        """Top candidates from one matrix multiplication over RAM-resident CLIP."""
+        if self._ram_features is None or self._ram_offsets is None:
+            return []
+        if allowed_video_ids and len(allowed_video_ids) == 1:
+            video_id = next(iter(allowed_video_ids))
+            try:
+                video_position = self._ram_video_ids.index(video_id)
+            except ValueError:
+                return []
+            start, end = self._ram_offsets[video_position : video_position + 2]
+            scores = self._ram_features[start:end] @ query_vector
+            indices = self._top_indices(scores, min(len(scores), candidate_pool * 8))
+            return [_Candidate(video_id, int(index), float(scores[index])) for index in indices]
+
+        scores = self._ram_features @ query_vector
+        # NMS and max-per-video happen later, so retrieve a wider raw pool.
+        indices = self._top_indices(scores, min(len(scores), candidate_pool * 10))
+        output: list[_Candidate] = []
+        for index in indices:
+            video_position = int(np.searchsorted(self._ram_offsets, index, side="right") - 1)
+            video_id = self._ram_video_ids[video_position]
+            if allowed_video_ids is not None and video_id not in allowed_video_ids:
+                continue
+            output.append(
+                _Candidate(video_id, int(index - self._ram_offsets[video_position]), float(scores[index]))
+            )
+        return output
 
     def _mapping(self, video_id: str) -> list[FrameMapping]:
         cached = self._mapping_cache.get(video_id)
@@ -318,6 +388,41 @@ class AICRetrievalEngine:
             video_path=str(video) if video is not None else None,
         )
 
+    def result_for_keyframe(
+        self,
+        video_id: str,
+        keyframe_number: int,
+        *,
+        score: float = 0.0,
+        ocr_score: float = 0.0,
+        ocr_text: str = "",
+    ) -> SearchResult | None:
+        """Materialize an OCR hit with the official keyframe-to-frame mapping."""
+        frame = next(
+            (item for item in self._mapping(video_id) if item.keyframe_number == keyframe_number),
+            None,
+        )
+        if frame is None:
+            return None
+        metadata = self._metadata(video_id)
+        image = self.paths.image_path(video_id, keyframe_number)
+        video = self.paths.video_path(video_id)
+        return SearchResult(
+            rank=0,
+            video_id=video_id,
+            frame_id=frame.frame_id,
+            keyframe_number=keyframe_number,
+            pts_time=frame.pts_time,
+            visual_score=0.0,
+            metadata_score=0.0,
+            score=score,
+            title=metadata.title,
+            image_path=str(image) if image is not None else None,
+            video_path=str(video) if video is not None else None,
+            ocr_score=ocr_score,
+            ocr_text=ocr_text,
+        )
+
     def _raw_candidates(
         self,
         query_vector: np.ndarray,
@@ -325,6 +430,8 @@ class AICRetrievalEngine:
         allowed_video_ids: set[str] | None = None,
     ) -> list[_Candidate]:
         candidate_pool = max(400, top_k * 25)
+        if self._ram_features is not None:
+            return self._ram_candidates(query_vector, candidate_pool, allowed_video_ids)
         per_video_limit = max(30, min(100, candidate_pool // 8))
         all_candidates: list[_Candidate] = []
         for video_id, feature_path in self._features.items():

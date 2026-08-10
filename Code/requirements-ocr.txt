@@ -1,0 +1,3 @@
+# Optional: only needed by Code/build_ocr_index.py, not by normal querying.
+paddlepaddle>=3.0
+paddleocr>=2.8
