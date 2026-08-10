@@ -13,16 +13,16 @@ from data_paths import AICPaths
 
 
 def resolve_device(requested: str) -> str:
-    """Require the existing Kaggle PyTorch GPU for full-dataset OCR."""
+    """Require the isolated Paddle GPU runtime for full-dataset OCR."""
     try:
-        import torch  # type: ignore
+        import paddle  # type: ignore
     except ImportError as error:
-        raise RuntimeError("Không thể import PyTorch CUDA của Kaggle.") from error
+        raise RuntimeError("Không thể import PaddlePaddle trong OCR virtualenv.") from error
     device = "gpu:0" if requested == "auto" else requested
     if device.startswith("gpu"):
-        if not torch.cuda.is_available():
+        if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 1:
             raise RuntimeError(
-                "Không có PyTorch GPU. Bật Accelerator = GPU trong Kaggle; "
+                "Không có Paddle GPU. Bật Accelerator = GPU trong Kaggle; "
                 "không chạy pre-OCR full dataset bằng CPU. "
                 "Chỉ dùng `--device cpu` cho smoke test nhỏ."
             )
@@ -31,33 +31,44 @@ def resolve_device(requested: str) -> str:
 
 def create_reader(language: str, device: str):
     try:
-        import easyocr  # type: ignore
+        from paddleocr import PaddleOCR  # type: ignore
     except ImportError as error:
         raise RuntimeError(
-            "Thiếu EasyOCR. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index. "
+            "Thiếu PaddleOCR trong OCR virtualenv. "
             "Lỗi gốc: "
             f"{error}"
         ) from error
-    # EasyOCR's Vietnamese model can be paired with English, which is useful
-    # for road signs, TV overlays, and imported footage in the same keyframe.
-    languages = ["vi", "en"] if language == "vi" else [language, "en"]
-    return easyocr.Reader(languages, gpu=device.startswith("gpu"), verbose=False)
+    # PaddleOCR 2.9's compact API does not import PaddleX/ModelScope/Torch.
+    # A larger recognition batch keeps GPU busy when a frame contains many
+    # subtitle/sign text regions, while preserving Vietnamese accuracy.
+    return PaddleOCR(
+        lang=language,
+        use_gpu=device.startswith("gpu"),
+        use_angle_cls=False,
+        rec_batch_num=int(os.environ.get("AIC_OCR_REC_BATCH", "32")),
+        show_log=False,
+    )
 
 
 def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
-    """Extract EasyOCR lines as (box, text, confidence) tuples."""
-    lines = [
-        str(text).strip()
-        for _box, text, confidence in reader.readtext(str(image_path), detail=1, paragraph=False)
-        if str(text).strip() and float(confidence) >= minimum_confidence
-    ]
+    """Extract legacy PaddleOCR lines as (polygon, (text, confidence))."""
+    output = reader.ocr(str(image_path), cls=False)
+    lines: list[str] = []
+    for page in output or []:
+        for item in page or []:
+            try:
+                text, confidence = item[1]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if str(text).strip() and float(confidence) >= minimum_confidence:
+                lines.append(str(text).strip())
     return " ".join(dict.fromkeys(lines))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pre-compute a text-only OCR index for mounted AIC keyframes")
     parser.add_argument("--output", type=Path, required=True, help=".jsonl or .jsonl.gz OCR index path")
-    parser.add_argument("--language", default="vi", help="EasyOCR language, default: vi")
+    parser.add_argument("--language", default="vi", help="PaddleOCR language, default: vi")
     parser.add_argument("--min-confidence", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=0, help="For smoke tests; 0 means all keyframes")
     parser.add_argument("--video", default="", help="Only OCR one video id")

@@ -1,4 +1,4 @@
-# Optional: only needed by Code/build_ocr_index.py, not by normal querying.
-# EasyOCR uses Kaggle's pre-installed CUDA-matched PyTorch runtime.
-easyocr>=1.7
+# Installed only inside /kaggle/working/aic_paddle_ocr_venv by run.py.
+# v2.9.1 is the lightweight API: no PaddleX/ModelScope/Torch dependency chain.
+paddleocr==2.9.1
 tqdm>=4.65

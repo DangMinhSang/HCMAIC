@@ -24,6 +24,8 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
+OCR_VENV = RUNTIME_DIR / "aic_paddle_ocr_venv"
+PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 STALE_MODULES = (
     "dashboard",
     "share_dashboard",
@@ -87,34 +89,48 @@ def install_if_changed(requirements: Path, marker_name: str) -> None:
 
 def install_requirements(build_ocr: bool) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
-    if build_ocr:
-        install_if_changed(CODE / "requirements-ocr.txt", ".aic_ocr_requirements.sha256")
 
 
-def torch_has_gpu() -> bool:
-    """Check Kaggle's CUDA-matched PyTorch runtime in a clean child process."""
-    probe = "import torch; print(int(torch.cuda.is_available()))"
-    result = subprocess.run(
-        [sys.executable, "-c", probe], text=True, capture_output=True, check=False
-    )
-    return result.returncode == 0 and result.stdout.strip() == "1"
-
-
-def ensure_torch_gpu() -> None:
-    """Refuse an impractical CPU pre-OCR without modifying CUDA libraries."""
+def ensure_paddle_ocr_venv() -> Path:
+    """Install Paddle GPU separately so it cannot break dashboard PyTorch."""
     gpu_probe = subprocess.run(["nvidia-smi", "-L"], text=True, capture_output=True, check=False)
     if gpu_probe.returncode != 0:
         raise RuntimeError(
             "Kaggle chưa bật GPU Accelerator. Vào Notebook settings → Accelerator → GPU, "
             "restart session rồi Run all. Không pre-OCR toàn bộ dataset bằng CPU."
         )
-    if torch_has_gpu():
-        print("PyTorch GPU đã sẵn sàng cho EasyOCR.", flush=True)
-        return
-    raise RuntimeError(
-        "PyTorch CUDA không khả dụng. Nếu vừa cài Paddle GPU ở lần chạy cũ, restart Kaggle "
-        "session để khôi phục môi trường CUDA sạch, bật Accelerator = GPU, rồi Run all."
-    )
+    python = OCR_VENV / "bin" / "python"
+    if not python.is_file():
+        command([sys.executable, "-m", "venv", str(OCR_VENV)])
+    digest = hashlib.sha256((CODE / "requirements-ocr.txt").read_bytes()).hexdigest()
+    marker = OCR_VENV / ".requirements.sha256"
+    try:
+        installed_digest = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        installed_digest = ""
+    if digest != installed_digest:
+        print("Đang cài PaddleOCR GPU trong virtualenv riêng…", flush=True)
+        command(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "--no-cache-dir",
+                "paddlepaddle-gpu==3.0.0",
+                "-i",
+                PADDLE_GPU_INDEX,
+            ]
+        )
+        command([str(python), "-m", "pip", "install", "-q", "-r", str(CODE / "requirements-ocr.txt")])
+        marker.write_text(digest + "\n", encoding="utf-8")
+    probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"
+    result = subprocess.run([str(python), "-c", probe], text=True, capture_output=True, check=False)
+    if result.returncode != 0 or result.stdout.strip() != "1":
+        raise RuntimeError("PaddleOCR virtualenv không thấy CUDA GPU. Hãy restart Kaggle session rồi Run all.")
+    print("PaddleOCR GPU virtualenv đã sẵn sàng.", flush=True)
+    return python
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -148,12 +164,12 @@ def main() -> None:
     if build_ocr:
         if not arguments.ocr_device.startswith("gpu"):
             raise ValueError("Full pre-OCR chỉ hỗ trợ GPU. Dùng --no-build-ocr nếu không cần OCR.")
-        ensure_torch_gpu()
+        ocr_python = ensure_paddle_ocr_venv()
         os.environ["AIC_OCR_DEVICE"] = arguments.ocr_device
         print("Chưa có OCR index hợp lệ; đang pre-OCR keyframe đã mount.", flush=True)
         command(
             [
-                sys.executable,
+                str(ocr_python),
                 str(CODE / "build_ocr_index.py"),
                 "--output",
                 str(arguments.ocr_index),
