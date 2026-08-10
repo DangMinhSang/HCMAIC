@@ -2,3 +2,4 @@
 paddlepaddle>=3.0
 # PaddleOCR 3.x provides PP-OCRv6, whose `lang="vi"` model is used by the builder.
 paddleocr>=3.0
+tqdm>=4.65

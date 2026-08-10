@@ -110,6 +110,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="For smoke tests; 0 means all keyframes")
     parser.add_argument("--video", default="", help="Only OCR one video id")
     arguments = parser.parse_args()
+    try:
+        from tqdm.auto import tqdm
+    except ImportError as error:
+        raise RuntimeError(
+            "Thiếu tqdm. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index."
+        ) from error
 
     paths = AICPaths.from_environment()
     reader = create_reader(arguments.language)
@@ -117,13 +123,25 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     opener = gzip.open if output.suffix == ".gz" else open
     processed = written = consecutive_failures = 0
+    video_dirs = [
+        video_dir
+        for keyframe_root in paths.keyframe_roots
+        for video_dir in sorted((keyframe_root / "keyframes").iterdir())
+        if video_dir.is_dir() and (not arguments.video or video_dir.name == arguments.video)
+    ]
+    total_frames = sum(sum(1 for _ in video_dir.glob("*.jpg")) for video_dir in video_dirs)
+    print(f"Sẽ OCR {total_frames:,} keyframe trong {len(video_dirs):,} video.", flush=True)
     with opener(output, "wt", encoding="utf-8") as stream:
-        for keyframe_root in paths.keyframe_roots:
-            for video_dir in sorted((keyframe_root / "keyframes").iterdir()):
-                if not video_dir.is_dir() or (arguments.video and video_dir.name != arguments.video):
-                    continue
+        with tqdm(
+            total=total_frames,
+            desc="OCR keyframes",
+            unit="frame",
+            dynamic_ncols=True,
+        ) as frame_progress:
+            for video_dir in tqdm(video_dirs, desc="Video", unit="video", leave=False, dynamic_ncols=True):
                 for image_path in sorted(video_dir.glob("*.jpg")):
                     processed += 1
+                    frame_progress.update(1)
                     try:
                         keyframe_number = int(image_path.stem)
                         text = read_text(reader, image_path, arguments.min_confidence)
@@ -147,9 +165,10 @@ def main() -> None:
                             + "\n"
                         )
                         written += 1
+                    if processed % 25 == 0:
+                        frame_progress.set_postfix(records=written, refresh=False)
                     if processed % 250 == 0:
                         stream.flush()
-                        print(f"OCR {processed:,} keyframes · {written:,} có text", flush=True)
                     if arguments.limit and processed >= arguments.limit:
                         print(f"Hoàn thành smoke test: {processed:,} keyframes · {written:,} records")
                         return
