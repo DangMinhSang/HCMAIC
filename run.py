@@ -148,7 +148,8 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> None:
     arguments = parse_arguments()
     update_source(arguments.skip_update)
-    index_ready = arguments.ocr_index.is_file() and arguments.ocr_index.stat().st_size > 64
+    complete_marker = Path(f"{arguments.ocr_index}.complete")
+    index_ready = arguments.ocr_index.is_file() and complete_marker.is_file()
     forced_ocr = arguments.build_ocr or os.environ.get("AIC_BUILD_OCR", "0").lower() in {"1", "true", "yes"}
     # Accuracy-first default: a fresh Kaggle session pre-OCRs once. Subsequent
     # Run all executions reuse the compact text index and launch immediately.

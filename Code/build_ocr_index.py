@@ -91,6 +91,10 @@ def main() -> None:
     reader = create_reader(arguments.language, device)
     output = arguments.output
     output.parent.mkdir(parents=True, exist_ok=True)
+    complete_marker = Path(f"{output}.complete")
+    # A stopped notebook leaves a partial JSONL behind. It must never be
+    # mistaken for a complete OCR index by the next Run all execution.
+    complete_marker.unlink(missing_ok=True)
     opener = gzip.open if output.suffix == ".gz" else open
     processed = written = consecutive_failures = 0
     video_dirs = [
@@ -142,6 +146,10 @@ def main() -> None:
                     if arguments.limit and processed >= arguments.limit:
                         print(f"Hoàn thành smoke test: {processed:,} keyframes · {written:,} records")
                         return
+    complete_marker.write_text(
+        json.dumps({"keyframes": processed, "records": written}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
     print(f"Hoàn thành: {processed:,} keyframes · {written:,} records → {output}")
 
 
