@@ -18,11 +18,17 @@ def create_reader(language: str):
         raise RuntimeError(
             "Thiếu PaddleOCR. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index."
         ) from error
+    # PaddleOCR 3.x rejects the legacy ``show_log`` parameter and renamed
+    # ``use_angle_cls``. PaddleOCR 2.x does not understand the new spelling.
+    # Try the current API first, then fall back without passing unsupported
+    # options so the notebook works with either package generation.
     try:
-        return PaddleOCR(lang=language, use_angle_cls=False, show_log=False)
-    except TypeError:
-        # PaddleOCR 3.x removed several 2.x constructor options.
-        return PaddleOCR(lang=language)
+        return PaddleOCR(lang=language, use_textline_orientation=False)
+    except (TypeError, ValueError):
+        try:
+            return PaddleOCR(lang=language, use_angle_cls=False)
+        except (TypeError, ValueError):
+            return PaddleOCR(lang=language)
 
 
 def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
