@@ -29,7 +29,7 @@ Trên Kaggle, vào **Add Input** và gắn các public dataset sau trước khi 
 | Nên có | `doanminhtuan/objects-aic25-b1-zip` | Hiển thị/rerank object detection |
 | Tùy chọn | `doanminhtuan/video-aic` | Mở đường dẫn video để kiểm tra |
 
-Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần đầu), `git pull --ff-only`, cài dependency và mở dashboard tối màu dạng keyframe-card. Gradio chỉ tạo share link cho Kaggle; toàn bộ giao diện và API tìm kiếm là dashboard riêng. Lần đầu cần bật Internet để cài package/trọng số CLIP; đó là **model cache**, không phải tải dataset. Khi cần chạy offline, mount/cache sẵn checkpoint ViT-B/32 và đặt `AIC_CLIP_CACHE`.
+Notebook [run_kaggle.ipynb](run_kaggle.ipynb) là bootstrap cố định. Lần đầu nó clone repo, rồi chỉ chạy [run.py](run.py). Launcher này tự `git pull --ff-only`, tự khởi động lại nếu source vừa đổi, cài dependency khi cần, xóa bytecode/module state cũ và mở dashboard tối màu dạng keyframe-card trong process mới. Vì vậy các cập nhật sau này chỉ sửa source trong repo, **không cần sửa notebook**. Gradio chỉ tạo share link cho Kaggle; toàn bộ giao diện và API tìm kiếm là dashboard riêng. Lần đầu cần bật Internet để cài package/trọng số CLIP; đó là **model cache**, không phải tải dataset. Khi cần chạy offline, mount/cache sẵn checkpoint ViT-B/32 và đặt `AIC_CLIP_CACHE`.
 
 ## Chạy trên Kaggle
 
@@ -40,9 +40,9 @@ Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần �
 
 ### OCR cho biển báo và chữ trong video
 
-Để truy vấn như “biển cảnh báo sạt lở nguy hiểm” ưu tiên ảnh có đúng nội dung chữ thay vì chỉ cảnh sạt lở, đặt `BUILD_OCR_INDEX = True` trong notebook. Cell này dùng PaddleOCR để tạo một file text-only `aic_ocr_index.jsonl.gz`; dashboard nạp file đó vào RAM khi khởi động. Query không chạy OCR trên ảnh và không tải/copy AIC dataset. Một từ điển nhỏ cho biển báo Việt–Anh (ví dụ `dangerous landslide warning` ↔ `cảnh báo sạt lở nguy hiểm`) cũng chạy hoàn toàn trong RAM.
+Để truy vấn như “biển cảnh báo sạt lở nguy hiểm” ưu tiên ảnh có đúng nội dung chữ thay vì chỉ cảnh sạt lở, `run.py` tự pre-OCR ở lần đầu khi chưa có `aic_ocr_index.jsonl.gz`. Nó dùng PaddleOCR `lang="vi"` để tạo file text-only; dashboard nạp file đó vào RAM khi khởi động. Query không chạy OCR trên ảnh và không tải/copy AIC dataset. Một từ điển nhỏ cho biển báo Việt–Anh (ví dụ `dangerous landslide warning` ↔ `cảnh báo sạt lở nguy hiểm`) cũng chạy hoàn toàn trong RAM.
 
-Pre-OCR toàn bộ keyframe có thể mất đáng kể thời gian. Sau khi hoàn tất, lưu phiên bản Kaggle có file index hoặc đính kèm index ở lần chạy sau, rồi đặt `AIC_OCR_INDEX` trỏ tới file đó. Notebook cũng đặt `AIC_PRELOAD_FEATURES=1`, giữ feature CLIP đã chuẩn hóa trong RAM để giảm thời gian query lặp lại mà không ghi cache feature ra đĩa.
+Pre-OCR toàn bộ keyframe có thể mất đáng kể thời gian. Sau khi hoàn tất, lưu phiên bản Kaggle có file index hoặc đính kèm index ở lần chạy sau; `run.py` tự nhận `/kaggle/working/aic_ocr_index.jsonl.gz` và không build lại nếu index hợp lệ. Để bỏ qua OCR ở một phiên mới, chạy `python /kaggle/working/HCMAIC/run.py --no-build-ocr`. Launcher cũng đặt `AIC_PRELOAD_FEATURES=1`, giữ feature CLIP đã chuẩn hóa trong RAM để giảm thời gian query lặp lại mà không ghi cache feature ra đĩa.
 
 Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount khác bố cục chuẩn, đặt các biến: `AIC_FEATURES_DIR`, `AIC_MAPPING_DIR`, `AIC_KEYFRAMES_DIR`, `AIC_METADATA_DIR`, `AIC_OBJECTS_DIR`, `AIC_VIDEOS_DIR`.
 
