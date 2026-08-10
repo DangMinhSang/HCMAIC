@@ -85,6 +85,19 @@ def language_note(engine: AICRetrievalEngine) -> str:
     return info.warning or "Đang dùng truy vấn tiếng Việt gốc."
 
 
+def vector_count_compat(engine: AICRetrievalEngine) -> int:
+    """Support a notebook process that still has an older retrieval module cached."""
+    value = getattr(engine, "vector_count", None)
+    if value is not None:
+        return int(value)
+    try:
+        import numpy as np
+
+        return sum(int(np.load(path, mmap_mode="r").shape[0]) for path in engine._features.values())
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+
 def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
     result = stored.result
     return {
@@ -96,7 +109,7 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         "score": round(result.score, 3),
         "clip": round(result.visual_score, 3),
         "title": result.title,
-        "answer": result.answer,
+        "answer": getattr(result, "answer", ""),
         "event": stored.event_index,
         # Relative URLs work both locally at / and when this Flask app is
         # mounted under /dashboard by the Kaggle Gradio share gateway.
@@ -116,14 +129,31 @@ def search_options(body: dict[str, Any]) -> tuple[int, int, int | None, str | No
 
 def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], str]:
     top_k, min_gap, maximum, video_id = search_options(body)
-    results = engine.search(
-        query,
-        top_k=top_k,
-        min_frame_gap=min_gap,
-        max_per_video=maximum,
-        video_id=video_id,
-        metadata_weight=0.10,
-    )
+    try:
+        results = engine.search(
+            query,
+            top_k=top_k,
+            min_frame_gap=min_gap,
+            max_per_video=maximum,
+            video_id=video_id,
+            metadata_weight=0.10,
+        )
+    except TypeError as error:
+        # A running Kaggle kernel can retain an older retrieval module in
+        # sys.modules after git pull. Keep the dashboard usable until restart.
+        if "unexpected keyword" not in str(error):
+            raise
+        results = engine.search(query, top_k=top_k, min_frame_gap=min_gap, metadata_weight=0.10)
+        if video_id:
+            results = [result for result in results if result.video_id == video_id]
+        if maximum:
+            counts: dict[str, int] = {}
+            filtered = []
+            for result in results:
+                counts[result.video_id] = counts.get(result.video_id, 0) + 1
+                if counts[result.video_id] <= maximum:
+                    filtered.append(result)
+            results = filtered
     return [StoredResult(result) for result in results], language_note(engine)
 
 
@@ -179,7 +209,7 @@ def health():
             {
                 "ok": True,
                 "video_count": engine.video_count,
-                "vector_count": engine.vector_count,
+                "vector_count": vector_count_compat(engine),
                 "video_ids": sorted(engine._features),
             }
         )
