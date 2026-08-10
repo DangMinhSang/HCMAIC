@@ -159,6 +159,7 @@ class AICRetrievalEngine:
         self._metadata_cache: dict[str, VideoMetadata] = {}
         self._metadata_tokens: dict[str, Counter[str]] = {}
         self._metadata_ready = False
+        self._vector_count: int | None = None
 
     @classmethod
     def from_environment(cls, input_root: str | Path | None = None) -> "AICRetrievalEngine":
@@ -167,6 +168,15 @@ class AICRetrievalEngine:
     @property
     def video_count(self) -> int:
         return len(self._features)
+
+    @property
+    def vector_count(self) -> int:
+        """Count vectors from .npy headers only; feature values stay memory-mapped."""
+        if self._vector_count is None:
+            self._vector_count = sum(
+                int(np.load(path, mmap_mode="r").shape[0]) for path in self._features.values()
+            )
+        return self._vector_count
 
     def _mapping(self, video_id: str) -> list[FrameMapping]:
         cached = self._mapping_cache.get(video_id)
@@ -308,11 +318,18 @@ class AICRetrievalEngine:
             video_path=str(video) if video is not None else None,
         )
 
-    def _raw_candidates(self, query_vector: np.ndarray, top_k: int) -> list[_Candidate]:
+    def _raw_candidates(
+        self,
+        query_vector: np.ndarray,
+        top_k: int,
+        allowed_video_ids: set[str] | None = None,
+    ) -> list[_Candidate]:
         candidate_pool = max(400, top_k * 25)
         per_video_limit = max(30, min(100, candidate_pool // 8))
         all_candidates: list[_Candidate] = []
         for video_id, feature_path in self._features.items():
+            if allowed_video_ids is not None and video_id not in allowed_video_ids:
+                continue
             features = np.load(feature_path, mmap_mode="r")
             if features.ndim != 2 or features.shape[1] != query_vector.shape[0]:
                 raise ValueError(
@@ -340,6 +357,8 @@ class AICRetrievalEngine:
         *,
         top_k: int = 100,
         min_frame_gap: int = 90,
+        max_per_video: int | None = None,
+        video_id: str | None = None,
         metadata_weight: float = 0.10,
     ) -> list[SearchResult]:
         """Search Textual KIS/Q&A event descriptions.
@@ -352,9 +371,17 @@ class AICRetrievalEngine:
             raise ValueError("top_k phải nằm trong khoảng 1..100 theo quy định AIC.")
         if min_frame_gap < 0:
             raise ValueError("min_frame_gap không thể âm.")
+        if max_per_video is not None and max_per_video < 1:
+            raise ValueError("max_per_video phải lớn hơn 0.")
         metadata_weight = min(max(float(metadata_weight), 0.0), 0.35)
         query_vector = self.encoder.encode(query, english_expansion)
-        results = [self._candidate_to_result(item) for item in self._raw_candidates(query_vector, top_k)]
+        allowed_video_ids = {video_id} if video_id else None
+        if allowed_video_ids is not None and video_id not in self._features:
+            raise ValueError(f"Không có video `{video_id}` trong CLIP features.")
+        results = [
+            self._candidate_to_result(item)
+            for item in self._raw_candidates(query_vector, top_k, allowed_video_ids)
+        ]
         results = [item for item in results if item is not None]
         translated = getattr(getattr(self.encoder, "last_query", None), "text_for_model", "")
         metadata_query = f"{query} {english_expansion} {translated}"
@@ -378,6 +405,8 @@ class AICRetrievalEngine:
         frames_by_video: dict[str, list[int]] = {}
         for result in results:
             nearby = frames_by_video.setdefault(result.video_id, [])
+            if max_per_video is not None and len(nearby) >= max_per_video:
+                continue
             if any(abs(result.frame_id - previous) <= min_frame_gap for previous in nearby):
                 continue
             nearby.append(result.frame_id)

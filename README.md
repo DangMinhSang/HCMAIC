@@ -28,14 +28,14 @@ Trên Kaggle, vào **Add Input** và gắn các public dataset sau trước khi 
 | Nên có | `doanminhtuan/objects-aic25-b1-zip` | Hiển thị/rerank object detection |
 | Tùy chọn | `doanminhtuan/video-aic` | Mở đường dẫn video để kiểm tra |
 
-Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần đầu), `git pull --ff-only`, cài dependency và mở Gradio. Lần đầu cần bật Internet để cài package/trọng số CLIP; đó là **model cache**, không phải tải dataset. Khi cần chạy offline, mount/cache sẵn checkpoint ViT-B/32 và đặt `AIC_CLIP_CACHE`.
+Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần đầu), `git pull --ff-only`, cài dependency và mở dashboard tối màu dạng keyframe-card. Gradio chỉ tạo share link cho Kaggle; toàn bộ giao diện và API tìm kiếm là dashboard riêng. Lần đầu cần bật Internet để cài package/trọng số CLIP; đó là **model cache**, không phải tải dataset. Khi cần chạy offline, mount/cache sẵn checkpoint ViT-B/32 và đặt `AIC_CLIP_CACHE`.
 
 ## Chạy trên Kaggle
 
 1. Tạo notebook mới, Add Input các dataset trong bảng trên.
 2. Upload/mở `run_kaggle.ipynb`, bật Internet lần đầu rồi Run all.
-3. Vào link Gradio và chọn một trong ba tab. Mỗi tab chỉ có một ô truy vấn, hỗ trợ Việt/Anh tự động.
-4. Kiểm tra gallery, sau đó tải CSV có thứ tự xếp hạng. Tab Q&A dùng ViLT để đề xuất answer; hãy kiểm tra keyframe trước khi nộp.
+3. Mở URL dashboard được in ở cell cuối. Chọn KIS, Q&A hoặc TRAKE; mỗi tab chỉ có một ô truy vấn, hỗ trợ Việt/Anh tự động.
+4. Chọn các keyframe muốn nộp trong lưới ảnh, sau đó bấm **Xuất CSV**. Tab Q&A dùng ViLT để đề xuất answer; hãy kiểm tra keyframe trước khi nộp.
 
 Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount khác bố cục chuẩn, đặt các biến: `AIC_FEATURES_DIR`, `AIC_MAPPING_DIR`, `AIC_KEYFRAMES_DIR`, `AIC_METADATA_DIR`, `AIC_OBJECTS_DIR`, `AIC_VIDEOS_DIR`.
 
@@ -45,8 +45,10 @@ Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount 
 python -m pip install -r Code/requirements.txt
 export AIC_DATA_ROOT=/duong-dan/toi/input/datasets/doanminhtuan
 cd Code
-python app.py --share
+python app.py --host 0.0.0.0 --port 7860
 ```
+
+Mở `http://localhost:7860`. Giao diện có sidebar, ba tab, Top-K, lọc video, khử trùng theo frame, chọn card và xuất CSV trực tiếp — theo layout dashboard tham chiếu.
 
 Không chạy script tải dataset cũ: nó tạo bản sao dataset rất lớn và không cần thiết cho demo này.
 
