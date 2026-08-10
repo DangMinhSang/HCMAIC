@@ -81,12 +81,15 @@ class SearchResult:
     object_labels: tuple[str, ...] = ()
     image_path: str | None = None
     video_path: str | None = None
+    answer: str = ""
+    qa_confidence: float = 0.0
 
     def caption(self) -> str:
         labels = ", ".join(self.object_labels[:6]) or "không có object metadata"
+        answer = f"\nQ&A: {self.answer} ({self.qa_confidence:.0%})" if self.answer else ""
         return (
             f"#{self.rank} | {self.video_id}.mp4 | frame {self.frame_id} | "
-            f"{self.pts_time:.2f}s | score {self.score:.4f}\n{self.title}\nObjects: {labels}"
+            f"{self.pts_time:.2f}s | score {self.score:.4f}\n{self.title}\nObjects: {labels}{answer}"
         )
 
     def table_row(self) -> list[Any]:
@@ -353,8 +356,10 @@ class AICRetrievalEngine:
         query_vector = self.encoder.encode(query, english_expansion)
         results = [self._candidate_to_result(item) for item in self._raw_candidates(query_vector, top_k)]
         results = [item for item in results if item is not None]
-        metadata_scores = self._metadata_scores(f"{query} {english_expansion}", (r.video_id for r in results))
-        query_tokens = set(tokenize(f"{query} {english_expansion}"))
+        translated = getattr(getattr(self.encoder, "last_query", None), "text_for_model", "")
+        metadata_query = f"{query} {english_expansion} {translated}"
+        metadata_scores = self._metadata_scores(metadata_query, (r.video_id for r in results))
+        query_tokens = set(tokenize(metadata_query))
 
         for result in results:
             result.metadata_score = metadata_scores.get(result.video_id, 0.0)
@@ -437,18 +442,24 @@ class AICRetrievalEngine:
         return output
 
 
-def write_kis_submission(results: Sequence[SearchResult], destination: str | Path, answer: str = "") -> Path:
+def write_kis_submission(
+    results: Sequence[SearchResult],
+    destination: str | Path,
+    answer: str = "",
+    *,
+    include_answer: bool | None = None,
+) -> Path:
     """Write ordered answers in the PDF's Textual KIS or Q&A field format."""
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    has_answer = bool(answer.strip())
+    has_answer = bool(answer.strip()) if include_answer is None else include_answer
     with destination.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(["video_id", "frame_id", "answer"] if has_answer else ["video_id", "frame_id"])
         for result in results[:100]:
             row = [result.video_id, result.frame_id]
             if has_answer:
-                row.append(answer.strip())
+                row.append(result.answer or answer.strip())
             writer.writerow(row)
     return destination
 

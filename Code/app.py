@@ -1,4 +1,4 @@
-"""Gradio web demo for AIC 2026 Textual KIS, Q&A, and TRAKE."""
+"""Three-tab Gradio web demo for the AIC 2026 preliminary tasks."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Sequence
 import gradio as gr
 
 from data_paths import DatasetNotFoundError
+from qa import VQABaseline, split_qa_query
 from retrieval import (
     AICRetrievalEngine,
     SearchResult,
@@ -21,14 +22,25 @@ from retrieval import (
 
 
 ENGINE: AICRetrievalEngine | None = None
+VQA: VQABaseline | None = None
+TOP_K = 100
+MIN_FRAME_GAP = 90
+METADATA_WEIGHT = 0.10
 
 
 def get_engine() -> AICRetrievalEngine:
-    """Create the engine lazily so opening the UI does not touch the dataset."""
+    """Create the feature reader only when a user submits a query."""
     global ENGINE
     if ENGINE is None:
         ENGINE = AICRetrievalEngine.from_environment()
     return ENGINE
+
+
+def get_vqa() -> VQABaseline:
+    global VQA
+    if VQA is None:
+        VQA = VQABaseline()
+    return VQA
 
 
 def _output_file(name: str) -> Path:
@@ -37,62 +49,106 @@ def _output_file(name: str) -> Path:
     return directory / name
 
 
-def _gallery(results: Sequence[SearchResult]) -> list[tuple[str, str]]:
-    return [(result.image_path, result.caption()) for result in results if result.image_path]
+def _gallery(results: Sequence[SearchResult], limit: int = 48) -> list[tuple[str, str]]:
+    # Keep the browser responsive while CSV/table retains all 100 answers.
+    return [(result.image_path, result.caption()) for result in results[:limit] if result.image_path]
 
 
-def run_kis_or_qa(
-    query: str,
-    english_expansion: str,
-    answer: str,
-    top_k: int,
-    min_frame_gap: int,
-    metadata_weight: float,
-):
+def _language_note(engine: AICRetrievalEngine) -> str:
+    info = getattr(engine.encoder, "last_query", None)
+    if info is None or info.language != "vi":
+        return "Đã nhận diện truy vấn tiếng Anh."
+    if info.translation_used:
+        return f"Đã nhận diện tiếng Việt và dịch cho CLIP: `{info.text_for_model}`"
+    return f"Đã nhận diện tiếng Việt. {info.warning}".strip()
+
+
+def _search(engine: AICRetrievalEngine, query: str) -> list[SearchResult]:
+    return engine.search(
+        query,
+        top_k=TOP_K,
+        min_frame_gap=MIN_FRAME_GAP,
+        metadata_weight=METADATA_WEIGHT,
+    )
+
+
+def run_kis(query: str):
     try:
         engine = get_engine()
-        results = engine.search(
-            query,
-            english_expansion,
-            top_k=int(top_k),
-            min_frame_gap=int(min_frame_gap),
-            metadata_weight=float(metadata_weight),
-        )
-        destination = write_kis_submission(
-            results, _output_file("aic_kis_or_qa_submission.csv"), answer
-        )
-        title = "Q&A" if answer.strip() else "Textual KIS"
+        results = _search(engine, query)
+        destination = write_kis_submission(results, _output_file("aic_textual_kis.csv"))
         status = (
-            f"Đã tìm **{len(results)}** ứng viên trong {engine.video_count} video "
-            f"({title}). File CSV giữ nguyên thứ tự xếp hạng và có tối đa 100 đáp án."
+            f"✅ Tìm được **{len(results)}** đáp án có thứ hạng trong {engine.video_count} video. "
+            f"{_language_note(engine)} CSV có `video_id, frame_id` và giữ đủ tối đa 100 kết quả."
         )
         return status, _gallery(results), [result.table_row() for result in results], str(destination)
     except (DatasetNotFoundError, ValueError, RuntimeError, OSError) as error:
-        return f"❌ {error}", [], [], None
+        return f"❌ Không thể truy vấn: {error}", [], [], None
+
+
+def run_qa(query: str):
+    """Localize first; VQA is a best-effort second stage and cannot break search."""
+    try:
+        event, question = split_qa_query(query)
+        engine = get_engine()
+        results = _search(engine, event)
+        vqa_message = ""
+        try:
+            predictions = get_vqa().predict(question, results)
+            by_rank = {item.rank: item for item in predictions}
+            for result in results:
+                prediction = by_rank.get(result.rank)
+                if prediction is not None:
+                    result.answer = prediction.answer
+                    result.qa_confidence = prediction.confidence
+            if predictions:
+                # All candidates answer one question. Reuse top localized VQA
+                # answer in CSV rows without a separate user input field.
+                answer = predictions[0].answer
+                confidence = predictions[0].confidence
+                for result in results:
+                    if not result.answer:
+                        result.answer = answer
+                vqa_message = f" Câu trả lời VQA đề xuất: **{answer}** ({confidence:.0%}, evidence top-1)."
+            else:
+                vqa_message = " Không có keyframe hợp lệ để chạy VQA."
+        except RuntimeError as error:
+            # The user can still inspect 100 localized frames even if the VQA
+            # checkpoint is unavailable in a network-restricted Kaggle run.
+            vqa_message = f" VQA chưa sẵn sàng: {error}"
+
+        destination = write_kis_submission(
+            results,
+            _output_file("aic_qa.csv"),
+            include_answer=any(result.answer for result in results),
+        )
+        rows = [result.table_row() + [result.answer, round(result.qa_confidence, 4)] for result in results]
+        status = (
+            f"✅ Đã định vị **{len(results)}** ứng viên Q&A. {_language_note(engine)}{vqa_message}"
+        )
+        return status, _gallery(results), rows, str(destination)
+    except (DatasetNotFoundError, ValueError, RuntimeError, OSError) as error:
+        return f"❌ Không thể truy vấn Q&A: {error}", [], [], None
 
 
 def _events(value: str) -> list[str]:
     return [line.strip().lstrip("-0123456789. ") for line in (value or "").splitlines() if line.strip()]
 
 
-def run_trake(events_text: str, english_events_text: str, top_videos: int):
+def run_trake(events_text: str):
     try:
         engine = get_engine()
-        results = engine.search_trake(
-            _events(events_text),
-            _events(english_events_text),
-            top_videos=int(top_videos),
-        )
-        destination = write_trake_submission(results, _output_file("aic_trake_submission.csv"))
+        results = engine.search_trake(_events(events_text), top_videos=10)
+        destination = write_trake_submission(results, _output_file("aic_trake.csv"))
         rows = [row for item in results for row in item.table_rows()]
         frames = [frame for item in results for frame in item.frames]
         status = (
-            f"Đã truy xuất và căn chỉnh **{len(results)}** video TRAKE. "
-            "Mỗi hàng trong CSV là một video cùng frame_id của từng event theo đúng thứ tự."
+            f"✅ Đã truy xuất và căn chỉnh **{len(results)}** video TRAKE. "
+            "Mỗi dòng input được tự nhận diện Việt/Anh và là một mốc semantic theo thứ tự."
         )
         return status, _gallery(frames), rows, str(destination)
     except (DatasetNotFoundError, ValueError, RuntimeError, OSError) as error:
-        return f"❌ {error}", [], [], None
+        return f"❌ Không thể truy vấn TRAKE: {error}", [], [], None
 
 
 def build_demo() -> gr.Blocks:
@@ -101,98 +157,67 @@ def build_demo() -> gr.Blocks:
             """
             # AIC 2026 — Video Retrieval Demo
 
-            Tìm **Textual KIS**, hỗ trợ xác minh **Q&A**, và căn chỉnh **TRAKE** bằng
-            CLIP ViT-B/32 khớp với feature AIC đã cung cấp. Dữ liệu luôn được đọc từ
-            Kaggle Input; ứng dụng không tải hay sao chép dataset.
-
-            Với truy vấn tiếng Việt, hãy điền một bản diễn đạt tiếng Anh chính xác để
-            tăng chất lượng CLIP. Kết quả được đa dạng theo thời gian để hữu ích cho
-            danh sách tối đa 100 câu trả lời của vòng sơ tuyển.
+            Chọn đúng loại câu hỏi bên dưới. Mỗi tab chỉ có **một ô truy vấn**;
+            hệ thống tự nhận diện tiếng Việt/Anh. Với tiếng Việt, demo tự dịch sang
+            tiếng Anh để khớp CLIP ViT-B/32, và vẫn truy vấn câu gốc nếu dịch không sẵn sàng.
+            Dữ liệu chỉ được đọc từ Kaggle Input — không tải dataset.
             """
         )
 
-        with gr.Tab("Textual KIS / Q&A"):
-            with gr.Row():
-                with gr.Column(scale=3):
-                    query = gr.Textbox(
-                        label="Mô tả truy vấn",
-                        lines=4,
-                        placeholder="Ví dụ: Tìm cảnh một người mở laptop trong văn phòng.",
-                    )
-                    english = gr.Textbox(
-                        label="English expansion — khuyến nghị cho độ chính xác",
-                        lines=3,
-                        placeholder="A person opening a laptop in an office.",
-                    )
-                    answer = gr.Textbox(
-                        label="Câu trả lời Q&A (tùy chọn)",
-                        placeholder="Nhập sau khi kiểm tra keyframe/object; để trống cho Textual KIS.",
-                    )
-                with gr.Column(scale=1):
-                    top_k = gr.Slider(1, 100, value=50, step=1, label="Số đáp án xuất")
-                    frame_gap = gr.Slider(
-                        0, 300, value=90, step=1, label="Khoảng cách frame tối thiểu cùng video"
-                    )
-                    metadata_weight = gr.Slider(
-                        0, 0.35, value=0.10, step=0.01, label="Trọng số metadata"
-                    )
-                    search_button = gr.Button("Tìm kiếm", variant="primary")
+        with gr.Tab("1. Textual KIS"):
+            kis_query = gr.Textbox(
+                label="Mô tả sự kiện (Việt hoặc English)",
+                lines=5,
+                placeholder="Ví dụ: Tìm cảnh một người mở laptop trong văn phòng.",
+            )
+            kis_button = gr.Button("Tìm Textual KIS", variant="primary")
             kis_status = gr.Markdown()
-            kis_gallery = gr.Gallery(label="Keyframe xếp hạng", columns=4, height="auto")
+            kis_gallery = gr.Gallery(label="Top keyframes", columns=4, height="auto")
             kis_table = gr.Dataframe(
-                headers=[
-                    "rank", "video_id", "frame_id", "keyframe", "time_s", "clip", "metadata",
-                    "score", "title", "objects",
-                ],
-                datatype=["number", "str", "number", "number", "number", "number", "number", "number", "str", "str"],
+                headers=["rank", "video_id", "frame_id", "keyframe", "time_s", "clip", "metadata", "score", "title", "objects"],
                 interactive=False,
-                label="Kết quả — dùng video_id và frame_id để nộp",
+                label="Tối đa 100 đáp án — dùng video_id và frame_id để nộp",
             )
-            kis_file = gr.File(label="CSV nộp bài")
-            search_button.click(
-                run_kis_or_qa,
-                inputs=[query, english, answer, top_k, frame_gap, metadata_weight],
-                outputs=[kis_status, kis_gallery, kis_table, kis_file],
-            )
+            kis_file = gr.File(label="CSV Textual KIS")
+            kis_button.click(run_kis, inputs=kis_query, outputs=[kis_status, kis_gallery, kis_table, kis_file])
 
-        with gr.Tab("TRAKE — temporal alignment"):
-            gr.Markdown(
-                "Nhập **mỗi mốc ngữ nghĩa một dòng**, đúng thứ tự thời gian. Hệ thống chọn video có "
-                "đủ mọi mốc rồi chọn một semantic keyframe cho từng mốc."
+        with gr.Tab("2. Q&A"):
+            qa_query = gr.Textbox(
+                label="Mô tả sự kiện và câu hỏi (Việt hoặc English)",
+                lines=5,
+                placeholder="Cảnh lễ trao giải âm nhạc. Câu hỏi: Có bao nhiêu người trên sân khấu?",
             )
-            with gr.Row():
-                trake_events = gr.Textbox(
-                    label="Các event của truy vấn TRAKE", lines=7,
-                    placeholder="1. Athlete runs toward the high-jump bar\n2. Athlete takes off\n3. Athlete clears the bar\n4. Athlete lands on the mat",
-                )
-                trake_english = gr.Textbox(
-                    label="English expansion của từng event (cùng số dòng, tùy chọn)", lines=7,
-                    placeholder="Có thể để trống nếu event đã viết bằng tiếng Anh.",
-                )
-            with gr.Row():
-                trake_top = gr.Slider(1, 50, value=10, step=1, label="Số video TRAKE xuất")
-                trake_button = gr.Button("Truy xuất & căn chỉnh", variant="primary")
+            qa_button = gr.Button("Tìm Q&A", variant="primary")
+            qa_status = gr.Markdown()
+            qa_gallery = gr.Gallery(label="Keyframes Q&A", columns=4, height="auto")
+            qa_table = gr.Dataframe(
+                headers=["rank", "video_id", "frame_id", "keyframe", "time_s", "clip", "metadata", "score", "title", "objects", "VQA answer", "VQA confidence"],
+                interactive=False,
+                label="Định vị sự kiện và câu trả lời VQA",
+            )
+            qa_file = gr.File(label="CSV Q&A")
+            qa_button.click(run_qa, inputs=qa_query, outputs=[qa_status, qa_gallery, qa_table, qa_file])
+
+        with gr.Tab("3. TRAKE"):
+            trake_events = gr.Textbox(
+                label="Chuỗi event TRAKE — mỗi dòng một mốc, Việt hoặc English",
+                lines=7,
+                placeholder="Vận động viên chạy đà\nVận động viên giậm nhảy\nVận động viên bay qua xà\nVận động viên tiếp đất trên đệm",
+            )
+            trake_button = gr.Button("Truy xuất & căn chỉnh TRAKE", variant="primary")
             trake_status = gr.Markdown()
             trake_gallery = gr.Gallery(label="Semantic keyframes", columns=4, height="auto")
             trake_table = gr.Dataframe(
                 headers=["video_rank", "video_id", "event", "frame_id", "keyframe", "time_s", "event_clip", "video_score", "title"],
-                datatype=["number", "str", "number", "number", "number", "number", "number", "number", "str"],
                 interactive=False,
                 label="Kết quả TRAKE",
             )
-            trake_file = gr.File(label="CSV nộp TRAKE")
-            trake_button.click(
-                run_trake,
-                inputs=[trake_events, trake_english, trake_top],
-                outputs=[trake_status, trake_gallery, trake_table, trake_file],
-            )
+            trake_file = gr.File(label="CSV TRAKE")
+            trake_button.click(run_trake, inputs=trake_events, outputs=[trake_status, trake_gallery, trake_table, trake_file])
 
         gr.Markdown(
-            """
-            **Lưu ý chấm điểm:** CSV chỉ là định dạng làm việc. Hãy đối chiếu template nộp bài
-            chính thức khi BTC phát hành. Với Q&A, demo định vị sự kiện và hiển thị object/keyframe;
-            người dùng nhập câu trả lời ngữ nghĩa vào ô Q&A trước khi tải CSV.
-            """
+            "CSV giữ nguyên thứ tự xếp hạng. Khi BTC phát hành template nộp chính thức, giữ nguyên "
+            "`video_id` và `frame_id`, chỉ điều chỉnh header nếu được yêu cầu."
         )
     return demo
 

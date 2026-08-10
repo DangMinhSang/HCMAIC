@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from query_language import NormalizedQuery, normalize_query
+
 
 class ClipModelUnavailableError(RuntimeError):
     """Raised with an actionable message when the CLIP model is unavailable."""
@@ -23,6 +25,7 @@ class ClipTextEncoder:
         self._model = None
         self._clip = None
         self._torch = None
+        self.last_query: NormalizedQuery | None = None
 
     def _load(self) -> None:
         if self._model is not None:
@@ -53,9 +56,10 @@ class ClipTextEncoder:
     def encode(self, query: str, english_expansion: str = ""):
         """Return one L2-normalized NumPy query vector.
 
-        CLIP ViT-B/32 is strongest in English. An accurate English expansion
-        is deliberately weighted more when supplied; prompt ensembling reduces
-        sensitivity to small wording changes.
+        Vietnamese is translated automatically when possible, then prompt
+        ensembling reduces sensitivity to small wording changes. The optional
+        ``english_expansion`` is retained for API compatibility, but the web UI
+        deliberately exposes only one query field.
         """
         self._load()
         query = (query or "").strip()
@@ -63,14 +67,9 @@ class ClipTextEncoder:
         if not query and not english_expansion:
             raise ValueError("Nhập mô tả truy vấn.")
 
-        base = english_expansion or query
-        prompts = [base]
-        if english_expansion:
-            prompts.extend([f"a video frame of {base}", f"a photograph of {base}"])
-            if query and query != english_expansion:
-                prompts.append(query)
-        elif all(ord(char) < 128 for char in base):
-            prompts.extend([f"a video frame of {base}", f"a photograph of {base}"])
+        self.last_query = normalize_query(query) if query else NormalizedQuery("", english_expansion, "en", False)
+        base = english_expansion or self.last_query.text_for_model
+        prompts = [base, f"a video frame of {base}", f"a photograph of {base}"]
 
         tokens = self._clip.tokenize(prompts, truncate=True).to(self.device)
         with self._torch.no_grad():

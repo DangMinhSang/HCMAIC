@@ -3,14 +3,14 @@
 Web demo cho vòng sơ tuyển AIC 2026, bám theo ba dạng truy vấn trong tài liệu đề bài:
 
 - Textual KIS: trả về danh sách có thứ tự `video_id, frame_id`.
-- Q&A: định vị keyframe, hiển thị object/keyframe để người dùng kiểm tra rồi nhập `answer`.
+- Q&A: định vị keyframe và sinh câu trả lời VQA baseline từ cùng một ô truy vấn.
 - TRAKE: truy xuất **một** video có toàn bộ chuỗi event và căn chỉnh một semantic frame cho mỗi event.
 
 Ưu tiên chính xác truy vấn:
 
 1. Dùng đúng họ model **OpenAI CLIP ViT-B/32**, tương thích feature 512 chiều được BTC cung cấp.
 2. Tính cosine similarity trực tiếp trên toàn bộ 873 file feature bằng `numpy.memmap`; không làm giảm dữ liệu, không tạo bản sao index lớn.
-3. Prompt ensemble và ô English expansion cho CLIP (rất nên dùng với câu hỏi tiếng Việt).
+3. Tự nhận diện Việt/Anh, dịch tiếng Việt sang tiếng Anh cho CLIP khi dịch vụ sẵn sàng, rồi prompt ensemble.
 4. Rerank nhẹ bằng YouTube metadata/object labels và loại các keyframe quá sát nhau để tăng độ phủ cho tối đa 100 đáp án.
 
 ## Không tải dataset
@@ -34,8 +34,8 @@ Notebook [run_kaggle.ipynb](run_kaggle.ipynb) thực hiện `git clone` (lần �
 
 1. Tạo notebook mới, Add Input các dataset trong bảng trên.
 2. Upload/mở `run_kaggle.ipynb`, bật Internet lần đầu rồi Run all.
-3. Vào link Gradio, nhập mô tả. Với truy vấn tiếng Việt, điền bản diễn đạt tiếng Anh chính xác ở ô kế bên.
-4. Kiểm tra gallery, sau đó tải CSV có thứ tự xếp hạng. Với Q&A, nhập answer sau khi đối chiếu kết quả.
+3. Vào link Gradio và chọn một trong ba tab. Mỗi tab chỉ có một ô truy vấn, hỗ trợ Việt/Anh tự động.
+4. Kiểm tra gallery, sau đó tải CSV có thứ tự xếp hạng. Tab Q&A dùng ViLT để đề xuất answer; hãy kiểm tra keyframe trước khi nộp.
 
 Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount khác bố cục chuẩn, đặt các biến: `AIC_FEATURES_DIR`, `AIC_MAPPING_DIR`, `AIC_KEYFRAMES_DIR`, `AIC_METADATA_DIR`, `AIC_OBJECTS_DIR`, `AIC_VIDEOS_DIR`.
 
