@@ -19,11 +19,16 @@ def create_reader(language: str):
             "Thiếu PaddleOCR. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index."
         ) from error
     # PaddleOCR 3.x rejects the legacy ``show_log`` parameter and renamed
-    # ``use_angle_cls``. PaddleOCR 2.x does not understand the new spelling.
-    # Try the current API first, then fall back without passing unsupported
-    # options so the notebook works with either package generation.
+    # ``use_angle_cls``. Disable document-only preprocessing: broadcast
+    # keyframes are ordinary scenes, so it wastes both downloads and time.
+    # ``lang='vi'`` selects PaddleOCR's Vietnamese recognition model.
     try:
-        return PaddleOCR(lang=language, use_textline_orientation=False)
+        return PaddleOCR(
+            lang=language,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
     except (TypeError, ValueError):
         try:
             return PaddleOCR(lang=language, use_angle_cls=False)
@@ -33,10 +38,38 @@ def create_reader(language: str):
 
 def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
     """Extract recognized lines across PaddleOCR 2.x/3.x result shapes."""
-    try:
-        output = reader.ocr(str(image_path), cls=False)
-    except AttributeError:
+    # PaddleOCR 3.x retains .ocr() only as a deprecated compatibility wrapper.
+    # That wrapper forwards ``cls`` to .predict(), where it is invalid, so
+    # choose .predict() directly whenever the modern method exists.
+    if hasattr(reader, "predict"):
         output = list(reader.predict(str(image_path)))
+        lines: list[str] = []
+        for result in output:
+            payload = result if isinstance(result, dict) else getattr(result, "json", None)
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except json.JSONDecodeError:
+                    payload = None
+            if not isinstance(payload, dict):
+                continue
+            values = payload.get("res", payload)
+            if not isinstance(values, dict):
+                continue
+            texts = values.get("rec_texts")
+            scores = values.get("rec_scores")
+            texts = [] if texts is None else texts
+            scores = [] if scores is None else scores
+            for index, text in enumerate(texts):
+                try:
+                    confidence = float(scores[index]) if index < len(scores) else 1.0
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if isinstance(text, str) and text.strip() and confidence >= minimum_confidence:
+                    lines.append(text.strip())
+        return " ".join(dict.fromkeys(lines))
+
+    output = reader.ocr(str(image_path), cls=False)
     lines: list[str] = []
 
     def walk(node) -> None:

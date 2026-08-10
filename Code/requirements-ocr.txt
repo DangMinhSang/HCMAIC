@@ -1,3 +1,4 @@
 # Optional: only needed by Code/build_ocr_index.py, not by normal querying.
 paddlepaddle>=3.0
-paddleocr>=2.8
+# PaddleOCR 3.x provides PP-OCRv6, whose `lang="vi"` model is used by the builder.
+paddleocr>=3.0
