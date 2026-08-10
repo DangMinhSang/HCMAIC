@@ -24,7 +24,6 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
-PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 STALE_MODULES = (
     "dashboard",
     "share_dashboard",
@@ -92,43 +91,30 @@ def install_requirements(build_ocr: bool) -> None:
         install_if_changed(CODE / "requirements-ocr.txt", ".aic_ocr_requirements.sha256")
 
 
-def paddle_has_gpu() -> bool:
-    """Check Paddle in a child process so no CPU module remains imported."""
-    probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"
+def torch_has_gpu() -> bool:
+    """Check Kaggle's CUDA-matched PyTorch runtime in a clean child process."""
+    probe = "import torch; print(int(torch.cuda.is_available()))"
     result = subprocess.run(
         [sys.executable, "-c", probe], text=True, capture_output=True, check=False
     )
     return result.returncode == 0 and result.stdout.strip() == "1"
 
 
-def ensure_paddle_gpu() -> None:
-    """Replace the PyPI CPU wheel with Paddle's CUDA 11.8 wheel on Kaggle GPU."""
+def ensure_torch_gpu() -> None:
+    """Refuse an impractical CPU pre-OCR without modifying CUDA libraries."""
     gpu_probe = subprocess.run(["nvidia-smi", "-L"], text=True, capture_output=True, check=False)
     if gpu_probe.returncode != 0:
         raise RuntimeError(
             "Kaggle chưa bật GPU Accelerator. Vào Notebook settings → Accelerator → GPU, "
             "restart session rồi Run all. Không pre-OCR toàn bộ dataset bằng CPU."
         )
-    if paddle_has_gpu():
-        print("Paddle GPU đã sẵn sàng.", flush=True)
+    if torch_has_gpu():
+        print("PyTorch GPU đã sẵn sàng cho EasyOCR.", flush=True)
         return
-    print("Đang thay Paddle CPU bằng Paddle GPU (CUDA 11.8)…", flush=True)
-    command([sys.executable, "-m", "pip", "uninstall", "-y", "paddlepaddle", "paddlepaddle-gpu"])
-    command(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "--no-cache-dir",
-            "paddlepaddle-gpu==3.0.0",
-            "-i",
-            PADDLE_GPU_INDEX,
-        ]
+    raise RuntimeError(
+        "PyTorch CUDA không khả dụng. Nếu vừa cài Paddle GPU ở lần chạy cũ, restart Kaggle "
+        "session để khôi phục môi trường CUDA sạch, bật Accelerator = GPU, rồi Run all."
     )
-    if not paddle_has_gpu():
-        raise RuntimeError("Đã cài Paddle GPU nhưng CUDA chưa khả dụng. Hãy restart Kaggle session rồi Run all.")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -162,7 +148,7 @@ def main() -> None:
     if build_ocr:
         if not arguments.ocr_device.startswith("gpu"):
             raise ValueError("Full pre-OCR chỉ hỗ trợ GPU. Dùng --no-build-ocr nếu không cần OCR.")
-        ensure_paddle_gpu()
+        ensure_torch_gpu()
         os.environ["AIC_OCR_DEVICE"] = arguments.ocr_device
         print("Chưa có OCR index hợp lệ; đang pre-OCR keyframe đã mount.", flush=True)
         command(

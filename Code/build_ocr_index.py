@@ -13,131 +13,58 @@ from data_paths import AICPaths
 
 
 def resolve_device(requested: str) -> str:
-    """Require GPU by default; CPU OCR is impractical for the full AIC set."""
+    """Require the existing Kaggle PyTorch GPU for full-dataset OCR."""
     try:
-        import paddle  # type: ignore
+        import torch  # type: ignore
     except ImportError as error:
-        raise RuntimeError("Thiếu PaddlePaddle runtime.") from error
+        raise RuntimeError("Không thể import PyTorch CUDA của Kaggle.") from error
     device = "gpu:0" if requested == "auto" else requested
     if device.startswith("gpu"):
-        if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 1:
+        if not torch.cuda.is_available():
             raise RuntimeError(
-                "Không có Paddle GPU. Bật Accelerator = GPU trong Kaggle và dùng "
-                "paddlepaddle-gpu; không chạy pre-OCR full dataset bằng CPU. "
+                "Không có PyTorch GPU. Bật Accelerator = GPU trong Kaggle; "
+                "không chạy pre-OCR full dataset bằng CPU. "
                 "Chỉ dùng `--device cpu` cho smoke test nhỏ."
             )
     return device
 
 
 def create_reader(language: str, device: str):
-    # Kaggle's CPU Paddle build can route PP-OCRv6 through a oneDNN/PIR path
-    # that raises ``ConvertPirAttribute2RuntimeAttribute`` for every image.
-    # This must be set before importing Paddle, then reinforced in the
-    # pipeline configuration below.
-    os.environ["FLAGS_use_mkldnn"] = "0"
     try:
-        from paddleocr import PaddleOCR  # type: ignore
+        import easyocr  # type: ignore
     except ImportError as error:
         raise RuntimeError(
-            "Không thể import PaddleOCR. Nếu lỗi nhắc `libtorch_cuda`/NCCL, restart Kaggle "
-            "session để khôi phục Torch CUDA có sẵn rồi Run all. Lỗi gốc: "
+            "Thiếu EasyOCR. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index. "
+            "Lỗi gốc: "
             f"{error}"
         ) from error
-    # PaddleOCR 3.x rejects the legacy ``show_log`` parameter and renamed
-    # ``use_angle_cls``. Disable document-only preprocessing: broadcast
-    # keyframes are ordinary scenes, so it wastes both downloads and time.
-    # ``lang='vi'`` selects PaddleOCR's Vietnamese recognition model.
-    try:
-        return PaddleOCR(
-            lang=language,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            enable_mkldnn=False,
-            device=device,
-        )
-    except (TypeError, ValueError):
-        try:
-            return PaddleOCR(
-                lang=language,
-                use_angle_cls=False,
-                use_gpu=device != "cpu",
-                enable_mkldnn=False,
-            )
-        except (TypeError, ValueError):
-            return PaddleOCR(lang=language, use_gpu=device != "cpu")
+    # EasyOCR's Vietnamese model can be paired with English, which is useful
+    # for road signs, TV overlays, and imported footage in the same keyframe.
+    languages = ["vi", "en"] if language == "vi" else [language, "en"]
+    return easyocr.Reader(languages, gpu=device.startswith("gpu"), verbose=False)
 
 
 def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
-    """Extract recognized lines across PaddleOCR 2.x/3.x result shapes."""
-    # PaddleOCR 3.x retains .ocr() only as a deprecated compatibility wrapper.
-    # That wrapper forwards ``cls`` to .predict(), where it is invalid, so
-    # choose .predict() directly whenever the modern method exists.
-    if hasattr(reader, "predict"):
-        output = list(reader.predict(str(image_path)))
-        lines: list[str] = []
-        for result in output:
-            payload = result if isinstance(result, dict) else getattr(result, "json", None)
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except json.JSONDecodeError:
-                    payload = None
-            if not isinstance(payload, dict):
-                continue
-            values = payload.get("res", payload)
-            if not isinstance(values, dict):
-                continue
-            texts = values.get("rec_texts")
-            scores = values.get("rec_scores")
-            texts = [] if texts is None else texts
-            scores = [] if scores is None else scores
-            for index, text in enumerate(texts):
-                try:
-                    confidence = float(scores[index]) if index < len(scores) else 1.0
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                if isinstance(text, str) and text.strip() and confidence >= minimum_confidence:
-                    lines.append(text.strip())
-        return " ".join(dict.fromkeys(lines))
-
-    output = reader.ocr(str(image_path), cls=False)
-    lines: list[str] = []
-
-    def walk(node) -> None:
-        if isinstance(node, (list, tuple)):
-            if len(node) >= 2 and isinstance(node[1], (list, tuple)) and node[1]:
-                candidate = node[1]
-                if isinstance(candidate[0], str):
-                    confidence = float(candidate[1]) if len(candidate) > 1 else 1.0
-                    if confidence >= minimum_confidence:
-                        lines.append(candidate[0].strip())
-                    return
-            for child in node:
-                walk(child)
-        elif isinstance(node, dict):
-            for key in ("rec_texts", "rec_text", "text"):
-                value = node.get(key)
-                if isinstance(value, str) and value.strip():
-                    lines.append(value.strip())
-                elif isinstance(value, list):
-                    lines.extend(str(item).strip() for item in value if str(item).strip())
-
-    walk(output)
-    return " ".join(dict.fromkeys(line for line in lines if line))
+    """Extract EasyOCR lines as (box, text, confidence) tuples."""
+    lines = [
+        str(text).strip()
+        for _box, text, confidence in reader.readtext(str(image_path), detail=1, paragraph=False)
+        if str(text).strip() and float(confidence) >= minimum_confidence
+    ]
+    return " ".join(dict.fromkeys(lines))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pre-compute a text-only OCR index for mounted AIC keyframes")
     parser.add_argument("--output", type=Path, required=True, help=".jsonl or .jsonl.gz OCR index path")
-    parser.add_argument("--language", default="vi", help="PaddleOCR language, default: vi")
+    parser.add_argument("--language", default="vi", help="EasyOCR language, default: vi")
     parser.add_argument("--min-confidence", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=0, help="For smoke tests; 0 means all keyframes")
     parser.add_argument("--video", default="", help="Only OCR one video id")
     parser.add_argument(
         "--device",
         default=os.environ.get("AIC_OCR_DEVICE", "auto"),
-        help="Paddle device; default gpu:0. Use cpu only for a small smoke test.",
+        help="OCR device; default gpu:0. Use cpu only for a small smoke test.",
     )
     arguments = parser.parse_args()
     try:
