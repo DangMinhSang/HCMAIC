@@ -31,6 +31,8 @@ Trên Kaggle, vào **Add Input** và gắn các public dataset sau trước khi 
 
 Notebook [run_kaggle.ipynb](run_kaggle.ipynb) là bootstrap cố định. Lần đầu nó clone repo, rồi chỉ chạy [run.py](run.py). Launcher này tự `git pull --ff-only`, tự khởi động lại nếu source vừa đổi, cài dependency khi cần, xóa bytecode/module state cũ và mở dashboard tối màu dạng keyframe-card trong process mới. Vì vậy các cập nhật sau này chỉ sửa source trong repo, **không cần sửa notebook**. Gradio chỉ tạo share link cho Kaggle; toàn bộ giao diện và API tìm kiếm là dashboard riêng. Lần đầu cần bật Internet để cài package/trọng số CLIP; đó là **model cache**, không phải tải dataset. Khi cần chạy offline, mount/cache sẵn checkpoint ViT-B/32 và đặt `AIC_CLIP_CACHE`.
 
+Kaggle đã có sẵn PyTorch đúng CUDA của image notebook. `requirements.txt` cố ý không nâng cấp Torch, vì cài Torch từ PyPI có thể thay NCCL và làm hỏng `libtorch_cuda.so`.
+
 ## Chạy trên Kaggle
 
 1. Tạo notebook mới, Add Input các dataset trong bảng trên.

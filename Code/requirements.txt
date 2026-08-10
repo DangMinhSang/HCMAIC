@@ -1,7 +1,9 @@
 # Kaggle normally already provides numpy and torch.  None of these packages
 # downloads an AIC dataset; datasets must be attached with Kaggle Add Input.
 numpy>=1.26
-torch>=2.0
+# Kaggle already ships a CUDA-matched PyTorch build. Installing/upgrading torch
+# from PyPI here can replace its NCCL libraries and break ``libtorch_cuda``.
+# For a non-Kaggle local install, install the matching PyTorch wheel separately.
 Flask>=3.0
 gradio>=5.0
 Pillow>=10.0

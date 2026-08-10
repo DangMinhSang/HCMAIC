@@ -39,7 +39,9 @@ def create_reader(language: str, device: str):
         from paddleocr import PaddleOCR  # type: ignore
     except ImportError as error:
         raise RuntimeError(
-            "Thiếu PaddleOCR. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index."
+            "Không thể import PaddleOCR. Nếu lỗi nhắc `libtorch_cuda`/NCCL, restart Kaggle "
+            "session để khôi phục Torch CUDA có sẵn rồi Run all. Lỗi gốc: "
+            f"{error}"
         ) from error
     # PaddleOCR 3.x rejects the legacy ``show_log`` parameter and renamed
     # ``use_angle_cls``. Disable document-only preprocessing: broadcast
