@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -12,6 +13,11 @@ from data_paths import AICPaths
 
 
 def create_reader(language: str):
+    # Kaggle's CPU Paddle build can route PP-OCRv6 through a oneDNN/PIR path
+    # that raises ``ConvertPirAttribute2RuntimeAttribute`` for every image.
+    # This must be set before importing Paddle, then reinforced in the
+    # pipeline configuration below.
+    os.environ["FLAGS_use_mkldnn"] = "0"
     try:
         from paddleocr import PaddleOCR  # type: ignore
     except ImportError as error:
@@ -28,10 +34,11 @@ def create_reader(language: str):
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            enable_mkldnn=False,
         )
     except (TypeError, ValueError):
         try:
-            return PaddleOCR(lang=language, use_angle_cls=False)
+            return PaddleOCR(lang=language, use_angle_cls=False, enable_mkldnn=False)
         except (TypeError, ValueError):
             return PaddleOCR(lang=language)
 
@@ -109,7 +116,7 @@ def main() -> None:
     output = arguments.output
     output.parent.mkdir(parents=True, exist_ok=True)
     opener = gzip.open if output.suffix == ".gz" else open
-    processed = written = 0
+    processed = written = consecutive_failures = 0
     with opener(output, "wt", encoding="utf-8") as stream:
         for keyframe_root in paths.keyframe_roots:
             for video_dir in sorted((keyframe_root / "keyframes").iterdir()):
@@ -121,8 +128,16 @@ def main() -> None:
                         keyframe_number = int(image_path.stem)
                         text = read_text(reader, image_path, arguments.min_confidence)
                     except Exception as error:
+                        consecutive_failures += 1
                         print(f"[skip] {image_path}: {error}", file=sys.stderr)
+                        if consecutive_failures >= 5 and written == 0:
+                            raise RuntimeError(
+                                "OCR thất bại liên tiếp từ frame đầu. "
+                                "Đã dừng để không tạo OCR index rỗng. Lỗi cuối: "
+                                f"{error}"
+                            ) from error
                         continue
+                    consecutive_failures = 0
                     if text:
                         stream.write(
                             json.dumps(
