@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
+PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 STALE_MODULES = (
     "dashboard",
     "share_dashboard",
@@ -91,6 +92,45 @@ def install_requirements(build_ocr: bool) -> None:
         install_if_changed(CODE / "requirements-ocr.txt", ".aic_ocr_requirements.sha256")
 
 
+def paddle_has_gpu() -> bool:
+    """Check Paddle in a child process so no CPU module remains imported."""
+    probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], text=True, capture_output=True, check=False
+    )
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
+def ensure_paddle_gpu() -> None:
+    """Replace the PyPI CPU wheel with Paddle's CUDA 11.8 wheel on Kaggle GPU."""
+    gpu_probe = subprocess.run(["nvidia-smi", "-L"], text=True, capture_output=True, check=False)
+    if gpu_probe.returncode != 0:
+        raise RuntimeError(
+            "Kaggle chưa bật GPU Accelerator. Vào Notebook settings → Accelerator → GPU, "
+            "restart session rồi Run all. Không pre-OCR toàn bộ dataset bằng CPU."
+        )
+    if paddle_has_gpu():
+        print("Paddle GPU đã sẵn sàng.", flush=True)
+        return
+    print("Đang thay Paddle CPU bằng Paddle GPU (CUDA 11.8)…", flush=True)
+    command([sys.executable, "-m", "pip", "uninstall", "-y", "paddlepaddle", "paddlepaddle-gpu"])
+    command(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--no-cache-dir",
+            "paddlepaddle-gpu==3.0.0",
+            "-i",
+            PADDLE_GPU_INDEX,
+        ]
+    )
+    if not paddle_has_gpu():
+        raise RuntimeError("Đã cài Paddle GPU nhưng CUDA chưa khả dụng. Hãy restart Kaggle session rồi Run all.")
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch the AIC dashboard on Kaggle")
     parser.add_argument("--skip-update", action="store_true", help=argparse.SUPPRESS)
@@ -98,6 +138,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--no-build-ocr", action="store_true", help="Launch with CLIP only when no OCR index exists")
     parser.add_argument("--ocr-index", type=Path, default=DEFAULT_OCR_INDEX)
     parser.add_argument("--data-root", default="/kaggle/input")
+    parser.add_argument("--ocr-device", default="gpu:0", help="OCR device; full pre-OCR requires gpu:0")
     parser.add_argument("--no-preload-features", action="store_true")
     return parser.parse_args()
 
@@ -119,6 +160,10 @@ def main() -> None:
     sys.path.insert(0, str(CODE))
 
     if build_ocr:
+        if not arguments.ocr_device.startswith("gpu"):
+            raise ValueError("Full pre-OCR chỉ hỗ trợ GPU. Dùng --no-build-ocr nếu không cần OCR.")
+        ensure_paddle_gpu()
+        os.environ["AIC_OCR_DEVICE"] = arguments.ocr_device
         print("Chưa có OCR index hợp lệ; đang pre-OCR keyframe đã mount.", flush=True)
         command(
             [
@@ -126,6 +171,8 @@ def main() -> None:
                 str(CODE / "build_ocr_index.py"),
                 "--output",
                 str(arguments.ocr_index),
+                "--device",
+                arguments.ocr_device,
             ]
         )
 

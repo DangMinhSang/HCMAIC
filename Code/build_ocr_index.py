@@ -12,7 +12,24 @@ from pathlib import Path
 from data_paths import AICPaths
 
 
-def create_reader(language: str):
+def resolve_device(requested: str) -> str:
+    """Require GPU by default; CPU OCR is impractical for the full AIC set."""
+    try:
+        import paddle  # type: ignore
+    except ImportError as error:
+        raise RuntimeError("Thiếu PaddlePaddle runtime.") from error
+    device = "gpu:0" if requested == "auto" else requested
+    if device.startswith("gpu"):
+        if not paddle.is_compiled_with_cuda() or paddle.device.cuda.device_count() < 1:
+            raise RuntimeError(
+                "Không có Paddle GPU. Bật Accelerator = GPU trong Kaggle và dùng "
+                "paddlepaddle-gpu; không chạy pre-OCR full dataset bằng CPU. "
+                "Chỉ dùng `--device cpu` cho smoke test nhỏ."
+            )
+    return device
+
+
+def create_reader(language: str, device: str):
     # Kaggle's CPU Paddle build can route PP-OCRv6 through a oneDNN/PIR path
     # that raises ``ConvertPirAttribute2RuntimeAttribute`` for every image.
     # This must be set before importing Paddle, then reinforced in the
@@ -35,12 +52,18 @@ def create_reader(language: str):
             use_doc_unwarping=False,
             use_textline_orientation=False,
             enable_mkldnn=False,
+            device=device,
         )
     except (TypeError, ValueError):
         try:
-            return PaddleOCR(lang=language, use_angle_cls=False, enable_mkldnn=False)
+            return PaddleOCR(
+                lang=language,
+                use_angle_cls=False,
+                use_gpu=device != "cpu",
+                enable_mkldnn=False,
+            )
         except (TypeError, ValueError):
-            return PaddleOCR(lang=language)
+            return PaddleOCR(lang=language, use_gpu=device != "cpu")
 
 
 def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
@@ -109,6 +132,11 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=float, default=0.45)
     parser.add_argument("--limit", type=int, default=0, help="For smoke tests; 0 means all keyframes")
     parser.add_argument("--video", default="", help="Only OCR one video id")
+    parser.add_argument(
+        "--device",
+        default=os.environ.get("AIC_OCR_DEVICE", "auto"),
+        help="Paddle device; default gpu:0. Use cpu only for a small smoke test.",
+    )
     arguments = parser.parse_args()
     try:
         from tqdm.auto import tqdm
@@ -117,8 +145,10 @@ def main() -> None:
             "Thiếu tqdm. Chạy `pip install -r Code/requirements-ocr.txt` trước khi build OCR index."
         ) from error
 
+    device = resolve_device(arguments.device)
+    print(f"OCR device: {device}", flush=True)
     paths = AICPaths.from_environment()
-    reader = create_reader(arguments.language)
+    reader = create_reader(arguments.language, device)
     output = arguments.output
     output.parent.mkdir(parents=True, exist_ok=True)
     opener = gzip.open if output.suffix == ".gz" else open
