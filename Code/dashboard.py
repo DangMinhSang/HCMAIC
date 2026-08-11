@@ -418,6 +418,8 @@ def make_kis_results(
             combined,
             rerank_limit,
             source_weights=profile.values(),
+            max_per_video=None if video_id else max(4, (rerank_limit + 5) // 6),
+            min_frame_gap=30,
         )
         try:
             normalized = normalize_query(query)

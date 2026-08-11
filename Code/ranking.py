@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 
 CandidateKey = tuple[str, int]
@@ -28,19 +28,45 @@ def select_multisource_candidates(
     combined: Mapping[CandidateKey, Any],
     budget: int,
     source_weights: Mapping[str, float] | None = None,
+    max_per_video: int | None = None,
+    min_frame_gap: int = 0,
 ) -> list[Any]:
     """Guarantee adaptive Qwen coverage from vision, OCR and metadata."""
     budget = max(1, budget)
     selected: list[Any] = []
     seen: set[CandidateKey] = set()
+    video_counts: dict[str, int] = {}
+    frames_by_video: dict[str, list[int]] = {}
 
-    def add(item: Any | None) -> None:
+    def add(item: Any | None, *, enforce_diversity: bool = True) -> bool:
         if item is None or len(selected) >= budget:
-            return
+            return False
         key = candidate_key(item)
-        if key not in seen:
-            seen.add(key)
-            selected.append(item)
+        if key in seen:
+            return False
+        video_id = str(item.video_id)
+        frame_id = int(getattr(item, "frame_id", 0))
+        if enforce_diversity:
+            if max_per_video is not None and video_counts.get(video_id, 0) >= max_per_video:
+                return False
+            if min_frame_gap and any(
+                abs(frame_id - previous) <= min_frame_gap
+                for previous in frames_by_video.get(video_id, ())
+            ):
+                return False
+        seen.add(key)
+        selected.append(item)
+        video_counts[video_id] = video_counts.get(video_id, 0) + 1
+        frames_by_video.setdefault(video_id, []).append(frame_id)
+        return True
+
+    def take(items: Iterable[Any], quota: int) -> None:
+        added = 0
+        for item in items:
+            if add(item):
+                added += 1
+                if added >= quota:
+                    break
 
     weights = source_weights or {}
     if weights:
@@ -55,19 +81,23 @@ def select_multisource_candidates(
     visual_quota = max(1, round(budget * visual_share))
     ocr_quota = max(1, round(budget * ocr_share))
     metadata_quota = max(1, round(budget * metadata_share))
-    for item in visual_results[:visual_quota]:
-        add(combined.get(candidate_key(item)))
-    for hit in ocr_hits[:ocr_quota]:
-        add(combined.get((str(hit.video_id), int(hit.keyframe_number))))
+    take((combined.get(candidate_key(item)) for item in visual_results), visual_quota)
+    take(
+        (combined.get((str(hit.video_id), int(hit.keyframe_number))) for hit in ocr_hits),
+        ocr_quota,
+    )
     metadata_ranked = sorted(
         combined.values(),
         key=lambda item: float(getattr(item, "metadata_score", 0.0)),
         reverse=True,
     )
-    for item in metadata_ranked[:metadata_quota]:
-        add(item)
-    for item in sorted(combined.values(), key=lambda value: float(value.score), reverse=True):
-        add(item)
+    take(metadata_ranked, metadata_quota)
+    fused_ranked = sorted(combined.values(), key=lambda value: float(value.score), reverse=True)
+    take(fused_ranked, budget)
+    # If a filtered query genuinely has only one relevant video or a tight
+    # temporal burst, fill every remaining model slot after the diverse pass.
+    for item in fused_ranked:
+        add(item, enforce_diversity=False)
         if len(selected) >= budget:
             break
     return selected

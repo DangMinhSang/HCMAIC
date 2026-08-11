@@ -176,6 +176,7 @@ class AICRetrievalEngine:
         self._ram_video_positions: dict[str, int] = {}
         self._keyframe_dirs: dict[str, Path | None] = {}
         self._video_path_cache: dict[str, Path | None] = {}
+        self._object_label_cache: dict[tuple[str, int], tuple[str, ...]] = {}
         if os.environ.get("AIC_PRELOAD_FEATURES", "0").lower() in {"1", "true", "yes"}:
             self.preload_features()
 
@@ -253,7 +254,7 @@ class AICRetrievalEngine:
             video_id = next(iter(allowed_video_ids))
             try:
                 video_position = self._ram_video_positions[video_id]
-            except ValueError:
+            except KeyError:
                 return []
             start, end = self._ram_offsets[video_position : video_position + 2]
             scores = self._ram_features[start:end] @ query_vector
@@ -373,13 +374,19 @@ class AICRetrievalEngine:
         return scores
 
     def _object_labels(self, video_id: str, keyframe_number: int) -> tuple[str, ...]:
+        cache_key = (video_id, keyframe_number)
+        cached = self._object_label_cache.get(cache_key)
+        if cached is not None:
+            return cached
         path = self.paths.object_path(video_id, keyframe_number)
         if path is None:
+            self._object_label_cache[cache_key] = ()
             return ()
         try:
             with path.open(encoding="utf-8") as stream:
                 payload = json.load(stream)
         except (OSError, json.JSONDecodeError):
+            self._object_label_cache[cache_key] = ()
             return ()
 
         labels: list[str] = []
@@ -395,7 +402,9 @@ class AICRetrievalEngine:
                 labels.append(node.strip())
 
         visit(payload)
-        return tuple(dict.fromkeys(labels))
+        output = tuple(dict.fromkeys(labels))
+        self._object_label_cache[cache_key] = output
+        return output
 
     @staticmethod
     def _top_indices(scores: np.ndarray, limit: int) -> np.ndarray:

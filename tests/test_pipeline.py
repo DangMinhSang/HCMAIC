@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -113,6 +113,41 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("v4", {item.video_id for item in selected})
         diverse = select_diverse_results(selected, limit=4, min_frame_gap=0, max_per_video=1)
         self.assertEqual(len({item.video_id for item in diverse}), 4)
+
+    def test_qwen_candidate_pool_uses_soft_video_diversity(self) -> None:
+        candidates = [
+            SimpleNamespace(
+                video_id=video_id,
+                keyframe_number=index,
+                frame_id=index * 60,
+                score=1.0 - index * 0.01,
+                metadata_score=0.0,
+            )
+            for video_id in ("v1", "v2", "v3")
+            for index in range(1, 5)
+        ]
+        combined = {(item.video_id, item.keyframe_number): item for item in candidates}
+        selected = select_multisource_candidates(
+            candidates,
+            [],
+            combined,
+            6,
+            source_weights={"visual": 0.8, "ocr": 0.05, "metadata": 0.05, "object": 0.1},
+            max_per_video=2,
+            min_frame_gap=30,
+        )
+        counts = Counter(item.video_id for item in selected)
+        self.assertEqual(len(selected), 6)
+        self.assertLessEqual(max(counts.values()), 2)
+
+    def test_unknown_video_filter_returns_no_ram_candidates(self) -> None:
+        engine = AICRetrievalEngine.__new__(AICRetrievalEngine)
+        engine._ram_features = np.zeros((2, 512), dtype=np.float32)
+        engine._ram_offsets = np.array([0, 2], dtype=np.int64)
+        engine._ram_video_ids = ("known",)
+        engine._ram_video_positions = {"known": 0}
+        candidates = engine._ram_candidates(np.zeros(512, dtype=np.float32), 10, {"missing"})
+        self.assertEqual(candidates, [])
 
     def test_qwen_query_router_returns_normalized_ocr_priority(self) -> None:
         class FakeReranker:
