@@ -301,7 +301,14 @@ def main() -> None:
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)
     os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features else "1"
     os.environ["AIC_RERANKER"] = "1" if reranker_enabled else "0"
-    sys.path.insert(0, str(CODE))
+    # Keep site-packages ahead of the app directory. The project has a
+    # compatibility module named ``Code/datasets.py``; putting Code first
+    # shadows Hugging Face's external ``datasets`` package when
+    # sentence-transformers imports it.
+    code_path = str(CODE)
+    while code_path in sys.path:
+        sys.path.remove(code_path)
+    sys.path.append(code_path)
 
     if build_ocr:
         if not arguments.ocr_device.startswith("gpu"):
