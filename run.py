@@ -38,9 +38,9 @@ STALE_MODULES = (
 )
 
 
-def command(arguments: list[str]) -> None:
+def command(arguments: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(arguments), flush=True)
-    subprocess.run(arguments, check=True)
+    subprocess.run(arguments, check=True, env=env)
 
 
 def update_source(skip_update: bool) -> None:
@@ -102,6 +102,16 @@ def ensure_paddle_ocr_venv() -> Path:
     python = OCR_VENV / "bin" / "python"
     if not python.is_file():
         command([sys.executable, "-m", "venv", str(OCR_VENV)])
+    # Kaggle injects a sitecustomize through PYTHONPATH. It is valid for the
+    # notebook interpreter but can make a fresh venv fail before pip imports.
+    # Keep the OCR venv isolated and bootstrap pip even if an older failed run
+    # created the venv without it.
+    venv_env = os.environ.copy()
+    venv_env.pop("PYTHONPATH", None)
+    venv_env.pop("PYTHONHOME", None)
+    venv_env["VIRTUAL_ENV"] = str(OCR_VENV)
+    venv_env["PATH"] = f"{OCR_VENV / 'bin'}:{venv_env.get('PATH', '')}"
+    command([str(python), "-m", "ensurepip", "--upgrade"], env=venv_env)
     digest = hashlib.sha256((CODE / "requirements-ocr.txt").read_bytes()).hexdigest()
     marker = OCR_VENV / ".requirements.sha256"
     try:
@@ -121,12 +131,18 @@ def ensure_paddle_ocr_venv() -> Path:
                 "paddlepaddle-gpu==3.0.0",
                 "-i",
                 PADDLE_GPU_INDEX,
-            ]
+            ],
+            env=venv_env,
         )
-        command([str(python), "-m", "pip", "install", "-q", "-r", str(CODE / "requirements-ocr.txt")])
+        command(
+            [str(python), "-m", "pip", "install", "-q", "-r", str(CODE / "requirements-ocr.txt")],
+            env=venv_env,
+        )
         marker.write_text(digest + "\n", encoding="utf-8")
     probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"
-    result = subprocess.run([str(python), "-c", probe], text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        [str(python), "-c", probe], text=True, capture_output=True, check=False, env=venv_env
+    )
     if result.returncode != 0 or result.stdout.strip() != "1":
         raise RuntimeError("PaddleOCR virtualenv không thấy CUDA GPU. Hãy restart Kaggle session rồi Run all.")
     print("PaddleOCR GPU virtualenv đã sẵn sàng.", flush=True)
