@@ -137,6 +137,19 @@ export AIC_TRAKE_REFINE_SEQUENCES=3
 python run.py
 ```
 
+### Đo latency thật trên Kaggle T4
+
+Dừng cell dashboard trước để không giữ hai bản model trong VRAM, rồi chạy benchmark trong repo. Lần chạy đầu trong report là warm query sau startup; các lần sau còn cho thấy hiệu quả LRU cache:
+
+```bash
+cd /kaggle/working/HCMAIC
+PYTHONPATH=Code python Code/benchmark.py --task kis --repeat 3
+
+PYTHONPATH=Code python Code/benchmark.py --task trake --repeat 2 --query $'Event 1\nEvent 2\nEvent 3'
+```
+
+Output JSON tách `startup_seconds`, mean/min query time, kích thước corpus, model backend, tỷ trọng query và Top-1 của từng run. Đây là số cần dùng để chọn `AIC_RERANKER_CANDIDATES` trên chính session/dataset của bạn; benchmark local không đại diện cho Tesla T4.
+
 ## Troubleshooting
 
 ### `The 'any-to-any' transformer task requires transformers v5+`
