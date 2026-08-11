@@ -173,6 +173,7 @@ class AICRetrievalEngine:
         self._ram_features: np.ndarray | None = None
         self._ram_offsets: np.ndarray | None = None
         self._ram_video_ids: tuple[str, ...] = ()
+        self._ram_video_positions: dict[str, int] = {}
         self._keyframe_dirs: dict[str, Path | None] = {}
         self._video_path_cache: dict[str, Path | None] = {}
         if os.environ.get("AIC_PRELOAD_FEATURES", "0").lower() in {"1", "true", "yes"}:
@@ -222,6 +223,7 @@ class AICRetrievalEngine:
         self._ram_features = matrix
         self._ram_offsets = offsets
         self._ram_video_ids = video_ids
+        self._ram_video_positions = {video_id: index for index, video_id in enumerate(video_ids)}
 
     def prepare_runtime(self) -> None:
         """Preload query-invariant metadata and warm models before serving."""
@@ -250,7 +252,7 @@ class AICRetrievalEngine:
         if allowed_video_ids and len(allowed_video_ids) == 1:
             video_id = next(iter(allowed_video_ids))
             try:
-                video_position = self._ram_video_ids.index(video_id)
+                video_position = self._ram_video_positions[video_id]
             except ValueError:
                 return []
             start, end = self._ram_offsets[video_position : video_position + 2]
@@ -608,20 +610,22 @@ class AICRetrievalEngine:
             ]
         )
 
+        global_scores = (
+            np.asarray(self._ram_features @ vectors.T, dtype=np.float32)
+            if self._ram_features is not None and self._ram_offsets is not None
+            else None
+        )
         video_candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
         for video_id, feature_path in self._features.items():
-            if self._ram_features is not None and self._ram_offsets is not None:
-                position = self._ram_video_ids.index(video_id)
+            if global_scores is not None and self._ram_offsets is not None:
+                position = self._ram_video_positions[video_id]
                 start, end = self._ram_offsets[position : position + 2]
-                features = self._ram_features[start:end]
-                normalized = True
+                scores = global_scores[start:end]
             else:
                 features = np.load(feature_path, mmap_mode="r")
-                normalized = False
-            if features.ndim != 2 or features.shape[1] != vectors.shape[1]:
-                continue
-            scores = np.asarray(features @ vectors.T, dtype=np.float32)
-            if not normalized:
+                if features.ndim != 2 or features.shape[1] != vectors.shape[1]:
+                    continue
+                scores = np.asarray(features @ vectors.T, dtype=np.float32)
                 scores /= np.maximum(np.linalg.norm(features, axis=1, keepdims=True), 1e-12)
             alignment = self._ordered_alignment(scores)
             if alignment is None:
