@@ -166,6 +166,7 @@ class AICRetrievalEngine:
             )
         self._mapping_cache: dict[str, list[FrameMapping]] = {}
         self._mapping_lookup: dict[str, dict[int, FrameMapping]] = {}
+        self._mapping_positions: dict[str, dict[int, int]] = {}
         self._metadata_cache: dict[str, VideoMetadata] = {}
         self._metadata_tokens: dict[str, Counter[str]] = {}
         self._metadata_document_lengths: dict[str, int] = {}
@@ -300,6 +301,9 @@ class AICRetrievalEngine:
                     raise ValueError(f"Mapping không hợp lệ: {video_id}.csv") from error
         self._mapping_cache[video_id] = mappings
         self._mapping_lookup[video_id] = {item.keyframe_number: item for item in mappings}
+        self._mapping_positions[video_id] = {
+            item.keyframe_number: index for index, item in enumerate(mappings)
+        }
         return mappings
 
     def _keyframe_dir(self, video_id: str) -> Path | None:
@@ -516,6 +520,37 @@ class AICRetrievalEngine:
             ocr_text=ocr_text,
         )
 
+    def neighboring_keyframes(
+        self,
+        video_id: str,
+        keyframe_number: int,
+        *,
+        radius: int = 1,
+        query_vector: np.ndarray | None = None,
+    ) -> list[tuple[int, SearchResult]]:
+        """Materialize a small temporal neighborhood for exact-frame refinement."""
+        mapping = self._mapping(video_id)
+        center = self._mapping_positions[video_id].get(keyframe_number)
+        if center is None:
+            return []
+        radius = max(0, min(int(radius), 5))
+        output: list[tuple[int, SearchResult]] = []
+        for feature_index in range(max(0, center - radius), min(len(mapping), center + radius + 1)):
+            visual_score = 0.0
+            if query_vector is not None:
+                if self._ram_features is not None and self._ram_offsets is not None:
+                    video_position = self._ram_video_positions[video_id]
+                    vector = self._ram_features[int(self._ram_offsets[video_position]) + feature_index]
+                    visual_score = float(vector @ query_vector)
+                else:
+                    features = np.load(self._features[video_id], mmap_mode="r")
+                    vector = np.asarray(features[feature_index], dtype=np.float32)
+                    visual_score = float(vector @ query_vector) / max(float(np.linalg.norm(vector)), 1e-12)
+            result = self._candidate_to_result(_Candidate(video_id, feature_index, visual_score))
+            if result is not None:
+                output.append((feature_index, result))
+        return output
+
     def _raw_candidates(
         self,
         query_vector: np.ndarray,
@@ -729,6 +764,53 @@ class AICRetrievalEngine:
             return None
         event_scores = scores[indices, np.arange(event_count)]
         return indices, event_scores
+
+    @staticmethod
+    def _ordered_candidate_alignment(
+        frame_indices: Sequence[Sequence[int]],
+        candidate_scores: Sequence[Sequence[float]],
+    ) -> list[int] | None:
+        """Choose one candidate per event while preserving strict chronology."""
+        if not frame_indices or len(frame_indices) != len(candidate_scores):
+            return None
+        if any(not indices for indices in frame_indices):
+            return None
+        previous_scores = np.asarray(candidate_scores[0], dtype=np.float32)
+        if len(previous_scores) != len(frame_indices[0]):
+            return None
+        back_pointers: list[np.ndarray] = []
+        for event_index in range(1, len(frame_indices)):
+            current_indices = frame_indices[event_index]
+            current_values = np.asarray(candidate_scores[event_index], dtype=np.float32)
+            if len(current_values) != len(current_indices):
+                return None
+            previous_indices = frame_indices[event_index - 1]
+            current_dp = np.full(len(current_indices), -np.inf, dtype=np.float32)
+            pointers = np.full(len(current_indices), -1, dtype=np.int32)
+            for current_position, frame_index in enumerate(current_indices):
+                valid = [
+                    position
+                    for position, previous_frame in enumerate(previous_indices)
+                    if previous_frame < frame_index and np.isfinite(previous_scores[position])
+                ]
+                if not valid:
+                    continue
+                best_previous = max(valid, key=lambda position: float(previous_scores[position]))
+                current_dp[current_position] = (
+                    previous_scores[best_previous] + current_values[current_position]
+                )
+                pointers[current_position] = best_previous
+            previous_scores = current_dp
+            back_pointers.append(pointers)
+        if not np.isfinite(previous_scores).any():
+            return None
+        choices = [0] * len(frame_indices)
+        choices[-1] = int(np.nanargmax(previous_scores))
+        for event_index in range(len(frame_indices) - 1, 0, -1):
+            choices[event_index - 1] = int(back_pointers[event_index - 1][choices[event_index]])
+            if choices[event_index - 1] < 0:
+                return None
+        return choices
 
 
 def write_kis_submission(

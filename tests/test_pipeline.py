@@ -100,6 +100,15 @@ class PipelineTests(unittest.TestCase):
         scores = np.zeros((2, 3), dtype=np.float32)
         self.assertIsNone(AICRetrievalEngine._ordered_alignment(scores))
 
+    def test_trake_neighbor_refinement_stays_strictly_ordered(self) -> None:
+        choices = AICRetrievalEngine._ordered_candidate_alignment(
+            [[2, 3], [2, 3], [3, 4]],
+            [[0.90, 0.80], [0.95, 0.70], [0.99, 0.60]],
+        )
+        self.assertEqual(choices, [0, 1, 1])
+        selected = [indices[choice] for indices, choice in zip([[2, 3], [2, 3], [3, 4]], choices)]
+        self.assertTrue(all(left < right for left, right in zip(selected, selected[1:])))
+
     def test_ocr_bilingual_aliases_rank_exact_sign_first(self) -> None:
         index = OCRMemoryIndex(
             [

@@ -559,27 +559,37 @@ def make_trake_results(
             pair_budget = 32
         sequence_limit = min(len(sequences), max(1, pair_budget // len(events)))
         reranked_sequences = sequences[:sequence_limit]
+        center_scored_ids = {id(sequence) for sequence in reranked_sequences}
+        event_queries: list[str] = []
+        event_vectors = []
+        for event in events:
+            normalized = normalize_query(event)
+            event_queries.append(
+                event
+                if normalized.text_for_model.lower() == event.lower()
+                else f"{event}\nEnglish translation: {normalized.text_for_model}"
+            )
+            event_vectors.append(engine.encoder.encode(event))
         pair_queries: list[str] = []
         pair_frames: list[SearchResult] = []
         for sequence in reranked_sequences:
-            for event, frame in zip(events, sequence.frames):
-                normalized = normalize_query(event)
-                pair_queries.append(
-                    event
-                    if normalized.text_for_model.lower() == event.lower()
-                    else f"{event}\nEnglish translation: {normalized.text_for_model}"
-                )
+            for event_query, frame in zip(event_queries, sequence.frames):
+                pair_queries.append(event_query)
                 pair_frames.append(frame)
+        pair_prompt = (
+            "Score whether this exact video frame is the requested semantic moment. "
+            "Use the visible action, temporal stage, objects, and relevant text."
+        )
         try:
             pair_scores = reranker.score_pairs(
                 pair_queries,
                 pair_frames,
-                prompt=(
-                    "Score whether this exact video frame is the requested semantic moment. "
-                    "Use the visible action, temporal stage, objects, and relevant text."
-                ),
+                prompt=pair_prompt,
             )
             clip_scaled = normalized_scores([sequence.score for sequence in sequences])
+            clip_by_sequence = {
+                id(sequence): clip_score for sequence, clip_score in zip(sequences, clip_scaled)
+            }
             offset = 0
             for index, sequence in enumerate(sequences):
                 if index < sequence_limit:
@@ -594,11 +604,78 @@ def make_trake_results(
                 else:
                     sequence.score = 0.35 * clip_scaled[index]
             sequences.sort(key=lambda item: item.score, reverse=True)
+
+            try:
+                radius = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_RADIUS", "1")), 2))
+                refine_limit = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_SEQUENCES", "2")), 5))
+            except ValueError:
+                radius, refine_limit = 1, 2
+            refinement_targets = [
+                sequence for sequence in sequences if id(sequence) in center_scored_ids
+            ][:refine_limit]
+            refinement_frames: list[SearchResult] = []
+            refinement_queries: list[str] = []
+            refinement_groups: list[
+                tuple[TrakeVideoResult, list[list[tuple[int, SearchResult]]]]
+            ] = []
+            if radius and refinement_targets:
+                for sequence in refinement_targets:
+                    groups: list[list[tuple[int, SearchResult]]] = []
+                    for event_index, center in enumerate(sequence.frames):
+                        neighbors = engine.neighboring_keyframes(
+                            sequence.video_id,
+                            center.keyframe_number,
+                            radius=radius,
+                            query_vector=event_vectors[event_index],
+                        )
+                        groups.append(neighbors)
+                        refinement_frames.extend(frame for _index, frame in neighbors)
+                        refinement_queries.extend([event_queries[event_index]] * len(neighbors))
+                    refinement_groups.append((sequence, groups))
+                refinement_scores = reranker.score_pairs(
+                    refinement_queries,
+                    refinement_frames,
+                    prompt=pair_prompt,
+                )
+                score_offset = 0
+                for sequence, groups in refinement_groups:
+                    grouped_scores: list[list[float]] = []
+                    for group in groups:
+                        grouped_scores.append(
+                            refinement_scores[score_offset : score_offset + len(group)]
+                        )
+                        score_offset += len(group)
+                    choices = engine._ordered_candidate_alignment(
+                        [[feature_index for feature_index, _frame in group] for group in groups],
+                        grouped_scores,
+                    )
+                    if choices is None:
+                        continue
+                    selected_frames = [
+                        groups[event_index][choice][1]
+                        for event_index, choice in enumerate(choices)
+                    ]
+                    selected_scores = [
+                        grouped_scores[event_index][choice]
+                        for event_index, choice in enumerate(choices)
+                    ]
+                    model_score = 0.72 * (sum(selected_scores) / len(selected_scores)) + 0.28 * min(selected_scores)
+                    sequence.frames = selected_frames
+                    sequence.score = 0.88 * model_score + 0.12 * clip_by_sequence[id(sequence)]
+                    for frame, value in zip(selected_frames, selected_scores):
+                        frame.rerank_score = value
+                        frame.rerank_joint_score = value
+                        frame.score = value
+
+            sequences.sort(key=lambda item: item.score, reverse=True)
             for rank, sequence in enumerate(sequences, start=1):
                 sequence.rank = rank
                 for frame in sequence.frames:
                     frame.rank = rank
-            rerank_note = f" · Qwen: {len(pair_frames)} cặp event–frame"
+            rerank_note = (
+                f" · Qwen center: {len(pair_frames)} cặp"
+                + (f" · refine ±{radius}: {len(refinement_frames)} frame" if refinement_frames else "")
+            )
         except MultimodalRerankerUnavailableError as error:
             rerank_note = f" · Qwen TRAKE fallback: {str(error)[:120]}"
     stored: list[StoredResult] = []
