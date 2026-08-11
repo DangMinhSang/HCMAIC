@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import gc
+import gzip
 import hashlib
 import importlib
+import json
 import os
 import shutil
 import subprocess
@@ -94,6 +96,40 @@ def install_requirements(build_ocr: bool) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
 
 
+def _open_ocr_text(path: Path, mode: str):
+    return gzip.open(path, mode, encoding="utf-8") if path.suffix == ".gz" else path.open(mode, encoding="utf-8")
+
+
+def import_ocr_index(source: Path, destination: Path) -> int:
+    """Validate and install a previously exported text-only OCR index."""
+    source = source.expanduser().resolve()
+    destination = destination.expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"Không tìm thấy OCR index để import: {source}")
+    records = 0
+    try:
+        with _open_ocr_text(source, "rt") as stream:
+            for line_number, line in enumerate(stream, 1):
+                payload = json.loads(line)
+                if not payload.get("video_id") or "keyframe_number" not in payload:
+                    raise ValueError(f"Dòng OCR {line_number} thiếu video_id/keyframe_number")
+                records += 1
+    except (OSError, EOFError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"OCR index không hợp lệ hoặc bị thiếu: {source} ({exc})") from exc
+    if records == 0:
+        raise ValueError(f"OCR index rỗng: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source != destination.resolve():
+        shutil.copyfile(source, destination)
+    marker = Path(f"{destination}.complete")
+    marker.write_text(
+        json.dumps({"records": records, "imported_from": str(source)}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Đã import OCR index: {records:,} records → {destination}", flush=True)
+    return records
+
+
 def ensure_paddle_ocr_packages() -> dict[str, str]:
     """Install Paddle GPU privately, without changing Kaggle's dashboard env."""
     gpu_probe = subprocess.run(["nvidia-smi", "-L"], text=True, capture_output=True, check=False)
@@ -161,6 +197,8 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch the AIC dashboard on Kaggle")
     parser.add_argument("--skip-update", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--build-ocr", action="store_true", help="Pre-OCR mounted keyframes before launch")
+    parser.add_argument("--pre-ocr", action="store_true", help="Build OCR index rồi thoát, không mở dashboard")
+    parser.add_argument("--import-ocr", type=Path, metavar="PATH", help="Import OCR index đã pre-OCR từ PATH")
     parser.add_argument("--no-build-ocr", action="store_true", help="Launch with CLIP only when no OCR index exists")
     parser.add_argument("--ocr-index", type=Path, default=DEFAULT_OCR_INDEX)
     parser.add_argument("--data-root", default="/kaggle/input")
@@ -171,10 +209,20 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> None:
     arguments = parse_arguments()
+    if arguments.pre_ocr and arguments.import_ocr:
+        raise ValueError("Không dùng đồng thời --pre-ocr và --import-ocr.")
+    if arguments.pre_ocr and arguments.no_build_ocr:
+        raise ValueError("--pre-ocr cần chạy OCR; không dùng cùng --no-build-ocr.")
     update_source(arguments.skip_update)
+    if arguments.import_ocr:
+        import_ocr_index(arguments.import_ocr, arguments.ocr_index)
     complete_marker = Path(f"{arguments.ocr_index}.complete")
     index_ready = arguments.ocr_index.is_file() and complete_marker.is_file()
-    forced_ocr = arguments.build_ocr or os.environ.get("AIC_BUILD_OCR", "0").lower() in {"1", "true", "yes"}
+    forced_ocr = (
+        arguments.build_ocr
+        or arguments.pre_ocr
+        or os.environ.get("AIC_BUILD_OCR", "0").lower() in {"1", "true", "yes"}
+    )
     # Accuracy-first default: a fresh Kaggle session pre-OCRs once. Subsequent
     # Run all executions reuse the compact text index and launch immediately.
     build_ocr = forced_ocr or (not arguments.no_build_ocr and not index_ready)
@@ -203,6 +251,9 @@ def main() -> None:
             ],
             env=ocr_env,
         )
+        if arguments.pre_ocr:
+            print("Pre-OCR hoàn tất; index đã lưu, không khởi động dashboard.", flush=True)
+            return
 
     from data_paths import AICPaths
     from share_dashboard import launch_dashboard

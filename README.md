@@ -42,11 +42,25 @@ Kaggle đã có sẵn PyTorch đúng CUDA của image notebook. `requirements.tx
 
 ### OCR cho biển báo và chữ trong video
 
-Để truy vấn như “biển cảnh báo sạt lở nguy hiểm” ưu tiên ảnh có đúng nội dung chữ thay vì chỉ cảnh sạt lở, `run.py` tự pre-OCR ở lần đầu khi chưa có `aic_ocr_index.jsonl.gz`. Nó dùng PaddleOCR GPU `lang="vi"` để tạo file text-only; dashboard nạp file đó vào RAM khi khởi động. PaddleOCR được cài trong virtualenv riêng ở `/kaggle/working/aic_paddle_ocr_venv`, nên không xung đột CUDA với PyTorch/CLIP của dashboard. Query không chạy OCR trên ảnh và không tải/copy AIC dataset. Một từ điển nhỏ cho biển báo Việt–Anh (ví dụ `dangerous landslide warning` ↔ `cảnh báo sạt lở nguy hiểm`) cũng chạy hoàn toàn trong RAM.
+Để truy vấn như “biển cảnh báo sạt lở nguy hiểm” ưu tiên ảnh có đúng nội dung chữ thay vì chỉ cảnh sạt lở, `run.py` tự pre-OCR ở lần đầu khi chưa có `aic_ocr_index.jsonl.gz`. Nó dùng PaddleOCR GPU `lang="vi"` để tạo file text-only; dashboard nạp file đó vào RAM khi khởi động. PaddleOCR được cài trong thư mục package riêng ở `/kaggle/working/aic_paddle_ocr_packages`, nên không xung đột CUDA với PyTorch/CLIP của dashboard. Query không chạy OCR trên ảnh và không tải/copy AIC dataset. Một từ điển nhỏ cho biển báo Việt–Anh (ví dụ `dangerous landslide warning` ↔ `cảnh báo sạt lở nguy hiểm`) cũng chạy hoàn toàn trong RAM.
 
 Pre-OCR toàn bộ keyframe có thể mất đáng kể thời gian, vì vậy **phải bật Kaggle Accelerator = GPU** trước khi Run all. `run.py` kiểm tra GPU, dùng PaddleOCR CUDA trong virtualenv riêng và đặt `rec_batch_num=32` để tăng throughput nhận dạng trong mỗi frame; nếu chưa bật GPU, nó dừng ngay thay vì mất hàng trăm giờ trên CPU. Sau khi hoàn tất, lưu phiên bản Kaggle có file index hoặc đính kèm index ở lần chạy sau; `run.py` tự nhận `/kaggle/working/aic_ocr_index.jsonl.gz` và không build lại nếu index hợp lệ. Để bỏ qua OCR ở một phiên mới, chạy `python /kaggle/working/HCMAIC/run.py --no-build-ocr`. Launcher cũng đặt `AIC_PRELOAD_FEATURES=1`, giữ feature CLIP đã chuẩn hóa trong RAM để giảm thời gian query lặp lại mà không ghi cache feature ra đĩa.
 
 Kaggle thường mount dữ liệu ngay tại `/kaggle/input`. Nếu tên mount khác bố cục chuẩn, đặt các biến: `AIC_FEATURES_DIR`, `AIC_MAPPING_DIR`, `AIC_KEYFRAMES_DIR`, `AIC_METADATA_DIR`, `AIC_OBJECTS_DIR`, `AIC_VIDEOS_DIR`.
+
+#### Tách riêng bước OCR để dùng lại
+
+Có thể chạy OCR một lần rồi lưu file index text-only, sau đó các lần chạy sau không OCR lại:
+
+```bash
+# Chỉ pre-OCR, không mở dashboard
+python /kaggle/working/HCMAIC/run.py --pre-ocr --ocr-index /kaggle/working/aic_ocr_index.jsonl.gz
+
+# Ở phiên sau, import index đã lưu/mount rồi mở dashboard ngay
+python /kaggle/working/HCMAIC/run.py --import-ocr /kaggle/input/my-ocr/aic_ocr_index.jsonl.gz
+```
+
+`--import-ocr` kiểm tra toàn bộ JSONL trước khi tạo marker `.complete`; index rỗng hoặc bị ngắt sẽ bị từ chối. Chỉ file OCR nhỏ được lưu/chia sẻ, không có frame hay dataset nào được copy.
 
 ## Chạy cục bộ
 
