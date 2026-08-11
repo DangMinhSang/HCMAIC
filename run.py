@@ -24,9 +24,10 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
-# v2 intentionally avoids an earlier venv created without pip by Kaggle's
-# Python image. Keep it alongside the old directory; users need not delete it.
-OCR_VENV = RUNTIME_DIR / "aic_paddle_ocr_venv_v2"
+# Kaggle's CPython image has no ``ensurepip``, so a virtualenv cannot be
+# bootstrapped reliably there.  Keep Paddle packages in this private directory
+# and expose it only to the pre-OCR subprocess via PYTHONPATH.
+OCR_PACKAGES = RUNTIME_DIR / "aic_paddle_ocr_packages"
 PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 STALE_MODULES = (
     "dashboard",
@@ -93,70 +94,67 @@ def install_requirements(build_ocr: bool) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
 
 
-def ensure_paddle_ocr_venv() -> Path:
-    """Install Paddle GPU separately so it cannot break dashboard PyTorch."""
+def ensure_paddle_ocr_packages() -> dict[str, str]:
+    """Install Paddle GPU privately, without changing Kaggle's dashboard env."""
     gpu_probe = subprocess.run(["nvidia-smi", "-L"], text=True, capture_output=True, check=False)
     if gpu_probe.returncode != 0:
         raise RuntimeError(
             "Kaggle chưa bật GPU Accelerator. Vào Notebook settings → Accelerator → GPU, "
             "restart session rồi Run all. Không pre-OCR toàn bộ dataset bằng CPU."
         )
-    python = OCR_VENV / "bin" / "python"
-    if not python.is_file():
-        # Kaggle's CPython omits ensurepip. Including its system packages makes
-        # the mandatory sitecustomize dependency (wrapt) visible at startup;
-        # PaddleOCR itself is still installed in this venv first.
-        command([sys.executable, "-m", "venv", "--system-site-packages", str(OCR_VENV)])
-    venv_env = os.environ.copy()
-    venv_env.pop("PYTHONPATH", None)
-    venv_env.pop("PYTHONHOME", None)
-    venv_env["VIRTUAL_ENV"] = str(OCR_VENV)
-    venv_env["PATH"] = f"{OCR_VENV / 'bin'}:{venv_env.get('PATH', '')}"
+    ocr_env = os.environ.copy()
+    ocr_env.pop("PYTHONHOME", None)
+    inherited_path = ocr_env.get("PYTHONPATH", "")
+    ocr_env["PYTHONPATH"] = f"{OCR_PACKAGES}:{inherited_path}" if inherited_path else str(OCR_PACKAGES)
+    ocr_env["PYTHONNOUSERSITE"] = "1"
     digest = hashlib.sha256((CODE / "requirements-ocr.txt").read_bytes()).hexdigest()
-    marker = OCR_VENV / ".requirements.sha256"
+    marker = OCR_PACKAGES / ".requirements.sha256"
     try:
         installed_digest = marker.read_text(encoding="utf-8").strip()
     except OSError:
         installed_digest = ""
     if digest != installed_digest:
-        print("Đang cài PaddleOCR GPU trong virtualenv riêng…", flush=True)
+        print("Đang cài PaddleOCR GPU vào thư mục cách ly…", flush=True)
+        OCR_PACKAGES.mkdir(parents=True, exist_ok=True)
         command(
             [
                 sys.executable,
                 "-m",
                 "pip",
-                "--python",
-                str(python),
                 "install",
                 "-q",
                 "--no-cache-dir",
+                "--upgrade",
+                "--target",
+                str(OCR_PACKAGES),
                 "paddlepaddle-gpu==3.0.0",
                 "-i",
                 PADDLE_GPU_INDEX,
-            ],
+            ], env=ocr_env,
         )
         command(
             [
                 sys.executable,
                 "-m",
                 "pip",
-                "--python",
-                str(python),
                 "install",
                 "-q",
+                "--upgrade",
+                "--target",
+                str(OCR_PACKAGES),
                 "-r",
                 str(CODE / "requirements-ocr.txt"),
-            ],
+            ], env=ocr_env,
         )
         marker.write_text(digest + "\n", encoding="utf-8")
     probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"
     result = subprocess.run(
-        [str(python), "-c", probe], text=True, capture_output=True, check=False, env=venv_env
+        [sys.executable, "-c", probe], text=True, capture_output=True, check=False, env=ocr_env
     )
-    if result.returncode != 0 or result.stdout.strip() != "1":
-        raise RuntimeError("PaddleOCR virtualenv không thấy CUDA GPU. Hãy restart Kaggle session rồi Run all.")
-    print("PaddleOCR GPU virtualenv đã sẵn sàng.", flush=True)
-    return python
+    if result.returncode != 0 or result.stdout.strip().splitlines()[-1:] != ["1"]:
+        raise RuntimeError("PaddleOCR packages cách ly không thấy CUDA GPU. Hãy restart Kaggle session rồi Run all.")
+    print("PaddleOCR GPU packages cách ly đã sẵn sàng.", flush=True)
+    return ocr_env
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -191,18 +189,19 @@ def main() -> None:
     if build_ocr:
         if not arguments.ocr_device.startswith("gpu"):
             raise ValueError("Full pre-OCR chỉ hỗ trợ GPU. Dùng --no-build-ocr nếu không cần OCR.")
-        ocr_python = ensure_paddle_ocr_venv()
+        ocr_env = ensure_paddle_ocr_packages()
         os.environ["AIC_OCR_DEVICE"] = arguments.ocr_device
         print("Chưa có OCR index hợp lệ; đang pre-OCR keyframe đã mount.", flush=True)
         command(
             [
-                str(ocr_python),
+                sys.executable,
                 str(CODE / "build_ocr_index.py"),
                 "--output",
                 str(arguments.ocr_index),
                 "--device",
                 arguments.ocr_device,
-            ]
+            ],
+            env=ocr_env,
         )
 
     from data_paths import AICPaths
