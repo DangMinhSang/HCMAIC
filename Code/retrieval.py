@@ -78,6 +78,8 @@ class SearchResult:
     visual_score: float
     metadata_score: float
     score: float
+    object_score: float = 0.0
+    retrieval_score: float = 0.0
     title: str = ""
     object_labels: tuple[str, ...] = ()
     image_path: str | None = None
@@ -163,6 +165,7 @@ class AICRetrievalEngine:
                 f"Không tìm thấy cặp .npy/.csv trong {paths.features_dir} và {paths.mapping_dir}"
             )
         self._mapping_cache: dict[str, list[FrameMapping]] = {}
+        self._mapping_lookup: dict[str, dict[int, FrameMapping]] = {}
         self._metadata_cache: dict[str, VideoMetadata] = {}
         self._metadata_tokens: dict[str, Counter[str]] = {}
         self._metadata_ready = False
@@ -170,6 +173,8 @@ class AICRetrievalEngine:
         self._ram_features: np.ndarray | None = None
         self._ram_offsets: np.ndarray | None = None
         self._ram_video_ids: tuple[str, ...] = ()
+        self._keyframe_dirs: dict[str, Path | None] = {}
+        self._video_path_cache: dict[str, Path | None] = {}
         if os.environ.get("AIC_PRELOAD_FEATURES", "0").lower() in {"1", "true", "yes"}:
             self.preload_features()
 
@@ -218,6 +223,21 @@ class AICRetrievalEngine:
         self._ram_offsets = offsets
         self._ram_video_ids = video_ids
 
+    def prepare_runtime(self) -> None:
+        """Preload query-invariant metadata and warm models before serving."""
+        if self._ram_features is None and os.environ.get("AIC_PRELOAD_FEATURES", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            self.preload_features()
+        for video_id in self._features:
+            self._mapping(video_id)
+            self._metadata(video_id)
+            self._keyframe_dir(video_id)
+        self._prepare_metadata()
+        self.encoder.warmup()
+
     def _ram_candidates(
         self,
         query_vector: np.ndarray,
@@ -239,8 +259,10 @@ class AICRetrievalEngine:
             return [_Candidate(video_id, int(index), float(scores[index])) for index in indices]
 
         scores = self._ram_features @ query_vector
-        # NMS and max-per-video happen later, so retrieve a wider raw pool.
-        indices = self._top_indices(scores, min(len(scores), candidate_pool * 10))
+        # Candidate diversification happens later. Avoid materializing tens of
+        # thousands of frames only to discard them before the reranker.
+        raw_limit = candidate_pool if allowed_video_ids is None else candidate_pool * 3
+        indices = self._top_indices(scores, min(len(scores), raw_limit))
         output: list[_Candidate] = []
         for index in indices:
             video_position = int(np.searchsorted(self._ram_offsets, index, side="right") - 1)
@@ -271,7 +293,32 @@ class AICRetrievalEngine:
                 except (KeyError, TypeError, ValueError) as error:
                     raise ValueError(f"Mapping không hợp lệ: {video_id}.csv") from error
         self._mapping_cache[video_id] = mappings
+        self._mapping_lookup[video_id] = {item.keyframe_number: item for item in mappings}
         return mappings
+
+    def _keyframe_dir(self, video_id: str) -> Path | None:
+        if video_id not in self._keyframe_dirs:
+            self._keyframe_dirs[video_id] = next(
+                (
+                    root / "keyframes" / video_id
+                    for root in self.paths.keyframe_roots
+                    if (root / "keyframes" / video_id).is_dir()
+                ),
+                None,
+            )
+        return self._keyframe_dirs[video_id]
+
+    def _image_path(self, video_id: str, keyframe_number: int) -> Path | None:
+        directory = self._keyframe_dir(video_id)
+        if directory is None:
+            return None
+        candidate = directory / f"{keyframe_number:03d}.jpg"
+        return candidate if candidate.is_file() else None
+
+    def _video_path(self, video_id: str) -> Path | None:
+        if video_id not in self._video_path_cache:
+            self._video_path_cache[video_id] = self.paths.video_path(video_id)
+        return self._video_path_cache[video_id]
 
     def _metadata(self, video_id: str) -> VideoMetadata:
         cached = self._metadata_cache.get(video_id)
@@ -376,8 +423,8 @@ class AICRetrievalEngine:
             return None
         frame = mapping[candidate.feature_index]
         metadata = self._metadata(candidate.video_id)
-        image = self.paths.image_path(candidate.video_id, frame.keyframe_number)
-        video = self.paths.video_path(candidate.video_id)
+        image = self._image_path(candidate.video_id, frame.keyframe_number)
+        video = self._video_path(candidate.video_id)
         return SearchResult(
             rank=0,
             video_id=candidate.video_id,
@@ -387,6 +434,7 @@ class AICRetrievalEngine:
             visual_score=candidate.visual_score,
             metadata_score=0.0,
             score=candidate.visual_score,
+            retrieval_score=candidate.visual_score,
             title=metadata.title,
             image_path=str(image) if image is not None else None,
             video_path=str(video) if video is not None else None,
@@ -402,15 +450,13 @@ class AICRetrievalEngine:
         ocr_text: str = "",
     ) -> SearchResult | None:
         """Materialize an OCR hit with the official keyframe-to-frame mapping."""
-        frame = next(
-            (item for item in self._mapping(video_id) if item.keyframe_number == keyframe_number),
-            None,
-        )
+        self._mapping(video_id)
+        frame = self._mapping_lookup[video_id].get(keyframe_number)
         if frame is None:
             return None
         metadata = self._metadata(video_id)
-        image = self.paths.image_path(video_id, keyframe_number)
-        video = self.paths.video_path(video_id)
+        image = self._image_path(video_id, keyframe_number)
+        video = self._video_path(video_id)
         return SearchResult(
             rank=0,
             video_id=video_id,
@@ -420,6 +466,7 @@ class AICRetrievalEngine:
             visual_score=0.0,
             metadata_score=0.0,
             score=score,
+            retrieval_score=score,
             title=metadata.title,
             image_path=str(image) if image is not None else None,
             video_path=str(video) if video is not None else None,
@@ -433,7 +480,7 @@ class AICRetrievalEngine:
         top_k: int,
         allowed_video_ids: set[str] | None = None,
     ) -> list[_Candidate]:
-        candidate_pool = max(400, top_k * 25)
+        candidate_pool = max(800, top_k * 30)
         if self._ram_features is not None:
             return self._ram_candidates(query_vector, candidate_pool, allowed_video_ids)
         per_video_limit = max(30, min(100, candidate_pool // 8))
@@ -501,15 +548,23 @@ class AICRetrievalEngine:
 
         for result in results:
             result.metadata_score = metadata_scores.get(result.video_id, 0.0)
-            result.object_labels = self._object_labels(result.video_id, result.keyframe_number)
-            object_score = self._object_match_score(result.object_labels, query_tokens)
-            # Object labels are only a small tie-breaker: Faster R-CNN has a
-            # narrower vocabulary than CLIP and should never dominate vision.
             result.score = (
                 (1.0 - metadata_weight) * result.visual_score
                 + metadata_weight * result.metadata_score
-                + 0.03 * object_score
             )
+            result.retrieval_score = result.score
+        results.sort(key=lambda item: item.score, reverse=True)
+
+        try:
+            object_budget = max(0, min(int(os.environ.get("AIC_OBJECT_RERANK_CANDIDATES", "300")), 600))
+        except ValueError:
+            object_budget = 300
+        for result in results[:object_budget]:
+            result.object_labels = self._object_labels(result.video_id, result.keyframe_number)
+            result.object_score = self._object_match_score(result.object_labels, query_tokens)
+            # Faster R-CNN labels are a tie-breaker, never the primary signal.
+            result.score += 0.03 * result.object_score
+            result.retrieval_score = result.score
         results.sort(key=lambda item: item.score, reverse=True)
 
         chosen: list[SearchResult] = []
@@ -555,14 +610,27 @@ class AICRetrievalEngine:
 
         video_candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
         for video_id, feature_path in self._features.items():
-            features = np.load(feature_path, mmap_mode="r")
+            if self._ram_features is not None and self._ram_offsets is not None:
+                position = self._ram_video_ids.index(video_id)
+                start, end = self._ram_offsets[position : position + 2]
+                features = self._ram_features[start:end]
+                normalized = True
+            else:
+                features = np.load(feature_path, mmap_mode="r")
+                normalized = False
             if features.ndim != 2 or features.shape[1] != vectors.shape[1]:
                 continue
             scores = np.asarray(features @ vectors.T, dtype=np.float32)
-            scores /= np.maximum(np.linalg.norm(features, axis=1, keepdims=True), 1e-12)
-            best_indices = scores.argmax(axis=0)
-            best_scores = scores[best_indices, np.arange(len(clean_events))]
-            video_candidates.append((float(best_scores.mean()), video_id, best_indices, best_scores))
+            if not normalized:
+                scores /= np.maximum(np.linalg.norm(features, axis=1, keepdims=True), 1e-12)
+            alignment = self._ordered_alignment(scores)
+            if alignment is None:
+                continue
+            best_indices, best_scores = alignment
+            # The mean rewards overall fit; the minimum prevents a video with
+            # one missing stage from winning merely because other stages match.
+            sequence_score = 0.72 * float(best_scores.mean()) + 0.28 * float(best_scores.min())
+            video_candidates.append((sequence_score, video_id, best_indices, best_scores))
 
         best_videos = heapq.nlargest(top_videos, video_candidates, key=lambda item: item[0])
         output: list[TrakeVideoResult] = []
@@ -580,6 +648,43 @@ class AICRetrievalEngine:
             if len(aligned) == len(clean_events):
                 output.append(TrakeVideoResult(rank, video_id, score, aligned))
         return output
+
+    @staticmethod
+    def _ordered_alignment(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """Viterbi alignment with one strictly increasing frame per event."""
+        if scores.ndim != 2:
+            return None
+        frame_count, event_count = scores.shape
+        if frame_count < event_count or event_count == 0:
+            return None
+        dp = scores[:, 0].astype(np.float32, copy=True)
+        back = np.full((event_count, frame_count), -1, dtype=np.int32)
+        negative_infinity = np.float32(-1e30)
+        for event_index in range(1, event_count):
+            previous_best = np.full(frame_count, negative_infinity, dtype=np.float32)
+            previous_index = np.full(frame_count, -1, dtype=np.int32)
+            running_score = negative_infinity
+            running_index = -1
+            for frame_index in range(frame_count):
+                candidate_index = frame_index - 1
+                if candidate_index >= 0 and dp[candidate_index] > running_score:
+                    running_score = dp[candidate_index]
+                    running_index = candidate_index
+                previous_best[frame_index] = running_score
+                previous_index[frame_index] = running_index
+            dp = scores[:, event_index] + previous_best
+            back[event_index] = previous_index
+        final_index = int(np.argmax(dp))
+        if dp[final_index] <= negative_infinity / 2:
+            return None
+        indices = np.empty(event_count, dtype=np.int32)
+        indices[-1] = final_index
+        for event_index in range(event_count - 1, 0, -1):
+            indices[event_index - 1] = back[event_index, indices[event_index]]
+        if np.any(indices < 0):
+            return None
+        event_scores = scores[indices, np.arange(event_count)]
+        return indices, event_scores
 
 
 def write_kis_submission(

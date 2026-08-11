@@ -6,6 +6,7 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 VIETNAMESE_HINTS = {
@@ -39,6 +40,7 @@ def looks_vietnamese(text: str) -> bool:
     return len(tokens & VIETNAMESE_HINTS) >= 2
 
 
+@lru_cache(maxsize=512)
 def normalize_query(text: str) -> NormalizedQuery:
     """Return English text for models when a Vietnamese translation is available.
 

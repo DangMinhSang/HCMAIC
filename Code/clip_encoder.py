@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from query_language import NormalizedQuery, normalize_query
@@ -61,20 +62,36 @@ class ClipTextEncoder:
         ``english_expansion`` is retained for API compatibility, but the web UI
         deliberately exposes only one query field.
         """
-        self._load()
         query = (query or "").strip()
         english_expansion = (english_expansion or "").strip()
         if not query and not english_expansion:
             raise ValueError("Nhập mô tả truy vấn.")
+        self._load()
+        vector, normalized = self._encode_cached(query, english_expansion)
+        self.last_query = normalized
+        return vector
 
-        self.last_query = normalize_query(query) if query else NormalizedQuery("", english_expansion, "en", False)
-        base = english_expansion or self.last_query.text_for_model
-        prompts = [base, f"a video frame of {base}", f"a photograph of {base}"]
+    @lru_cache(maxsize=128)
+    def _encode_cached(self, query: str, english_expansion: str):
+        normalized = normalize_query(query) if query else NormalizedQuery("", english_expansion, "en", False)
+        base = english_expansion or normalized.text_for_model
+        prompts = [
+            base,
+            f"a video frame showing {base}",
+            f"a news video frame showing {base}",
+            f"a photograph of {base}",
+        ]
 
         tokens = self._clip.tokenize(prompts, truncate=True).to(self.device)
-        with self._torch.no_grad():
+        with self._torch.inference_mode():
             embeddings = self._model.encode_text(tokens).float()
             embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             query_embedding = embeddings.mean(dim=0)
             query_embedding = query_embedding / query_embedding.norm().clamp_min(1e-12)
-        return query_embedding.cpu().numpy().astype("float32", copy=False)
+        vector = query_embedding.cpu().numpy().astype("float32", copy=False)
+        vector.setflags(write=False)
+        return vector, normalized
+
+    def warmup(self) -> None:
+        """Load CLIP and execute one text pass before the first web query."""
+        self.encode("a person in a video")
