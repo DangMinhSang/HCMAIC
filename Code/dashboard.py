@@ -310,10 +310,25 @@ def make_qa_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]
                 result.answer = prediction.answer
                 result.qa_confidence = prediction.confidence
         if predictions:
-            best = predictions[0]
+            answer_scores: dict[str, float] = {}
+            answer_labels: dict[str, str] = {}
+            for prediction in predictions:
+                key = " ".join(prediction.answer.lower().split())
+                answer_labels.setdefault(key, prediction.answer)
+                rank_weight = 1.0 / (1.0 + 0.10 * max(prediction.rank - 1, 0))
+                answer_scores[key] = answer_scores.get(key, 0.0) + prediction.confidence * rank_weight
+            best_key = max(answer_scores, key=answer_scores.get)
+            consensus_answer = answer_labels[best_key]
+            best_confidence = max(
+                prediction.confidence
+                for prediction in predictions
+                if " ".join(prediction.answer.lower().split()) == best_key
+            )
             for result in results:
-                result.answer = result.answer or best.answer
-            note += f" · VQA: {best.answer} ({best.confidence:.0%})"
+                if not result.answer:
+                    result.answer = consensus_answer
+                    result.qa_confidence = best_confidence
+            note += f" · VQA đồng thuận: {consensus_answer} ({best_confidence:.0%})"
         else:
             note += " · Không có ảnh để chạy VQA."
     except RuntimeError as error:

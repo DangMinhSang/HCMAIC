@@ -65,13 +65,20 @@ class VQABaseline:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             self._processor = ViltProcessor.from_pretrained(self.model_name)
-            self._model = ViltForQuestionAnswering.from_pretrained(self.model_name).to(self.device).eval()
+            self._model = ViltForQuestionAnswering.from_pretrained(self.model_name)
+            if self.device == "cuda":
+                self._model = self._model.half()
+            self._model = self._model.to(self.device).eval()
         except Exception as error:
             raise RuntimeError(
                 "Không tải được model VQA. Bật Internet lần đầu hoặc cache model trước; "
                 "truy xuất keyframe vẫn hoạt động."
             ) from error
         self._torch = torch
+
+    def warmup(self) -> None:
+        """Load VQA weights before the dashboard starts accepting queries."""
+        self._load()
 
     def predict(self, question: str, results: Sequence[SearchResult], limit: int = 8) -> list[QAPrediction]:
         self._load()
@@ -87,7 +94,7 @@ class VQABaseline:
             with Image.open(result.image_path) as image:
                 inputs = self._processor(images=image.convert("RGB"), text=normalized.text_for_model, return_tensors="pt")
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
-            with self._torch.no_grad():
+            with self._torch.inference_mode():
                 logits = self._model(**inputs).logits[0]
                 probabilities = logits.softmax(dim=-1)
                 index = int(probabilities.argmax())
