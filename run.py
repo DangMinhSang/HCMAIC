@@ -26,6 +26,7 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
+RERANKER_REQUIREMENTS = CODE / "requirements-reranker.txt"
 # Kaggle's CPython image has no ``ensurepip``, so a virtualenv cannot be
 # bootstrapped reliably there.  Keep Paddle packages in this private directory
 # and expose it only to the pre-OCR subprocess via PYTHONPATH.
@@ -40,6 +41,7 @@ STALE_MODULES = (
     "clip_encoder",
     "qa",
     "query_language",
+    "multimodal_reranker",
 )
 
 
@@ -92,8 +94,42 @@ def install_if_changed(requirements: Path, marker_name: str) -> None:
     marker.write_text(digest + "\n", encoding="utf-8")
 
 
-def install_requirements(build_ocr: bool) -> None:
+def install_reranker_requirements() -> None:
+    """Install and probe the Kaggle-only Qwen reranker stack.
+
+    Keep this separate from the lightweight local requirements. The probe is
+    intentional: a stale marker must not silently produce the fallback path
+    after a Kaggle kernel was restarted or packages were removed.
+    """
+    marker_name = ".aic_reranker_requirements.sha256"
+    install_if_changed(RERANKER_REQUIREMENTS, marker_name)
+    probe = (
+        "import sentence_transformers, qwen_vl_utils, transformers; "
+        "from transformers import Qwen3VLForConditionalGeneration; "
+        "print(transformers.__version__)"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, check=False)
+    if result.returncode == 0:
+        print(f"Qwen reranker đã sẵn sàng (transformers {result.stdout.strip().splitlines()[-1]}).", flush=True)
+        return
+    print("Dependency Qwen reranker chưa hợp lệ; đang cài lại trong Kaggle kernel…", flush=True)
+    marker = RUNTIME_DIR / marker_name
+    marker.unlink(missing_ok=True)
+    install_if_changed(RERANKER_REQUIREMENTS, marker_name)
+    verify = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, check=False)
+    if verify.returncode != 0:
+        detail = (verify.stderr or verify.stdout).strip().splitlines()[-1:]
+        raise RuntimeError(
+            "Không thể kích hoạt Qwen reranker trong Kaggle. "
+            + (detail[0] if detail else "Kiểm tra Internet và GPU rồi restart kernel.")
+        )
+    print(f"Qwen reranker đã sẵn sàng (transformers {verify.stdout.strip().splitlines()[-1]}).", flush=True)
+
+
+def install_requirements(build_ocr: bool, enable_reranker: bool = True) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
+    if enable_reranker:
+        install_reranker_requirements()
 
 
 def _open_ocr_text(path: Path, mode: str):
@@ -204,6 +240,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--data-root", default="/kaggle/input")
     parser.add_argument("--ocr-device", default="gpu:0", help="OCR device; full pre-OCR requires gpu:0")
     parser.add_argument("--no-preload-features", action="store_true")
+    parser.add_argument("--no-reranker", action="store_true", help="Không cài/chạy Qwen multimodal reranker")
     return parser.parse_args()
 
 
@@ -227,11 +264,17 @@ def main() -> None:
     # Run all executions reuse the compact text index and launch immediately.
     build_ocr = forced_ocr or (not arguments.no_build_ocr and not index_ready)
     clear_source_cache()
-    install_requirements(build_ocr)
+    reranker_enabled = (
+        not arguments.no_reranker
+        and not arguments.pre_ocr
+        and os.environ.get("AIC_RERANKER", "1").lower() not in {"0", "false", "no"}
+    )
+    install_requirements(build_ocr, reranker_enabled)
 
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)
     os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features else "1"
+    os.environ["AIC_RERANKER"] = "1" if reranker_enabled else "0"
     sys.path.insert(0, str(CODE))
 
     if build_ocr:

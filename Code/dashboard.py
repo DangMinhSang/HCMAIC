@@ -71,7 +71,8 @@ def get_reranker() -> QwenVLQueryReranker | None:
         if RERANKER_ATTEMPTED:
             return RERANKER
         RERANKER_ATTEMPTED = True
-        if os.environ.get("AIC_RERANKER", "1").lower() in {"0", "false", "no"}:
+        default_enabled = "1" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "0"
+        if os.environ.get("AIC_RERANKER", default_enabled).lower() in {"0", "false", "no"}:
             RERANKER_ERROR = "đã tắt qua AIC_RERANKER=0"
             return None
         try:
@@ -177,12 +178,24 @@ def search_options(body: dict[str, Any]) -> tuple[int, int, int | None, str | No
 
 def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], str]:
     top_k, min_gap, maximum, video_id = search_options(body)
+    default_reranker_enabled = "1" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "0"
+    reranker_requested = os.environ.get("AIC_RERANKER", default_reranker_enabled).lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    # Recall broadly before applying the user's final Top-K/diversity rules.
+    # Otherwise the expensive multimodal model would only see the first 16
+    # CLIP answers and could not recover a correct frame ranked 30th or 80th.
+    recall_top_k = 100 if reranker_requested else top_k
+    recall_min_gap = 0 if reranker_requested else min_gap
+    recall_max_per_video = None if reranker_requested else maximum
     try:
         results = engine.search(
             query,
-            top_k=top_k,
-            min_frame_gap=min_gap,
-            max_per_video=maximum,
+            top_k=recall_top_k,
+            min_frame_gap=recall_min_gap,
+            max_per_video=recall_max_per_video,
             video_id=video_id,
             metadata_weight=0.10,
         )
@@ -191,10 +204,10 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         # sys.modules after git pull. Keep the dashboard usable until restart.
         if "unexpected keyword" not in str(error):
             raise
-        results = engine.search(query, top_k=top_k, min_frame_gap=min_gap, metadata_weight=0.10)
+        results = engine.search(query, top_k=recall_top_k, min_frame_gap=recall_min_gap, metadata_weight=0.10)
         if video_id:
             results = [result for result in results if result.video_id == video_id]
-        if maximum:
+        if maximum and not reranker_requested:
             counts: dict[str, int] = {}
             filtered = []
             for result in results:
@@ -236,10 +249,10 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         # Qwen is a cross-attention reranker, not a corpus scanner. Keep the
         # expensive pass bounded while ensuring OCR hits can enter the pool.
         try:
-            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "48")), 128))
+            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "100")), 100))
         except ValueError:
-            rerank_budget = 48
-        rerank_limit = min(rerank_budget, max(24, top_k * 2))
+            rerank_budget = 100
+        rerank_limit = min(rerank_budget, max(100, top_k * 2))
         rerank_candidates = sorted(combined.values(), key=lambda item: item.score, reverse=True)[:rerank_limit]
         try:
             rerank_scores = reranker.score(query, rerank_candidates)

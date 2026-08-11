@@ -44,7 +44,8 @@ class QwenVLQueryReranker:
         except ImportError as error:
             raise MultimodalRerankerUnavailableError(
                 "Thiếu sentence-transformers/qwen-vl-utils cho Qwen3-VL-Reranker. "
-                "Chạy lại requirements.txt hoặc tắt AIC_RERANKER."
+                "Chạy lại run.py trên Kaggle hoặc cài requirements-reranker.txt; "
+                "muốn tắt thì đặt AIC_RERANKER=0."
             ) from error
 
         if not torch.cuda.is_available() and os.environ.get("AIC_RERANKER_CPU", "0").lower() not in {

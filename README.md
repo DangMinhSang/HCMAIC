@@ -64,7 +64,7 @@ python /kaggle/working/HCMAIC/run.py --import-ocr /kaggle/input/my-ocr/aic_ocr_i
 
 ### AI rerank query–ảnh–OCR
 
-Sau bước CLIP/OCR recall, dashboard mặc định dùng `Qwen/Qwen3-VL-Reranker-2B` trên tối đa 48 ứng viên. Model chấm riêng độ khớp hình ảnh, độ khớp OCR và điểm kết hợp; điểm kết hợp mới được dùng để xếp hạng cuối. Model cần GPU và sẽ tải khoảng 4 GB trọng số ở query đầu tiên. Nếu cần chỉ chạy CLIP/OCR, đặt `AIC_RERANKER=0`; muốn thử CPU đặt `AIC_RERANKER_CPU=1` nhưng sẽ chậm.
+Sau bước CLIP/OCR recall, dashboard Kaggle mặc định dùng `Qwen/Qwen3-VL-Reranker-2B` trên tối đa 100 ứng viên (có thể tăng/giảm bằng `AIC_RERANKER_CANDIDATES`). Model chấm riêng độ khớp hình ảnh, độ khớp OCR và điểm kết hợp; điểm kết hợp mới được dùng để xếp hạng cuối. Model cần GPU và sẽ tải khoảng 4 GB trọng số ở query đầu tiên. `run.py` tự cài dependency Kaggle-only trong `requirements-reranker.txt`; local dashboard không cài model này. Nếu cần chỉ chạy CLIP/OCR trên Kaggle, đặt `AIC_RERANKER=0` hoặc thêm `--no-reranker`; muốn thử CPU đặt `AIC_RERANKER_CPU=1` nhưng sẽ chậm.
 
 Các biến tùy chọn: `AIC_RERANKER_MODEL`, `AIC_RERANKER_DEVICE`, `AIC_RERANKER_CANDIDATES`. Kết quả API trả thêm `ai_score`, `ai_visual_score`, `ai_ocr_score` và `ai_joint_score` để kiểm tra vì sao một frame được ưu tiên.
 

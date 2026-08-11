@@ -1,0 +1,5 @@
+# Kaggle-only accuracy reranker. Do not install this for the lightweight local
+# dashboard; run.py installs it after the base requirements in the GPU kernel.
+transformers>=4.57.0
+sentence-transformers>=5.4.0
+qwen-vl-utils>=0.0.14
