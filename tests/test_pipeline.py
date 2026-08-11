@@ -27,7 +27,7 @@ from evaluation import (
 from ocr_index import OCRMemoryIndex, OCRRecord
 from query_router import QueryProfile, build_query_profile
 from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
-from retrieval import AICRetrievalEngine
+from retrieval import AICRetrievalEngine, VideoMetadata
 
 
 class PipelineTests(unittest.TestCase):
@@ -148,6 +148,24 @@ class PipelineTests(unittest.TestCase):
         engine._ram_video_positions = {"known": 0}
         candidates = engine._ram_candidates(np.zeros(512, dtype=np.float32), 10, {"missing"})
         self.assertEqual(candidates, [])
+
+    def test_metadata_bm25_precompute_rewards_rare_terms(self) -> None:
+        engine = AICRetrievalEngine.__new__(AICRetrievalEngine)
+        engine._features = {"generic": None, "specific": None, "other": None}
+        engine._metadata_cache = {
+            "generic": VideoMetadata(title="daily news bulletin"),
+            "specific": VideoMetadata(title="daily news aurora expedition"),
+            "other": VideoMetadata(title="daily weather update"),
+        }
+        engine._metadata_tokens = {}
+        engine._metadata_document_lengths = {}
+        engine._metadata_average_length = 1.0
+        engine._metadata_idf = {}
+        engine._metadata_ready = False
+        engine.paths = SimpleNamespace(metadata_dir=Path("/metadata"))
+        scores = engine._metadata_scores("daily aurora", engine._features)
+        self.assertEqual(scores["specific"], 1.0)
+        self.assertGreater(scores["specific"], scores["generic"])
 
     def test_qwen_query_router_returns_normalized_ocr_priority(self) -> None:
         class FakeReranker:

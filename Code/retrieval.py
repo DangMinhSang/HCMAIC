@@ -168,6 +168,9 @@ class AICRetrievalEngine:
         self._mapping_lookup: dict[str, dict[int, FrameMapping]] = {}
         self._metadata_cache: dict[str, VideoMetadata] = {}
         self._metadata_tokens: dict[str, Counter[str]] = {}
+        self._metadata_document_lengths: dict[str, int] = {}
+        self._metadata_average_length = 1.0
+        self._metadata_idf: dict[str, float] = {}
         self._metadata_ready = False
         self._vector_count: int | None = None
         self._ram_features: np.ndarray | None = None
@@ -351,27 +354,55 @@ class AICRetrievalEngine:
     def _prepare_metadata(self) -> None:
         if self._metadata_ready:
             return
+        document_frequency: Counter[str] = Counter()
         for video_id in self._features:
-            self._metadata_tokens[video_id] = Counter(tokenize(self._metadata(video_id).searchable_text))
+            terms = Counter(tokenize(self._metadata(video_id).searchable_text))
+            self._metadata_tokens[video_id] = terms
+            self._metadata_document_lengths[video_id] = sum(terms.values())
+            document_frequency.update(terms.keys())
+        lengths = list(self._metadata_document_lengths.values())
+        self._metadata_average_length = sum(lengths) / len(lengths) if lengths else 1.0
+        total = max(1, len(self._metadata_tokens))
+        self._metadata_idf = {
+            term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
+            for term, frequency in document_frequency.items()
+        }
         self._metadata_ready = True
 
     def _metadata_scores(self, query: str, video_ids: Iterable[str]) -> dict[str, float]:
-        """A bounded lexical score for names/dates/channels missing from CLIP."""
+        """Normalized BM25 for names, dates and channels missing from CLIP."""
         tokens = [token for token in tokenize(query) if len(token) > 1]
         unique_video_ids = set(video_ids)
         if not tokens or self.paths.metadata_dir is None:
             return {video_id: 0.0 for video_id in unique_video_ids}
         self._prepare_metadata()
         query_counts = Counter(tokens)
-        scores: dict[str, float] = {}
+        raw_scores: dict[str, float] = {}
+        k1, b = 1.2, 0.75
         for video_id in unique_video_ids:
             document = self._metadata_tokens.get(video_id, Counter())
             if not document:
-                scores[video_id] = 0.0
+                raw_scores[video_id] = 0.0
                 continue
-            matched = sum(min(count, document.get(token, 0)) for token, count in query_counts.items())
-            scores[video_id] = matched / sum(query_counts.values())
-        return scores
+            document_length = self._metadata_document_lengths.get(video_id, 0)
+            normalizer = 1.0 - b + b * document_length / max(self._metadata_average_length, 1.0)
+            score = 0.0
+            matched = 0
+            for token, query_frequency in query_counts.items():
+                frequency = document.get(token, 0)
+                if not frequency:
+                    continue
+                matched += 1
+                term_frequency = frequency * (k1 + 1.0) / (frequency + k1 * normalizer)
+                score += self._metadata_idf.get(token, 0.0) * term_frequency * min(query_frequency, 2)
+            if matched:
+                coverage = matched / len(query_counts)
+                score *= 1.0 + 0.45 * coverage
+            raw_scores[video_id] = score
+        maximum = max(raw_scores.values(), default=0.0)
+        if maximum <= 0.0:
+            return {video_id: 0.0 for video_id in unique_video_ids}
+        return {video_id: score / maximum for video_id, score in raw_scores.items()}
 
     def _object_labels(self, video_id: str, keyframe_number: int) -> tuple[str, ...]:
         cache_key = (video_id, keyframe_number)
