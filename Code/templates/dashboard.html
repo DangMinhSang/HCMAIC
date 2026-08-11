@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>AIC26 Retrieval Workspace</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="." aria-label="AIC26 Retrieval">
+      <span class="brand-mark">A/26</span>
+      <span><strong>Retrieval Workspace</strong><small>Preliminary Search Console</small></span>
+    </a>
+    <nav class="task-tabs" aria-label="Loại bài toán">
+      <button class="task-tab active" data-task="kis"><span>01</span>KIS</button>
+      <button class="task-tab" data-task="qa"><span>02</span>Q&amp;A</button>
+      <button class="task-tab" data-task="trake"><span>03</span>TRAKE</button>
+    </nav>
+    <div class="system-state">
+      <span class="status-pill waiting" id="model-status"><i></i>Đang kiểm tra model</span>
+      <span class="corpus" id="corpus">Đang đọc dataset…</span>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <section class="query-panel" aria-labelledby="task-title">
+      <div class="query-heading">
+        <div>
+          <span class="section-label" id="task-kicker">TEXTUAL KNOWN ITEM SEARCH</span>
+          <h1 id="task-title">Tìm đúng khoảnh khắc</h1>
+          <p id="task-help">Mô tả sự kiện bằng tiếng Việt hoặc tiếng Anh. Hệ thống kết hợp CLIP, OCR và Qwen.</p>
+        </div>
+        <div class="score-rule" title="Cách chấm điểm trong thể lệ vòng sơ tuyển">
+          <span>R@k</span>
+          <strong>1 · 5 · 20 · 50 · 100</strong>
+        </div>
+      </div>
+
+      <div class="query-composer">
+        <textarea id="query" rows="4" spellcheck="false" placeholder="Ví dụ: Biển màu vàng có nội dung cảnh báo sạt lở nguy hiểm"></textarea>
+        <div class="composer-footer">
+          <div class="query-hints" id="query-hints">
+            <button data-example="Biển màu vàng có nội dung cảnh báo sạt lở nguy hiểm">Biển cảnh báo</button>
+            <button data-example="Một người đang phát biểu trước nhiều micro tại họp báo">Họp báo</button>
+          </div>
+          <span class="shortcut">Ctrl/⌘ + Enter</span>
+          <button class="primary-action" id="search"><span>Tìm kiếm</span><b>→</b></button>
+        </div>
+      </div>
+
+      <details class="filters">
+        <summary><span>Tùy chỉnh chiến lược</span><small>Accuracy-first · recall rộng trước rerank</small></summary>
+        <div class="filter-grid">
+          <label><span>Video</span><select id="video"><option value="">Tất cả video</option></select></label>
+          <label><span>Số kết quả</span><input id="topk" type="number" min="1" max="100" value="100"></label>
+          <label><span>Tối đa / video</span><input id="pervideo" type="number" min="0" max="100" value="4"></label>
+          <label><span>Khoảng cách frame</span><input id="dedupe" type="number" min="0" max="600" value="90"></label>
+        </div>
+        <div class="gap-presets" id="gap-presets" aria-label="Preset khoảng cách frame">
+          <button data-gap="0">Không lọc</button>
+          <button data-gap="30">30</button>
+          <button class="active" data-gap="90">90</button>
+          <button data-gap="180">180</button>
+        </div>
+      </details>
+    </section>
+
+    <main class="results-panel">
+      <div class="results-head">
+        <div>
+          <span class="section-label">RANKED RESULTS</span>
+          <h2 id="count">Sẵn sàng tìm kiếm</h2>
+        </div>
+        <div class="selection-actions">
+          <button data-select-top="5">Top 5</button>
+          <button data-select-top="20">Top 20</button>
+          <button data-select-top="100">Tất cả</button>
+          <button id="clear">Bỏ chọn</button>
+          <button class="export-action" id="export">Xuất CSV <span>0</span></button>
+        </div>
+      </div>
+
+      <div class="rank-scale" aria-label="Các mốc xếp hạng được chấm">
+        <span class="zone z1">Top 1</span><span class="zone z5">Top 5</span>
+        <span class="zone z20">Top 20</span><span class="zone z50">Top 50</span>
+        <span class="zone z100">Top 100</span>
+      </div>
+      <div class="query-summary" id="query-summary" hidden></div>
+      <div class="notice" id="notice">Nhập mô tả để bắt đầu. Query đầu tiên sẽ nhanh vì model đã được warmup.</div>
+      <div class="empty-state" id="empty">
+        <div class="empty-graphic"><span></span><span></span><span></span></div>
+        <h3>Chưa có keyframe</h3>
+        <p>Kết quả sẽ được xếp hạng theo độ phù hợp và hiển thị score breakdown tại đây.</p>
+      </div>
+      <div class="result-grid" id="grid"></div>
+    </main>
+  </div>
+
+  <aside class="inspector" id="inspector" aria-hidden="true">
+    <button class="inspector-close" id="inspector-close" aria-label="Đóng">×</button>
+    <img id="detail-image" alt="Keyframe đang xem">
+    <div class="detail-body">
+      <span class="section-label" id="detail-rank"></span>
+      <h2 id="detail-id"></h2>
+      <p id="detail-title"></p>
+      <dl id="detail-metrics"></dl>
+      <div class="detail-block"><strong>OCR</strong><p id="detail-ocr">Không có OCR.</p></div>
+      <div class="detail-block"><strong>Objects</strong><p id="detail-objects">Không có object metadata.</p></div>
+    </div>
+  </aside>
+  <div class="drawer-backdrop" id="drawer-backdrop"></div>
+  <div class="toast" id="toast" role="status"></div>
+
+  <script>window.AIC_CONFIG = {{ app_config|tojson }};</script>
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>
