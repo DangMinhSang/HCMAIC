@@ -244,6 +244,19 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def warmup_dashboard(reranker_enabled: bool) -> None:
+    """Load query-time resources before Gradio can receive HTTP requests."""
+    from dashboard import get_engine, get_ocr_index, get_reranker
+
+    print("Đang khởi tạo feature engine và OCR index trước khi mở dashboard…", flush=True)
+    get_engine()
+    get_ocr_index()
+    if reranker_enabled:
+        print("Đang tải Qwen reranker trước query đầu tiên…", flush=True)
+        if get_reranker() is None:
+            print("Qwen reranker không sẵn sàng; dashboard sẽ dùng CLIP/OCR fallback.", flush=True)
+
+
 def main() -> None:
     arguments = parse_arguments()
     if arguments.pre_ocr and arguments.import_ocr:
@@ -298,6 +311,7 @@ def main() -> None:
             print("Pre-OCR hoàn tất; index đã lưu, không khởi động dashboard.", flush=True)
             return
 
+    warmup_dashboard(reranker_enabled)
     from data_paths import AICPaths
     from share_dashboard import launch_dashboard
 

@@ -89,9 +89,13 @@ class QwenVLQueryReranker:
         if not pairs:
             return []
         try:
+            batch_size = max(1, min(int(os.environ.get("AIC_RERANKER_BATCH_SIZE", "1")), 4))
+        except ValueError:
+            batch_size = 1
+        try:
             values = self.model.predict(
                 pairs,
-                batch_size=1,
+                batch_size=batch_size,
                 show_progress_bar=False,
                 activation_fn=self._torch.nn.Sigmoid(),
                 prompt=prompt,
@@ -105,26 +109,25 @@ class QwenVLQueryReranker:
     def score(self, query: str, results: Sequence[Any]) -> list[RerankScore]:
         """Return visual/OCR/joint probabilities for each result.
 
-        The three passes intentionally isolate evidence types.  The joint
-        pass sees both image and OCR and receives the largest final weight.
+        Use one multimodal pass per candidate.  Three independent Qwen passes
+        (image, OCR, and joint) made a synchronous Gradio request exceed the
+        gateway timeout.  The joint score is the model score; visual/OCR are
+        calibrated first-stage signals retained as cheap supporting evidence.
         """
-        image_documents = [self._image_document(result) for result in results]
-        joint_documents = [self._joint_document(result) for result in results]
-        visual_documents = [document or {"text": "No image available."} for document in image_documents]
-        joint_documents = [document or {"text": "No image or OCR evidence available."} for document in joint_documents]
-
-        visual_scores = self._predict(query, visual_documents, VISUAL_PROMPT)
+        joint_documents = [
+            document or {"text": "No image or OCR evidence available."}
+            for document in (self._joint_document(result) for result in results)
+        ]
         joint_scores = self._predict(query, joint_documents, JOINT_PROMPT)
 
-        ocr_indices = [index for index, result in enumerate(results) if str(getattr(result, "ocr_text", "") or "").strip()]
-        ocr_scores = [0.0] * len(results)
-        if ocr_indices:
-            ocr_documents = [{"text": str(getattr(results[index], "ocr_text", "")).strip()} for index in ocr_indices]
-            values = self._predict(query, ocr_documents, OCR_PROMPT)
-            for index, value in zip(ocr_indices, values):
-                ocr_scores[index] = value
+        def bounded(value: Any) -> float:
+            return max(0.0, min(1.0, float(value or 0.0)))
 
         return [
-            RerankScore(visual_scores[index], ocr_scores[index], joint_scores[index])
-            for index in range(len(results))
+            RerankScore(
+                visual=bounded(getattr(result, "visual_score", 0.0)),
+                ocr=bounded(getattr(result, "ocr_score", 0.0)),
+                joint=joint_scores[index],
+            )
+            for index, result in enumerate(results)
         ]

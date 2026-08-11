@@ -249,10 +249,14 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         # Qwen is a cross-attention reranker, not a corpus scanner. Keep the
         # expensive pass bounded while ensuring OCR hits can enter the pool.
         try:
-            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "100")), 100))
+            # Recall still contains up to 100 candidates. A single Qwen
+            # multimodal pass over 24 is accurate enough for the final Top-K
+            # while keeping a synchronous /api/search request below the
+            # Gradio gateway timeout. Increase explicitly when needed.
+            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "24")), 100))
         except ValueError:
-            rerank_budget = 100
-        rerank_limit = min(rerank_budget, max(100, top_k * 2))
+            rerank_budget = 24
+        rerank_limit = min(rerank_budget, len(combined))
         rerank_candidates = sorted(combined.values(), key=lambda item: item.score, reverse=True)[:rerank_limit]
         try:
             rerank_scores = reranker.score(query, rerank_candidates)
