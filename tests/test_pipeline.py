@@ -14,12 +14,50 @@ if str(CODE) not in sys.path:
 import numpy as np
 
 from multimodal_reranker import QwenVLQueryReranker
+from evaluation import (
+    Interval,
+    KISGroundTruth,
+    QAGroundTruth,
+    TrakeGroundTruth,
+    final_score,
+    score_kis,
+    score_qa,
+    score_trake,
+)
 from ocr_index import OCRMemoryIndex, OCRRecord
 from ranking import select_diverse_results, select_multisource_candidates
 from retrieval import AICRetrievalEngine
 
 
 class PipelineTests(unittest.TestCase):
+    def test_pdf_final_score_example(self) -> None:
+        scores = [0.5, 0.0, 0.8, *([0.0] * 97)]
+        self.assertAlmostEqual(final_score(scores), 0.74)
+
+    def test_pdf_kis_and_qa_rules(self) -> None:
+        rows = [
+            {"video_id": "L01_V001", "frame_id": "505", "answer": "Năm"},
+            {"video_id": "L01_V001", "frame_id": "600", "answer": "5"},
+        ]
+        kis = KISGroundTruth("L01_V001", Interval(500, 510))
+        qa = QAGroundTruth("L01_V001", Interval(500, 510), ("5", "five"))
+        self.assertEqual(score_kis(rows, kis), [1.0, 0.0])
+        self.assertEqual(score_qa(rows, qa), [1.0, 0.0])
+
+    def test_pdf_trake_partial_credit_example(self) -> None:
+        rows = [{
+            "video_id": "L10_V010",
+            "frame_id_1": "101",
+            "frame_id_2": "156",
+            "frame_id_3": "203",
+            "frame_id_4": "251",
+        }]
+        ground_truth = TrakeGroundTruth(
+            "L10_V010",
+            (Interval(95, 105), Interval(145, 155), Interval(195, 205), Interval(245, 255)),
+        )
+        self.assertEqual(score_trake(rows, ground_truth), [0.75])
+
     def test_trake_alignment_is_strictly_ordered(self) -> None:
         scores = np.array(
             [
