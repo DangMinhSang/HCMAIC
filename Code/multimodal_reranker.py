@@ -35,6 +35,14 @@ class RerankScore:
         return 0.84 * self.joint + 0.10 * self.visual + 0.06 * self.ocr
 
 
+@dataclass(frozen=True)
+class _TextDocument:
+    """Adapt a text document to the same cached pair-scoring path as frames."""
+
+    ocr_text: str
+    image_path: str = ""
+
+
 class QwenVLQueryReranker:
     """Score a query against candidate frames with Qwen3-VL-Reranker-2B."""
 
@@ -183,6 +191,17 @@ class QwenVLQueryReranker:
                 "Qwen reranker trả thiếu điểm cho một hoặc nhiều candidate."
             )
         return [float(value) for value in output]
+
+    def score_documents(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        prompt: str = JOINT_PROMPT,
+    ) -> list[float]:
+        """Score text evidence descriptions without loading another model."""
+        adapted = [_TextDocument(str(document)) for document in documents]
+        return self.score_pairs([query] * len(adapted), adapted, prompt=prompt)
 
     def score(self, query: str, results: Sequence[Any]) -> list[RerankScore]:
         """Return visual/OCR/joint probabilities for each result.

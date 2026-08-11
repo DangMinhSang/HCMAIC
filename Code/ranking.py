@@ -27,8 +27,9 @@ def select_multisource_candidates(
     ocr_hits: Sequence[Any],
     combined: Mapping[CandidateKey, Any],
     budget: int,
+    source_weights: Mapping[str, float] | None = None,
 ) -> list[Any]:
-    """Guarantee Qwen coverage from vision, OCR, metadata, then fused score."""
+    """Guarantee adaptive Qwen coverage from vision, OCR and metadata."""
     budget = max(1, budget)
     selected: list[Any] = []
     seen: set[CandidateKey] = set()
@@ -41,9 +42,19 @@ def select_multisource_candidates(
             seen.add(key)
             selected.append(item)
 
-    visual_quota = max(1, round(budget * 0.55))
-    ocr_quota = max(1, round(budget * 0.30))
-    metadata_quota = max(1, budget // 10)
+    weights = source_weights or {}
+    if weights:
+        visual_share = min(
+            0.65,
+            max(0.30, float(weights.get("visual", 0.0)) + 0.35 * float(weights.get("object", 0.0))),
+        )
+        ocr_share = min(0.55, max(0.15, float(weights.get("ocr", 0.0))))
+        metadata_share = min(0.30, max(0.08, float(weights.get("metadata", 0.0))))
+    else:
+        visual_share, ocr_share, metadata_share = 0.55, 0.30, 0.10
+    visual_quota = max(1, round(budget * visual_share))
+    ocr_quota = max(1, round(budget * ocr_share))
+    metadata_quota = max(1, round(budget * metadata_share))
     for item in visual_results[:visual_quota]:
         add(combined.get(candidate_key(item)))
     for hit in ocr_hits[:ocr_quota]:
@@ -60,6 +71,27 @@ def select_multisource_candidates(
         if len(selected) >= budget:
             break
     return selected
+
+
+def fuse_adaptive_retrieval_scores(results: Sequence[Any], profile: Any) -> None:
+    """Fuse first-stage evidence using percentages chosen from the query."""
+    if not results:
+        return
+    base_scores = normalized_scores(
+        [float(getattr(result, "retrieval_score", getattr(result, "score", 0.0))) for result in results]
+    )
+    visual_scores = normalized_scores([float(getattr(result, "visual_score", 0.0)) for result in results])
+    for index, result in enumerate(results):
+        support = profile.support_score(
+            visual=visual_scores[index],
+            ocr=float(getattr(result, "ocr_score", 0.0)),
+            metadata=float(getattr(result, "metadata_score", 0.0)),
+            object_score=float(getattr(result, "object_score", 0.0)),
+        )
+        # Keep a small rank-preserving term so a weak router prediction cannot
+        # erase strong broad-recall evidence. The adaptive signal is primary.
+        result.score = 0.22 * base_scores[index] + 0.78 * support
+        result.retrieval_score = result.score
 
 
 def select_diverse_results(

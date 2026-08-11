@@ -108,6 +108,23 @@
     return `<div class="score-row ${kind}"><span>${label}</span><b><i style="--score:${percent}%"></i></b><em>${percent}%</em></div>`;
   }
 
+  function renderQueryProfile(profile) {
+    const container = $("#query-routing");
+    if (!profile) {
+      container.hidden = true;
+      container.replaceChildren();
+      return;
+    }
+    const sources = [
+      ["visual", "Hình ảnh"], ["ocr", "OCR"], ["metadata", "Metadata"], ["object", "Object"],
+    ];
+    container.innerHTML = `<span class="route-source">${escapeHtml(profile.source || "Query router")}</span>${sources.map(([key, label]) => {
+      const percent = scorePercent(profile[key]);
+      return `<div class="route-meter ${key}"><span>${label}<strong>${percent}%</strong></span><b><i style="--route:${percent}%"></i></b></div>`;
+    }).join("")}`;
+    container.hidden = false;
+  }
+
   function toggleItem(item) {
     const targets = state.task === "trake"
       ? state.results.filter((candidate) => candidate.rank === item.rank)
@@ -254,6 +271,7 @@
       $("#count").textContent = `${state.results.length} kết quả · ${(data.elapsed_ms / 1000).toFixed(2)} giây`;
       $("#query-summary").hidden = false;
       $("#query-summary").textContent = query;
+      renderQueryProfile(data.query_profile);
       $("#notice").textContent = data.notice || "Hoàn thành.";
       render();
       updateSelection();
@@ -264,6 +282,7 @@
       $("#count").textContent = "Truy vấn chưa hoàn thành";
       $("#notice").className = "notice error";
       $("#notice").textContent = error.message;
+      renderQueryProfile(null);
       render();
       updateSelection();
       toast(error.message);
@@ -297,6 +316,7 @@
     $("#count").textContent = "Sẵn sàng tìm kiếm";
     $("#notice").textContent = task === "trake" ? "Nhập ít nhất hai event, mỗi event một dòng." : "Nhập mô tả để bắt đầu.";
     $("#query-summary").hidden = true;
+    renderQueryProfile(null);
     render();
     updateSelection();
   }

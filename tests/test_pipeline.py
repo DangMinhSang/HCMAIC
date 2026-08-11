@@ -25,7 +25,8 @@ from evaluation import (
     score_trake,
 )
 from ocr_index import OCRMemoryIndex, OCRRecord
-from ranking import select_diverse_results, select_multisource_candidates
+from query_router import QueryProfile, build_query_profile
+from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
 from retrieval import AICRetrievalEngine
 
 
@@ -113,6 +114,38 @@ class PipelineTests(unittest.TestCase):
         diverse = select_diverse_results(selected, limit=4, min_frame_gap=0, max_per_video=1)
         self.assertEqual(len({item.video_id for item in diverse}), 4)
 
+    def test_qwen_query_router_returns_normalized_ocr_priority(self) -> None:
+        class FakeReranker:
+            def score_documents(self, _query, _documents, *, prompt):
+                self.prompt = prompt
+                return [0.15, 0.96, 0.10, 0.25]
+
+        profile = build_query_profile("Biển có nội dung cảnh báo sạt lở", FakeReranker())
+        self.assertEqual(profile.source, "Qwen+lexical")
+        self.assertGreater(profile.ocr, max(profile.visual, profile.metadata, profile.object))
+        self.assertAlmostEqual(sum(profile.values().values()), 1.0)
+
+    def test_adaptive_ocr_fusion_can_recover_exact_text_candidate(self) -> None:
+        visual = SimpleNamespace(
+            visual_score=0.95,
+            ocr_score=0.0,
+            metadata_score=0.0,
+            object_score=0.0,
+            retrieval_score=0.9,
+            score=0.9,
+        )
+        exact_text = SimpleNamespace(
+            visual_score=0.35,
+            ocr_score=1.0,
+            metadata_score=0.0,
+            object_score=0.0,
+            retrieval_score=0.4,
+            score=0.4,
+        )
+        profile = QueryProfile(visual=0.15, ocr=0.75, metadata=0.05, object=0.05, source="test")
+        fuse_adaptive_retrieval_scores([visual, exact_text], profile)
+        self.assertGreater(exact_text.score, visual.score)
+
     def test_qwen_pair_scores_are_cached(self) -> None:
         model = QwenVLQueryReranker.__new__(QwenVLQueryReranker)
         model._score_cache = OrderedDict()
@@ -128,6 +161,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(model.score_pairs(["query"], [result]), [0.9])
         self.assertEqual(model.score_pairs(["query"], [result]), [0.9])
         self.assertEqual(calls, [1])
+        self.assertEqual(model.score_documents("route", ["OCR evidence", "visual evidence"]), [0.9, 0.9])
+        self.assertEqual(model.score_documents("route", ["OCR evidence", "visual evidence"]), [0.9, 0.9])
+        self.assertEqual(calls, [1, 2])
 
 
 if __name__ == "__main__":

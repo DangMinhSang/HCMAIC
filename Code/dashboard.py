@@ -26,7 +26,13 @@ from multimodal_reranker import (
 from ocr_index import OCRMemoryIndex
 from qa import VQABaseline, split_qa_query
 from query_language import normalize_query
-from ranking import normalized_scores, select_diverse_results, select_multisource_candidates
+from query_router import QueryProfile, build_query_profile
+from ranking import (
+    fuse_adaptive_retrieval_scores,
+    normalized_scores,
+    select_diverse_results,
+    select_multisource_candidates,
+)
 from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult
 
 
@@ -97,6 +103,7 @@ class SearchJob:
     finished_at: float = 0.0
     elapsed_ms: int = 0
     notice: str = ""
+    query_profile: dict[str, float | str] = field(default_factory=dict)
     result_ids: list[str] = field(default_factory=list)
     error: str = ""
 
@@ -142,6 +149,7 @@ def warmup_reranker() -> bool:
             sample = engine.result_for_keyframe(video_id, mapping[0].keyframe_number)
             if sample is not None and sample.image_path:
                 reranker.score("a representative video frame", [sample])
+                build_query_profile("exact words written on a yellow warning sign", reranker)
                 return True
         raise MultimodalRerankerUnavailableError("Không tìm thấy keyframe để warmup Qwen.")
     except MultimodalRerankerUnavailableError as error:
@@ -309,8 +317,18 @@ def search_options(body: dict[str, Any]) -> tuple[int, int, int | None, str | No
     return top_k, min_gap, max_per_video, video_id
 
 
-def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], str]:
+def make_kis_results(
+    engine: AICRetrievalEngine,
+    query: str,
+    body: dict[str, Any],
+    *,
+    profile: QueryProfile | None = None,
+    reranker: QwenVLQueryReranker | None = None,
+) -> tuple[list[StoredResult], str]:
     top_k, min_gap, maximum, video_id = search_options(body)
+    if profile is None:
+        reranker = reranker or get_reranker()
+        profile = build_query_profile(query, reranker)
     default_reranker_enabled = "1" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "0"
     reranker_requested = os.environ.get("AIC_RERANKER", default_reranker_enabled).lower() not in {
         "0",
@@ -330,14 +348,19 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
             min_frame_gap=recall_min_gap,
             max_per_video=recall_max_per_video,
             video_id=video_id,
-            metadata_weight=0.10,
+            metadata_weight=profile.metadata_weight,
         )
     except TypeError as error:
         # A running Kaggle kernel can retain an older retrieval module in
         # sys.modules after git pull. Keep the dashboard usable until restart.
         if "unexpected keyword" not in str(error):
             raise
-        results = engine.search(query, top_k=recall_top_k, min_frame_gap=recall_min_gap, metadata_weight=0.10)
+        results = engine.search(
+            query,
+            top_k=recall_top_k,
+            min_frame_gap=recall_min_gap,
+            metadata_weight=profile.metadata_weight,
+        )
         if video_id:
             results = [result for result in results if result.video_id == video_id]
         if maximum and not reranker_requested:
@@ -377,21 +400,25 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
             )
             existing.retrieval_score = existing.score
 
+    fuse_adaptive_retrieval_scores(list(combined.values()), profile)
     rerank_note = ""
-    reranker = get_reranker()
     if reranker and combined:
         # Qwen is a cross-attention reranker, not a corpus scanner. Keep the
         # expensive pass bounded while ensuring OCR hits can enter the pool.
         try:
-            # Recall still contains up to 100 candidates. A single Qwen
-            # multimodal pass over 24 is accurate enough for the final Top-K
-            # while keeping a synchronous /api/search request below the
-            # Gradio gateway timeout. Increase explicitly when needed.
-            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "24")), 100))
+            # The HTTP layer is asynchronous, so the accuracy-first default
+            # can inspect 32 multimodal candidates without a gateway timeout.
+            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "32")), 100))
         except ValueError:
-            rerank_budget = 24
+            rerank_budget = 32
         rerank_limit = min(rerank_budget, len(combined))
-        rerank_candidates = select_multisource_candidates(results, hits, combined, rerank_limit)
+        rerank_candidates = select_multisource_candidates(
+            results,
+            hits,
+            combined,
+            rerank_limit,
+            source_weights=profile.values(),
+        )
         try:
             normalized = normalize_query(query)
             rerank_query = query
@@ -399,11 +426,17 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
                 rerank_query = f"{query}\nEnglish translation: {normalized.text_for_model}"
             rerank_scores = reranker.score(rerank_query, rerank_candidates)
             for result, rerank_score in zip(rerank_candidates, rerank_scores):
-                result.rerank_score = rerank_score.final
                 result.rerank_joint_score = rerank_score.joint
                 result.rerank_visual_score = rerank_score.visual
                 result.rerank_ocr_score = rerank_score.ocr
-                result.score = rerank_score.final
+                adaptive_support = profile.support_score(
+                    visual=rerank_score.visual,
+                    ocr=rerank_score.ocr,
+                    metadata=result.metadata_score,
+                    object_score=result.object_score,
+                )
+                result.score = 0.80 * rerank_score.joint + 0.20 * adaptive_support
+                result.rerank_score = result.score
             # Candidates outside the reranker budget remain available as a
             # diversity fallback, but cannot outrank model-scored candidates.
             if len(rerank_candidates) < len(combined):
@@ -425,12 +458,28 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         max_per_video=maximum,
     )
     ocr_note = f"OCR RAM: {len(hits)} keyframe khớp chữ." if ocr_index else "OCR index chưa được nạp."
-    return [StoredResult(result) for result in selected], language_note(engine) + " · " + ocr_note + rerank_note
+    return (
+        [StoredResult(result) for result in selected],
+        language_note(engine) + " · " + profile.summary() + " · " + ocr_note + rerank_note,
+    )
 
 
-def make_qa_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], str]:
+def make_qa_results(
+    engine: AICRetrievalEngine,
+    query: str,
+    body: dict[str, Any],
+    *,
+    profile: QueryProfile | None = None,
+    reranker: QwenVLQueryReranker | None = None,
+) -> tuple[list[StoredResult], str]:
     event, question = split_qa_query(query)
-    stored, note = make_kis_results(engine, event, body)
+    stored, note = make_kis_results(
+        engine,
+        event,
+        body,
+        profile=profile,
+        reranker=reranker,
+    )
     results = [item.result for item in stored]
     try:
         predictions = get_vqa().predict(question, results)
@@ -468,17 +517,24 @@ def make_qa_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]
     return stored, note
 
 
-def make_trake_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], dict[str, TrakeVideoResult], str]:
+def make_trake_results(
+    engine: AICRetrievalEngine,
+    query: str,
+    body: dict[str, Any],
+    *,
+    profile: QueryProfile | None = None,
+    reranker: QwenVLQueryReranker | None = None,
+) -> tuple[list[StoredResult], dict[str, TrakeVideoResult], str]:
     events = [line.strip().lstrip("-0123456789. ") for line in query.splitlines() if line.strip()]
     top_k, _gap, _maximum, _video_id = search_options(body)
     sequences = engine.search_trake(events, top_videos=min(top_k, 100))
     rerank_note = ""
-    reranker = get_reranker()
+    profile = profile or build_query_profile(query, reranker)
     if reranker and sequences:
         try:
-            pair_budget = max(1, min(int(os.environ.get("AIC_TRAKE_RERANK_PAIRS", "24")), 100))
+            pair_budget = max(1, min(int(os.environ.get("AIC_TRAKE_RERANK_PAIRS", "32")), 100))
         except ValueError:
-            pair_budget = 24
+            pair_budget = 32
         sequence_limit = min(len(sequences), max(1, pair_budget // len(events)))
         reranked_sequences = sequences[:sequence_limit]
         pair_queries: list[str] = []
@@ -533,7 +589,8 @@ def make_trake_results(engine: AICRetrievalEngine, query: str, body: dict[str, A
     return (
         stored,
         indexed,
-        "TRAKE căn chỉnh có thứ tự thời gian; chọn một card để xuất cả chuỗi video."
+        "TRAKE căn chỉnh có thứ tự thời gian; chọn một card để xuất cả chuỗi video. · "
+        + profile.summary()
         + rerank_note,
     )
 
@@ -591,15 +648,36 @@ def run_search_job(
         job.started_at = time.monotonic()
     try:
         engine = get_engine()
+        reranker = get_reranker()
+        profile_query = split_qa_query(query)[0] if task == "qa" else query
+        profile = build_query_profile(profile_query, reranker)
         with ENGINE_LOCK:
             if task == "kis":
-                stored, notice = make_kis_results(engine, query, body)
+                stored, notice = make_kis_results(
+                    engine,
+                    query,
+                    body,
+                    profile=profile,
+                    reranker=reranker,
+                )
                 sequences: dict[str, TrakeVideoResult] = {}
             elif task == "qa":
-                stored, notice = make_qa_results(engine, query, body)
+                stored, notice = make_qa_results(
+                    engine,
+                    query,
+                    body,
+                    profile=profile,
+                    reranker=reranker,
+                )
                 sequences = {}
             else:
-                stored, sequences, notice = make_trake_results(engine, query, body)
+                stored, sequences, notice = make_trake_results(
+                    engine,
+                    query,
+                    body,
+                    profile=profile,
+                    reranker=reranker,
+                )
         result_ids: list[str] = []
         with SESSIONS_LOCK:
             state = SESSIONS.setdefault(session_id, SearchSession())
@@ -620,6 +698,7 @@ def run_search_job(
                 job.finished_at = time.monotonic()
                 job.elapsed_ms = elapsed_ms
                 job.notice = notice
+                job.query_profile = profile.as_dict()
                 job.result_ids = result_ids
     except (DatasetNotFoundError, ValueError, RuntimeError, OSError) as error:
         with SEARCH_JOBS_LOCK:
@@ -728,6 +807,7 @@ def search_status(job_id: str):
         task = job.task
         query = job.query
         notice = job.notice
+        query_profile = dict(job.query_profile)
 
     state = session_state(session_id)
     with SESSIONS_LOCK:
@@ -741,6 +821,7 @@ def search_status(job_id: str):
             **response,
             "results": payload,
             "notice": notice,
+            "query_profile": query_profile,
             "task": task,
             "query": query,
         }

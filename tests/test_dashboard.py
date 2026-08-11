@@ -127,6 +127,11 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(payload["notice"], "pipeline complete")
         self.assertEqual(payload["results"][0]["frame_id"], 500)
+        self.assertAlmostEqual(
+            sum(payload["query_profile"][name] for name in ("visual", "ocr", "metadata", "object")),
+            1.0,
+            places=3,
+        )
 
     def test_video_route_supports_browser_byte_ranges(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".mp4") as video:

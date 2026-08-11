@@ -41,6 +41,7 @@ STALE_MODULES = (
     "clip_encoder",
     "qa",
     "query_language",
+    "query_router",
     "multimodal_reranker",
     "ranking",
 )
