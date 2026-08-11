@@ -24,6 +24,8 @@ from multimodal_reranker import (
 )
 from ocr_index import OCRMemoryIndex
 from qa import VQABaseline, split_qa_query
+from query_language import normalize_query
+from ranking import normalized_scores, select_diverse_results, select_multisource_candidates
 from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult
 
 
@@ -80,6 +82,29 @@ def get_reranker() -> QwenVLQueryReranker | None:
         except MultimodalRerankerUnavailableError as error:
             RERANKER_ERROR = str(error)
         return RERANKER
+
+
+def warmup_reranker() -> bool:
+    """Exercise a real image pair before exposing the public dashboard."""
+    global RERANKER, RERANKER_ERROR
+    reranker = get_reranker()
+    if reranker is None:
+        return False
+    engine = get_engine()
+    try:
+        for video_id in engine._features:
+            mapping = engine._mapping(video_id)
+            if not mapping:
+                continue
+            sample = engine.result_for_keyframe(video_id, mapping[0].keyframe_number)
+            if sample is not None and sample.image_path:
+                reranker.score("a representative video frame", [sample])
+                return True
+        raise MultimodalRerankerUnavailableError("Không tìm thấy keyframe để warmup Qwen.")
+    except MultimodalRerankerUnavailableError as error:
+        RERANKER_ERROR = str(error)
+        RERANKER = None
+        return False
 
 
 def get_vqa() -> VQABaseline:
@@ -151,8 +176,14 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         "time": time_label(result.pts_time),
         "score": round(result.score, 3),
         "clip": round(result.visual_score, 3),
+        "retrieval_score": round(getattr(result, "retrieval_score", 0.0), 3),
+        "metadata_score": round(result.metadata_score, 3),
+        "object_score": round(getattr(result, "object_score", 0.0), 3),
+        "keyframe_number": result.keyframe_number,
         "title": result.title,
+        "objects": list(result.object_labels[:8]),
         "answer": getattr(result, "answer", ""),
+        "qa_confidence": round(getattr(result, "qa_confidence", 0.0), 3),
         "ocr_score": round(getattr(result, "ocr_score", 0.0), 3),
         "ocr_text": getattr(result, "ocr_text", ""),
         "ai_score": round(getattr(result, "rerank_score", 0.0), 3),
@@ -168,9 +199,9 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
 
 def search_options(body: dict[str, Any]) -> tuple[int, int, int | None, str | None]:
     options = body.get("options") or {}
-    top_k = max(1, min(int(options.get("top_k", 16)), 100))
+    top_k = max(1, min(int(options.get("top_k", 100)), 100))
     min_gap = max(0, min(int(options.get("dedupe", 0)), 600))
-    max_per_video_raw = int(options.get("max_per_video", 3))
+    max_per_video_raw = int(options.get("max_per_video", 4))
     max_per_video = max(1, min(max_per_video_raw, 100)) if max_per_video_raw else None
     video_id = str(options.get("video_id") or "").strip() or None
     return top_k, min_gap, max_per_video, video_id
@@ -216,7 +247,7 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
                     filtered.append(result)
             results = filtered
     ocr_index = get_ocr_index()
-    hits = ocr_index.search(query, limit=max(top_k * 12, 100), video_id=video_id) if ocr_index else []
+    hits = ocr_index.search(query, limit=max(200, min(top_k * 4, 400)), video_id=video_id) if ocr_index else []
     combined = {(result.video_id, result.keyframe_number): result for result in results}
     for hit in hits:
         key = (hit.video_id, hit.keyframe_number)
@@ -242,6 +273,7 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
                 existing.score,
                 0.40 * existing.visual_score + 0.45 * hit.score + 0.10 * existing.metadata_score,
             )
+            existing.retrieval_score = existing.score
 
     rerank_note = ""
     reranker = get_reranker()
@@ -257,9 +289,13 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         except ValueError:
             rerank_budget = 24
         rerank_limit = min(rerank_budget, len(combined))
-        rerank_candidates = sorted(combined.values(), key=lambda item: item.score, reverse=True)[:rerank_limit]
+        rerank_candidates = select_multisource_candidates(results, hits, combined, rerank_limit)
         try:
-            rerank_scores = reranker.score(query, rerank_candidates)
+            normalized = normalize_query(query)
+            rerank_query = query
+            if normalized.text_for_model.lower() != query.lower():
+                rerank_query = f"{query}\nEnglish translation: {normalized.text_for_model}"
+            rerank_scores = reranker.score(rerank_query, rerank_candidates)
             for result, rerank_score in zip(rerank_candidates, rerank_scores):
                 result.rerank_score = rerank_score.final
                 result.rerank_joint_score = rerank_score.joint
@@ -280,19 +316,12 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
     elif RERANKER_ERROR:
         rerank_note = f" · AI rerank fallback: {RERANKER_ERROR[:140]}"
 
-    selected: list[SearchResult] = []
-    frames_by_video: dict[str, list[int]] = {}
-    for result in sorted(combined.values(), key=lambda item: item.score, reverse=True):
-        nearby = frames_by_video.setdefault(result.video_id, [])
-        if maximum is not None and len(nearby) >= maximum:
-            continue
-        if any(abs(result.frame_id - frame_id) <= min_gap for frame_id in nearby):
-            continue
-        nearby.append(result.frame_id)
-        result.rank = len(selected) + 1
-        selected.append(result)
-        if len(selected) == top_k:
-            break
+    selected = select_diverse_results(
+        list(combined.values()),
+        limit=top_k,
+        min_frame_gap=min_gap,
+        max_per_video=maximum,
+    )
     ocr_note = f"OCR RAM: {len(hits)} keyframe khớp chữ." if ocr_index else "OCR index chưa được nạp."
     return [StoredResult(result) for result in selected], language_note(engine) + " · " + ocr_note + rerank_note
 
@@ -340,7 +369,58 @@ def make_qa_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]
 def make_trake_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], dict[str, TrakeVideoResult], str]:
     events = [line.strip().lstrip("-0123456789. ") for line in query.splitlines() if line.strip()]
     top_k, _gap, _maximum, _video_id = search_options(body)
-    sequences = engine.search_trake(events, top_videos=min(top_k, 50))
+    sequences = engine.search_trake(events, top_videos=min(top_k, 100))
+    rerank_note = ""
+    reranker = get_reranker()
+    if reranker and sequences:
+        try:
+            pair_budget = max(1, min(int(os.environ.get("AIC_TRAKE_RERANK_PAIRS", "24")), 100))
+        except ValueError:
+            pair_budget = 24
+        sequence_limit = min(len(sequences), max(1, pair_budget // len(events)))
+        reranked_sequences = sequences[:sequence_limit]
+        pair_queries: list[str] = []
+        pair_frames: list[SearchResult] = []
+        for sequence in reranked_sequences:
+            for event, frame in zip(events, sequence.frames):
+                normalized = normalize_query(event)
+                pair_queries.append(
+                    event
+                    if normalized.text_for_model.lower() == event.lower()
+                    else f"{event}\nEnglish translation: {normalized.text_for_model}"
+                )
+                pair_frames.append(frame)
+        try:
+            pair_scores = reranker.score_pairs(
+                pair_queries,
+                pair_frames,
+                prompt=(
+                    "Score whether this exact video frame is the requested semantic moment. "
+                    "Use the visible action, temporal stage, objects, and relevant text."
+                ),
+            )
+            clip_scaled = normalized_scores([sequence.score for sequence in sequences])
+            offset = 0
+            for index, sequence in enumerate(sequences):
+                if index < sequence_limit:
+                    values = pair_scores[offset : offset + len(events)]
+                    offset += len(events)
+                    model_score = 0.72 * (sum(values) / len(values)) + 0.28 * min(values)
+                    sequence.score = 0.85 * model_score + 0.15 * clip_scaled[index]
+                    for frame, value in zip(sequence.frames, values):
+                        frame.rerank_score = value
+                        frame.rerank_joint_score = value
+                        frame.score = value
+                else:
+                    sequence.score = 0.35 * clip_scaled[index]
+            sequences.sort(key=lambda item: item.score, reverse=True)
+            for rank, sequence in enumerate(sequences, start=1):
+                sequence.rank = rank
+                for frame in sequence.frames:
+                    frame.rank = rank
+            rerank_note = f" · Qwen: {len(pair_frames)} cặp event–frame"
+        except MultimodalRerankerUnavailableError as error:
+            rerank_note = f" · Qwen TRAKE fallback: {str(error)[:120]}"
     stored: list[StoredResult] = []
     indexed: dict[str, TrakeVideoResult] = {}
     for sequence in sequences:
@@ -348,7 +428,12 @@ def make_trake_results(engine: AICRetrievalEngine, query: str, body: dict[str, A
         indexed[group] = sequence
         for event_index, frame in enumerate(sequence.frames, start=1):
             stored.append(StoredResult(frame, group=group, event_index=event_index))
-    return stored, indexed, "Mỗi card là một semantic keyframe; chọn một card để xuất cả chuỗi video TRAKE."
+    return (
+        stored,
+        indexed,
+        "TRAKE căn chỉnh có thứ tự thời gian; chọn một card để xuất cả chuỗi video."
+        + rerank_note,
+    )
 
 
 @app.get("/")
@@ -375,6 +460,9 @@ def health():
                 "vector_count": vector_count_compat(engine),
                 "video_ids": sorted(engine._features),
                 "ocr_records": get_ocr_index().record_count if get_ocr_index() else 0,
+                "feature_cache_loaded": engine.feature_cache_loaded,
+                "reranker_ready": RERANKER is not None,
+                "reranker_error": RERANKER_ERROR,
             }
         )
     except (DatasetNotFoundError, OSError) as error:

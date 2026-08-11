@@ -42,6 +42,7 @@ STALE_MODULES = (
     "qa",
     "query_language",
     "multimodal_reranker",
+    "ranking",
 )
 
 
@@ -250,7 +251,8 @@ def warmup_dashboard(reranker_enabled: bool) -> None:
     import dashboard
 
     print("Đang khởi tạo feature engine và OCR index trước khi mở dashboard…", flush=True)
-    dashboard.get_engine()
+    engine = dashboard.get_engine()
+    engine.prepare_runtime()
     dashboard.get_ocr_index()
     if reranker_enabled:
         print("Đang tải Qwen reranker trước query đầu tiên…", flush=True)
@@ -264,10 +266,18 @@ def warmup_dashboard(reranker_enabled: bool) -> None:
             )
         except Exception as error:
             print(f"Không kiểm tra được CUDA từ PyTorch: {error}", flush=True)
-        if dashboard.get_reranker() is None:
+        if not dashboard.warmup_reranker():
             detail = dashboard.RERANKER_ERROR or "không có thông tin lỗi"
             print(f"Qwen reranker không sẵn sàng: {detail}", flush=True)
             print("Dashboard sẽ dùng CLIP/OCR fallback.", flush=True)
+        else:
+            print("Qwen reranker đã warmup bằng một keyframe thật.", flush=True)
+    if os.environ.get("AIC_PRELOAD_VQA", "1").lower() not in {"0", "false", "no"}:
+        try:
+            print("Đang tải VQA model trước query đầu tiên…", flush=True)
+            dashboard.get_vqa().warmup()
+        except RuntimeError as error:
+            print(f"VQA preload bỏ qua: {error}", flush=True)
 
 
 def main() -> None:
