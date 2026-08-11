@@ -3,7 +3,7 @@
 
   const api = window.AIC_CONFIG;
   const $ = (selector) => document.querySelector(selector);
-  const state = { task: "kis", results: [], selected: new Set(), query: "" };
+  const state = { task: "kis", results: [], selected: new Set(), query: "", detailId: null };
   const taskCopy = {
     kis: {
       kicker: "TEXTUAL KNOWN ITEM SEARCH",
@@ -167,6 +167,11 @@
     $("#detail-metrics").innerHTML = metrics.map(([label, value]) => `<div><dt>${label}</dt><dd>${typeof value === "number" ? value.toFixed(3) : escapeHtml(value)}</dd></div>`).join("");
     $("#detail-ocr").textContent = item.ocr_text || "Không có OCR.";
     $("#detail-objects").textContent = item.objects?.length ? item.objects.join(", ") : "Không có object metadata.";
+    $("#detail-frame-input").value = item.frame_id;
+    state.detailId = item.id;
+    const videoLink = $("#detail-video");
+    videoLink.hidden = !item.video_url;
+    videoLink.href = item.video_url ? `${item.video_url}#t=${Math.max(0, Number(item.pts_time) || 0)}` : "";
     $("#inspector").classList.add("open");
     $("#inspector").setAttribute("aria-hidden", "false");
     $("#drawer-backdrop").classList.add("show");
@@ -176,6 +181,7 @@
     $("#inspector").classList.remove("open");
     $("#inspector").setAttribute("aria-hidden", "true");
     $("#drawer-backdrop").classList.remove("show");
+    state.detailId = null;
   }
 
   function options() {
@@ -275,7 +281,12 @@
       const response = await fetch(api.export, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selected: [...state.selected] }),
+        body: JSON.stringify({
+          selected: [...state.selected],
+          frame_overrides: Object.fromEntries(
+            state.results.filter((item) => item.frameOverride && state.selected.has(item.id)).map((item) => [item.id, item.frame_id]),
+          ),
+        }),
       });
       if (!response.ok) await jsonResponse(response, "Xuất CSV thất bại");
       const blob = await response.blob();
@@ -323,6 +334,18 @@
   }));
   $("#inspector-close").addEventListener("click", closeInspector);
   $("#drawer-backdrop").addEventListener("click", closeInspector);
+  $("#apply-frame").addEventListener("click", () => {
+    const item = state.results.find((result) => result.id === state.detailId);
+    const frame = Number($("#detail-frame-input").value);
+    if (!item || !Number.isInteger(frame) || frame < 0) {
+      toast("Frame nộp phải là số nguyên không âm.");
+      return;
+    }
+    item.frame_id = frame;
+    item.frameOverride = true;
+    render();
+    toast(`Đã override ${item.video_id} → frame ${frame}`);
+  });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeInspector(); });
 
   bindHints();

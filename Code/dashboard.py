@@ -172,6 +172,7 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         "rank": result.rank,
         "video_id": result.video_id,
         "frame_id": result.frame_id,
+        "pts_time": round(result.pts_time, 3),
         "time": time_label(result.pts_time),
         "score": round(result.score, 3),
         "clip": round(result.visual_score, 3),
@@ -193,6 +194,7 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         # Include the WSGI mount prefix when the app is exposed under
         # /dashboard by the Kaggle Gradio share gateway.
         "image_url": url_for("media", identifier=identifier),
+        "video_url": url_for("video", identifier=identifier) if result.video_path else "",
     }
 
 
@@ -517,32 +519,58 @@ def media(identifier: str):
     return send_file(path, conditional=True, max_age=3600)
 
 
+@app.get("/video/<identifier>")
+def video(identifier: str):
+    stored = current_session().results.get(identifier)
+    if stored is None or not stored.result.video_path:
+        return "Not found", 404
+    path = Path(stored.result.video_path)
+    if not path.is_file():
+        return "Not found", 404
+    return send_file(path, conditional=True, max_age=3600)
+
+
 @app.post("/api/export")
 def export():
     body = request.get_json(silent=True) or {}
     selected = [str(value) for value in body.get("selected") or []]
+    raw_overrides = body.get("frame_overrides") or {}
     state = current_session()
-    entries = [state.results[item] for item in selected if item in state.results]
-    if not entries:
+    selected_entries = [(identifier, state.results[identifier]) for identifier in selected if identifier in state.results]
+    if not selected_entries:
         return jsonify({"error": "Chọn ít nhất một kết quả trước khi xuất CSV."}), 400
+    frame_overrides: dict[str, int] = {}
+    try:
+        for identifier, _entry in selected_entries:
+            if identifier in raw_overrides:
+                frame_overrides[identifier] = max(0, int(raw_overrides[identifier]))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Frame override phải là số nguyên không âm."}), 400
+    override_by_result = {
+        id(entry.result): frame_overrides[identifier]
+        for identifier, entry in selected_entries
+        if identifier in frame_overrides
+    }
 
     stream = io.StringIO(newline="")
     writer = csv.writer(stream)
     if state.task == "trake":
-        groups = {entry.group for entry in entries if entry.group}
+        groups = {entry.group for _identifier, entry in selected_entries if entry.group}
         sequences = [state.trake_sequences[group] for group in groups if group in state.trake_sequences]
         sequences.sort(key=lambda item: item.rank)
         width = max((len(item.frames) for item in sequences), default=0)
         writer.writerow(["video_id", *[f"frame_id_{index}" for index in range(1, width + 1)]])
         for item in sequences:
-            writer.writerow([item.video_id, *[frame.frame_id for frame in item.frames]])
+            writer.writerow(
+                [item.video_id, *[override_by_result.get(id(frame), frame.frame_id) for frame in item.frames]]
+            )
         name = "aic_trake.csv"
     else:
-        entries.sort(key=lambda item: item.result.rank)
+        selected_entries.sort(key=lambda item: item[1].result.rank)
         is_qa = state.task == "qa"
         writer.writerow(["video_id", "frame_id", "answer"] if is_qa else ["video_id", "frame_id"])
-        for entry in entries:
-            row = [entry.result.video_id, entry.result.frame_id]
+        for identifier, entry in selected_entries:
+            row = [entry.result.video_id, frame_overrides.get(identifier, entry.result.frame_id)]
             if is_qa:
                 row.append(entry.result.answer)
             writer.writerow(row)
