@@ -84,12 +84,24 @@ class OCRMemoryIndex:
         self._terms: list[Counter[str]] = []
         self._postings: dict[str, list[int]] = defaultdict(list)
         self._normalized_text: list[str] = []
+        self._document_lengths: list[int] = []
         for index, record in enumerate(self.records):
             terms = Counter(token for token in tokenize(record.text) if len(token) > 1 and token not in STOP_WORDS)
             self._terms.append(terms)
             self._normalized_text.append(normalize_text(record.text))
+            self._document_lengths.append(sum(terms.values()))
             for term in terms:
                 self._postings[term].append(index)
+        self._average_length = (
+            sum(self._document_lengths) / len(self._document_lengths)
+            if self._document_lengths
+            else 1.0
+        )
+        total = len(self.records)
+        self._idf = {
+            term: math.log(1.0 + (total - len(postings) + 0.5) / (len(postings) + 0.5))
+            for term, postings in self._postings.items()
+        }
 
     @property
     def record_count(self) -> int:
@@ -131,10 +143,14 @@ class OCRMemoryIndex:
         interoperable entirely in RAM; no OCR or online translation runs here.
         """
         source_terms = [term for term in tokenize(query) if len(term) > 1 and term not in STOP_WORDS]
+        term_groups = [
+            tuple(dict.fromkeys((term, *SIGN_TERM_ALIASES.get(term, ()))))
+            for term in source_terms
+        ]
         terms = [
             expanded
-            for term in source_terms
-            for expanded in (term, *SIGN_TERM_ALIASES.get(term, ()))
+            for group in term_groups
+            for expanded in group
         ]
         if not terms or not self.records:
             return []
@@ -145,31 +161,41 @@ class OCRMemoryIndex:
         if not candidate_indices:
             return []
 
-        total = len(self.records)
         scored: list[tuple[float, int, int]] = []
+        normalized_query = normalize_text(query).strip()
+        compact_query = " ".join(source_terms)
         for index in candidate_indices:
             record = self.records[index]
             if video_id and record.video_id != video_id:
                 continue
             doc_terms = self._terms[index]
-            shared = sum(1 for term in query_terms if term in doc_terms)
-            # Require two distinctive terms for long descriptions. This avoids
-            # a random subtitle containing only "cảnh" outranking a real sign.
-            required = 1 if len(query_terms) <= 2 else 2
-            if shared < required:
+            matched_groups = sum(
+                1 for group in term_groups if any(term in doc_terms for term in group)
+            )
+            # Count semantic groups rather than expanded aliases. A random
+            # subtitle matching only one common word should not enter recall.
+            required = 1 if len(term_groups) <= 2 else max(2, math.ceil(len(term_groups) * 0.35))
+            if matched_groups < required:
                 continue
             score = 0.0
+            document_length = self._document_lengths[index]
+            length_normalizer = 1.0 - 0.75 + 0.75 * document_length / max(self._average_length, 1.0)
             for term, query_count in query_terms.items():
                 frequency = doc_terms.get(term, 0)
                 if not frequency:
                     continue
-                idf = math.log((total + 1) / (len(self._postings[term]) + 1)) + 1.0
-                score += idf * (1.0 + math.log(frequency)) * min(query_count, frequency)
-            # A contiguous phrase is very strong evidence for sign text.
-            normalized_query = " ".join(query_terms)
-            if len(normalized_query) >= 6 and normalized_query in self._normalized_text[index]:
-                score *= 1.75
-            scored.append((score, shared, index))
+                tf = frequency * 2.2 / (frequency + 1.2 * length_normalizer)
+                score += self._idf.get(term, 0.0) * tf * min(query_count, frequency)
+            coverage = matched_groups / len(term_groups)
+            score *= 1.0 + 0.75 * coverage
+            # Phrase matching uses the original query, not the expanded alias
+            # stream, so exact signs/subtitles receive the intended boost.
+            document_text = self._normalized_text[index]
+            if len(normalized_query) >= 6 and normalized_query in document_text:
+                score *= 2.0
+            elif len(compact_query) >= 6 and compact_query in document_text:
+                score *= 1.65
+            scored.append((score, matched_groups, index))
         if not scored:
             return []
         scored.sort(reverse=True)
