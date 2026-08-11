@@ -246,15 +246,27 @@ def parse_arguments() -> argparse.Namespace:
 
 def warmup_dashboard(reranker_enabled: bool) -> None:
     """Load query-time resources before Gradio can receive HTTP requests."""
-    from dashboard import get_engine, get_ocr_index, get_reranker
+    import dashboard
 
     print("Đang khởi tạo feature engine và OCR index trước khi mở dashboard…", flush=True)
-    get_engine()
-    get_ocr_index()
+    dashboard.get_engine()
+    dashboard.get_ocr_index()
     if reranker_enabled:
         print("Đang tải Qwen reranker trước query đầu tiên…", flush=True)
-        if get_reranker() is None:
-            print("Qwen reranker không sẵn sàng; dashboard sẽ dùng CLIP/OCR fallback.", flush=True)
+        try:
+            import torch
+
+            print(
+                f"PyTorch {torch.__version__}; CUDA available={torch.cuda.is_available()}"
+                + (f"; GPU={torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else ""),
+                flush=True,
+            )
+        except Exception as error:
+            print(f"Không kiểm tra được CUDA từ PyTorch: {error}", flush=True)
+        if dashboard.get_reranker() is None:
+            detail = dashboard.RERANKER_ERROR or "không có thông tin lỗi"
+            print(f"Qwen reranker không sẵn sàng: {detail}", flush=True)
+            print("Dashboard sẽ dùng CLIP/OCR fallback.", flush=True)
 
 
 def main() -> None:
