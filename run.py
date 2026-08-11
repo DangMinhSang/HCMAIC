@@ -24,7 +24,9 @@ REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
-OCR_VENV = RUNTIME_DIR / "aic_paddle_ocr_venv"
+# v2 intentionally avoids an earlier venv created without pip by Kaggle's
+# Python image. Keep it alongside the old directory; users need not delete it.
+OCR_VENV = RUNTIME_DIR / "aic_paddle_ocr_venv_v2"
 PADDLE_GPU_INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 STALE_MODULES = (
     "dashboard",
@@ -101,17 +103,15 @@ def ensure_paddle_ocr_venv() -> Path:
         )
     python = OCR_VENV / "bin" / "python"
     if not python.is_file():
-        command([sys.executable, "-m", "venv", str(OCR_VENV)])
-    # Kaggle injects a sitecustomize through PYTHONPATH. It is valid for the
-    # notebook interpreter but can make a fresh venv fail before pip imports.
-    # Keep the OCR venv isolated and bootstrap pip even if an older failed run
-    # created the venv without it.
+        # Kaggle's CPython omits ensurepip. Including its system packages makes
+        # the mandatory sitecustomize dependency (wrapt) visible at startup;
+        # PaddleOCR itself is still installed in this venv first.
+        command([sys.executable, "-m", "venv", "--system-site-packages", str(OCR_VENV)])
     venv_env = os.environ.copy()
     venv_env.pop("PYTHONPATH", None)
     venv_env.pop("PYTHONHOME", None)
     venv_env["VIRTUAL_ENV"] = str(OCR_VENV)
     venv_env["PATH"] = f"{OCR_VENV / 'bin'}:{venv_env.get('PATH', '')}"
-    command([str(python), "-m", "ensurepip", "--upgrade"], env=venv_env)
     digest = hashlib.sha256((CODE / "requirements-ocr.txt").read_bytes()).hexdigest()
     marker = OCR_VENV / ".requirements.sha256"
     try:
@@ -122,9 +122,11 @@ def ensure_paddle_ocr_venv() -> Path:
         print("Đang cài PaddleOCR GPU trong virtualenv riêng…", flush=True)
         command(
             [
-                str(python),
+                sys.executable,
                 "-m",
                 "pip",
+                "--python",
+                str(python),
                 "install",
                 "-q",
                 "--no-cache-dir",
@@ -132,11 +134,19 @@ def ensure_paddle_ocr_venv() -> Path:
                 "-i",
                 PADDLE_GPU_INDEX,
             ],
-            env=venv_env,
         )
         command(
-            [str(python), "-m", "pip", "install", "-q", "-r", str(CODE / "requirements-ocr.txt")],
-            env=venv_env,
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "--python",
+                str(python),
+                "install",
+                "-q",
+                "-r",
+                str(CODE / "requirements-ocr.txt"),
+            ],
         )
         marker.write_text(digest + "\n", encoding="utf-8")
     probe = "import paddle; print(int(paddle.is_compiled_with_cuda() and paddle.device.cuda.device_count() > 0))"

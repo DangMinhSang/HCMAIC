@@ -1,4 +1,4 @@
-# Installed only inside /kaggle/working/aic_paddle_ocr_venv by run.py.
+# Installed only inside /kaggle/working/aic_paddle_ocr_venv_v2 by run.py.
 # v2.9.1 is the lightweight API: no PaddleX/ModelScope/Torch dependency chain.
 paddleocr==2.9.1
 tqdm>=4.65
