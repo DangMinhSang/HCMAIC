@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from progress import track
 from retrieval import normalize_text
 
 
@@ -75,7 +76,13 @@ def final_score(r_scores: Sequence[float], cutoffs: Sequence[int] = RANK_CUTOFFS
 
 def score_kis(rows: Sequence[dict[str, str]], ground_truth: KISGroundTruth) -> list[float]:
     output: list[float] = []
-    for row in rows[:100]:
+    candidates = rows[:100]
+    for row in track(
+        candidates,
+        desc="Chấm KIS",
+        total=len(candidates),
+        unit="answer",
+    ):
         try:
             frame_id = int(float(row["frame_id"]))
         except (KeyError, TypeError, ValueError):
@@ -91,19 +98,36 @@ def score_qa(rows: Sequence[dict[str, str]], ground_truth: QAGroundTruth) -> lis
     return [
         location_score
         * float(answer_matches(row.get("answer", ""), ground_truth.accepted_answers))
-        for row, location_score in zip(rows[:100], location_scores)
+        for row, location_score in track(
+            zip(rows[:100], location_scores),
+            desc="Chấm Q&A",
+            total=len(location_scores),
+            unit="answer",
+        )
     ]
 
 
 def score_trake(rows: Sequence[dict[str, str]], ground_truth: TrakeGroundTruth) -> list[float]:
     output: list[float] = []
     event_count = len(ground_truth.intervals)
-    for row in rows[:100]:
+    candidates = rows[:100]
+    for row in track(
+        candidates,
+        desc="Chấm TRAKE",
+        total=len(candidates),
+        unit="answer",
+    ):
         if row.get("video_id") != ground_truth.video_id or event_count == 0:
             output.append(0.0)
             continue
         matches = 0
-        for index, interval in enumerate(ground_truth.intervals, start=1):
+        for index, interval in track(
+            enumerate(ground_truth.intervals, start=1),
+            desc="Chấm TRAKE events",
+            total=len(ground_truth.intervals),
+            unit="event",
+            nested=True,
+        ):
             try:
                 frame_id = int(float(row[f"frame_id_{index}"]))
             except (KeyError, TypeError, ValueError):

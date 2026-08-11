@@ -21,6 +21,8 @@ import sys
 import threading
 from pathlib import Path
 
+from Code.progress import track
+
 
 REPO = Path(__file__).resolve().parent
 CODE = REPO / "Code"
@@ -44,6 +46,7 @@ STALE_MODULES = (
     "query_router",
     "multimodal_reranker",
     "ranking",
+    "progress",
 )
 
 
@@ -72,9 +75,10 @@ def update_source(skip_update: bool) -> None:
 def clear_source_cache() -> None:
     """Remove only disposable source bytecode; preserve model/OCR caches."""
     shutil.rmtree(REPO / "__pycache__", ignore_errors=True)
-    for cache_dir in CODE.rglob("__pycache__"):
+    cache_dirs = list(CODE.rglob("__pycache__"))
+    for cache_dir in track(cache_dirs, desc="Xóa Python cache", unit="dir"):
         shutil.rmtree(cache_dir, ignore_errors=True)
-    for module in STALE_MODULES:
+    for module in track(STALE_MODULES, desc="Gỡ module cũ", unit="module"):
         sys.modules.pop(module, None)
     importlib.invalidate_caches()
     gc.collect()
@@ -148,7 +152,14 @@ def import_ocr_index(source: Path, destination: Path) -> int:
     records = 0
     try:
         with _open_ocr_text(source, "rt") as stream:
-            for line_number, line in enumerate(stream, 1):
+            lines = enumerate(stream, 1)
+            for line_number, line in track(
+                lines,
+                desc="Kiểm tra OCR index",
+                unit="record",
+                force=True,
+                leave=True,
+            ):
                 payload = json.loads(line)
                 if not payload.get("video_id") or "keyframe_number" not in payload:
                     raise ValueError(f"Dòng OCR {line_number} thiếu video_id/keyframe_number")

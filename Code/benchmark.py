@@ -10,6 +10,7 @@ import time
 from typing import Any
 
 import dashboard
+from progress import track
 from qa import split_qa_query
 from query_router import build_query_profile
 
@@ -70,7 +71,15 @@ def main() -> None:
     profile_query = split_qa_query(query)[0] if arguments.task == "qa" else query
     profile = build_query_profile(profile_query, reranker)
     runs: list[dict[str, Any]] = []
-    for run_index in range(1, repeat + 1):
+    run_indices = range(1, repeat + 1)
+    for run_index in track(
+        run_indices,
+        desc=f"Benchmark {arguments.task.upper()}",
+        total=len(run_indices),
+        unit="query",
+        force=True,
+        leave=True,
+    ):
         started = time.perf_counter()
         with dashboard.ENGINE_LOCK:
             if arguments.task == "kis":

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
+from progress import track
+
 
 CandidateKey = tuple[str, int]
 
@@ -62,7 +64,12 @@ def select_multisource_candidates(
 
     def take(items: Iterable[Any], quota: int) -> None:
         added = 0
-        for item in items:
+        for item in track(
+            items,
+            desc="Lấy candidate theo nguồn",
+            unit="frame",
+            nested=True,
+        ):
             if add(item):
                 added += 1
                 if added >= quota:
@@ -96,7 +103,12 @@ def select_multisource_candidates(
     take(fused_ranked, budget)
     # If a filtered query genuinely has only one relevant video or a tight
     # temporal burst, fill every remaining model slot after the diverse pass.
-    for item in fused_ranked:
+    for item in track(
+        fused_ranked,
+        desc="Điền Qwen candidate pool",
+        total=len(fused_ranked),
+        unit="frame",
+    ):
         add(item, enforce_diversity=False)
         if len(selected) >= budget:
             break
@@ -111,7 +123,12 @@ def fuse_adaptive_retrieval_scores(results: Sequence[Any], profile: Any) -> None
         [float(getattr(result, "retrieval_score", getattr(result, "score", 0.0))) for result in results]
     )
     visual_scores = normalized_scores([float(getattr(result, "visual_score", 0.0)) for result in results])
-    for index, result in enumerate(results):
+    for index, result in track(
+        enumerate(results),
+        desc="Fuse adaptive retrieval",
+        total=len(results),
+        unit="frame",
+    ):
         support = profile.support_score(
             visual=visual_scores[index],
             ocr=float(getattr(result, "ocr_score", 0.0)),
@@ -134,7 +151,13 @@ def select_diverse_results(
     """Apply submission diversity after all retrieval/reranking stages."""
     selected: list[Any] = []
     frames_by_video: dict[str, list[int]] = {}
-    for result in sorted(results, key=lambda item: float(item.score), reverse=True):
+    ranked = sorted(results, key=lambda item: float(item.score), reverse=True)
+    for result in track(
+        ranked,
+        desc="Chọn output đa dạng",
+        total=len(ranked),
+        unit="frame",
+    ):
         nearby = frames_by_video.setdefault(str(result.video_id), [])
         if max_per_video is not None and len(nearby) >= max_per_video:
             continue

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from progress import track
 from query_language import normalize_query
 from retrieval import SearchResult
 
@@ -160,26 +161,56 @@ class VQABaseline:
             except ValueError:
                 limit = 6
         normalized = normalize_query(question)
+        source_results = results[:limit]
         candidates = [
             result
-            for result in results[:limit]
+            for result in track(
+                source_results,
+                desc="Kiểm tra ảnh VQA",
+                total=len(source_results),
+                unit="frame",
+            )
             if result.image_path and Path(result.image_path).is_file()
         ]
         try:
-            return [
-                QAPrediction(result.rank, *self._predict_one(normalized.text_for_model, Path(result.image_path)))
-                for result in candidates
-            ]
+            predictions = []
+            for result in track(
+                candidates,
+                desc=f"VQA {self.backend_name}",
+                total=len(candidates),
+                unit="frame",
+                force=True,
+                leave=True,
+            ):
+                predictions.append(
+                    QAPrediction(
+                        result.rank,
+                        *self._predict_one(normalized.text_for_model, Path(result.image_path)),
+                    )
+                )
+            return predictions
         except Exception as error:
             if self.backend_name.startswith("Qwen"):
                 self.load_error = f"Qwen VQA inference fallback: {type(error).__name__}: {error}"
                 self.requested_backend = "vilt"
                 self._release_model()
                 self._load_vilt()
-                return [
-                    QAPrediction(result.rank, *self._predict_one(normalized.text_for_model, Path(result.image_path)))
-                    for result in candidates
-                ]
+                predictions = []
+                for result in track(
+                    candidates,
+                    desc="VQA ViLT fallback",
+                    total=len(candidates),
+                    unit="frame",
+                    force=True,
+                    leave=True,
+                ):
+                    predictions.append(
+                        QAPrediction(
+                            result.rank,
+                            *self._predict_one(normalized.text_for_model, Path(result.image_path)),
+                        )
+                    )
+                return predictions
             raise
 
     def _predict_one(self, question: str, image_path: Path) -> tuple[str, float]:
@@ -234,7 +265,13 @@ class VQABaseline:
         )[0].strip()
         answer = re.sub(r"^(?:answer|đáp\s*án)\s*[:\-]\s*", "", answer, flags=re.IGNORECASE).strip()
         probabilities: list[float] = []
-        for logits, token_id in zip(generated.scores, token_ids):
+        for logits, token_id in track(
+            zip(generated.scores, token_ids),
+            desc="Tính VQA confidence",
+            total=len(generated.scores),
+            unit="token",
+            nested=True,
+        ):
             probability = logits[0].float().softmax(dim=-1)[int(token_id)]
             probabilities.append(max(1e-8, float(probability)))
         confidence = math.exp(sum(math.log(value) for value in probabilities) / len(probabilities)) if probabilities else 0.0

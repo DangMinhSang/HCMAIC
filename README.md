@@ -69,6 +69,8 @@ Open dashboard: https://....gradio.live/dashboard/
 
 Lần đầu có thể lâu vì tải khoảng 4.3 GB cho reranker, thêm checkpoint VQA và pre-OCR corpus. Đây là startup/precompute; query không OCR ảnh lại và không nạp model lại.
 
+Mọi phase có vòng lặp dài đều hiện `tqdm` ngay trong output cell Kaggle, gồm kiểm tra/import OCR, dựng postings/IDF, preload CLIP, recall, Qwen batch, VQA và TRAKE refinement. Bar có nhãn phase, số item đã xử lý, tốc độ và ETA nên có thể phân biệt model đang tính với process bị lỗi.
+
 ### Dùng OCR index đã tạo sẵn
 
 ```bash
@@ -119,6 +121,16 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_SEARCH_WORKERS` | `1` | Số GPU job đồng thời; giữ 1 trên T4 |
 | `AIC_SEARCH_QUEUE_LIMIT` | `8` | Chặn public queue tăng vô hạn |
 | `AIC_TRANSLATE_VI` | `1` | Dịch VI→EN có cache cho CLIP/VQA |
+| `AIC_PROGRESS` | `1` | Hiện progress bar cho startup và từng query; đặt `0` để tắt |
+| `AIC_PROGRESS_MIN_ITEMS` | `20` | Ẩn các bar cực nhỏ để output dễ đọc |
+| `AIC_PROGRESS_ALL` | `0` | Đặt `1` để hiện cả mọi vòng lặp nhỏ/lồng nhau khi debug |
+
+Muốn soi chi tiết tuyệt đối một query, chạy trước launcher:
+
+```bash
+export AIC_PROGRESS_ALL=1
+python run.py
+```
 
 Preset nhanh khi cần kiểm tra UI:
 

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from data_paths import AICPaths
+from progress import track
 
 
 def resolve_device(requested: str) -> str:
@@ -54,8 +55,22 @@ def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
     """Extract legacy PaddleOCR lines as (polygon, (text, confidence))."""
     output = reader.ocr(str(image_path), cls=False)
     lines: list[str] = []
-    for page in output or []:
-        for item in page or []:
+    pages = output or []
+    for page in track(
+        pages,
+        desc="OCR pages",
+        total=len(pages),
+        unit="page",
+        nested=True,
+    ):
+        items = page or []
+        for item in track(
+            items,
+            desc="OCR text boxes",
+            total=len(items),
+            unit="box",
+            nested=True,
+        ):
             try:
                 text, confidence = item[1]
             except (IndexError, TypeError, ValueError):
@@ -113,7 +128,14 @@ def main() -> None:
             dynamic_ncols=True,
         ) as frame_progress:
             for video_dir in tqdm(video_dirs, desc="Video", unit="video", leave=False, dynamic_ncols=True):
-                for image_path in sorted(video_dir.glob("*.jpg")):
+                image_paths = sorted(video_dir.glob("*.jpg"))
+                for image_path in track(
+                    image_paths,
+                    desc=f"OCR {video_dir.name}",
+                    total=len(image_paths),
+                    unit="frame",
+                    nested=True,
+                ):
                     processed += 1
                     frame_progress.update(1)
                     try:

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from progress import track
+
 
 class DatasetNotFoundError(FileNotFoundError):
     """Raised when the required Kaggle inputs have not been attached."""
@@ -20,7 +22,13 @@ class DatasetNotFoundError(FileNotFoundError):
 
 def _first_existing(candidates: Iterable[Path], label: str) -> Path:
     checked = list(dict.fromkeys(Path(path) for path in candidates))
-    for path in checked:
+    for path in track(
+        checked,
+        desc=f"Tìm {label}",
+        total=len(checked),
+        unit="path",
+        nested=True,
+    ):
         if path.is_dir():
             return path
     preview = "\n".join(f"  - {path}" for path in checked[:8])
@@ -121,7 +129,13 @@ class AICPaths:
 
     def image_path(self, video_id: str, keyframe_number: int) -> Path | None:
         filename = f"{keyframe_number:03d}.jpg"
-        for root in self.keyframe_roots:
+        for root in track(
+            self.keyframe_roots,
+            desc="Tìm keyframe root",
+            total=len(self.keyframe_roots),
+            unit="root",
+            nested=True,
+        ):
             candidate = root / "keyframes" / video_id / filename
             if candidate.is_file():
                 return candidate
@@ -134,7 +148,13 @@ class AICPaths:
         return candidate if candidate.is_file() else None
 
     def video_path(self, video_id: str) -> Path | None:
-        for root in self.video_roots:
+        for root in track(
+            self.video_roots,
+            desc="Tìm video root",
+            total=len(self.video_roots),
+            unit="root",
+            nested=True,
+        ):
             candidate = root / "video" / f"{video_id}.mp4"
             if candidate.is_file():
                 return candidate

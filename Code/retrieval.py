@@ -22,6 +22,7 @@ import numpy as np
 
 from clip_encoder import ClipTextEncoder
 from data_paths import AICPaths
+from progress import track
 
 
 TOKEN_RE = re.compile(r"[\w]+", flags=re.UNICODE)
@@ -125,7 +126,13 @@ class TrakeVideoResult:
 
     def table_rows(self) -> list[list[Any]]:
         rows: list[list[Any]] = []
-        for event_index, result in enumerate(self.frames, start=1):
+        for event_index, result in track(
+            enumerate(self.frames, start=1),
+            desc="Dựng bảng TRAKE",
+            total=len(self.frames),
+            unit="event",
+            nested=True,
+        ):
             rows.append(
                 [
                     self.rank,
@@ -155,11 +162,16 @@ class AICRetrievalEngine:
     def __init__(self, paths: AICPaths, encoder: ClipTextEncoder | None = None) -> None:
         self.paths = paths
         self.encoder = encoder or ClipTextEncoder()
-        self._features = {
-            feature.stem: feature
-            for feature in sorted(paths.features_dir.glob("*.npy"))
-            if (paths.mapping_dir / f"{feature.stem}.csv").is_file()
-        }
+        feature_paths = sorted(paths.features_dir.glob("*.npy"))
+        self._features: dict[str, Path] = {}
+        for feature in track(
+            feature_paths,
+            desc="Kiểm tra CLIP feature",
+            unit="video",
+            leave=True,
+        ):
+            if (paths.mapping_dir / f"{feature.stem}.csv").is_file():
+                self._features[feature.stem] = feature
         if not self._features:
             raise FileNotFoundError(
                 f"Không tìm thấy cặp .npy/.csv trong {paths.features_dir} và {paths.mapping_dir}"
@@ -196,9 +208,15 @@ class AICRetrievalEngine:
     def vector_count(self) -> int:
         """Count vectors from .npy headers only; feature values stay memory-mapped."""
         if self._vector_count is None:
-            self._vector_count = sum(
-                int(np.load(path, mmap_mode="r").shape[0]) for path in self._features.values()
-            )
+            self._vector_count = 0
+            for path in track(
+                self._features.values(),
+                desc="Đếm CLIP vectors",
+                total=len(self._features),
+                unit="video",
+                leave=True,
+            ):
+                self._vector_count += int(np.load(path, mmap_mode="r").shape[0])
         return self._vector_count
 
     @property
@@ -215,13 +233,27 @@ class AICRetrievalEngine:
         if self._ram_features is not None:
             return
         video_ids = tuple(self._features)
-        shapes = [np.load(self._features[video_id], mmap_mode="r").shape for video_id in video_ids]
+        shapes = []
+        for video_id in track(
+            video_ids,
+            desc="Đọc CLIP headers",
+            unit="video",
+            leave=True,
+        ):
+            shapes.append(np.load(self._features[video_id], mmap_mode="r").shape)
         if not shapes or any(len(shape) != 2 or shape[1] != 512 for shape in shapes):
             raise ValueError("Không thể preload feature: cần các mảng CLIP 512 chiều.")
         offsets = np.zeros(len(video_ids) + 1, dtype=np.int64)
         offsets[1:] = np.cumsum([shape[0] for shape in shapes])
         matrix = np.empty((int(offsets[-1]), 512), dtype=np.float32)
-        for index, video_id in enumerate(video_ids):
+        for index, video_id in track(
+            enumerate(video_ids),
+            desc="Nạp CLIP vào RAM",
+            total=len(video_ids),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
             values = np.asarray(np.load(self._features[video_id]), dtype=np.float32)
             values /= np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
             matrix[offsets[index] : offsets[index + 1]] = values
@@ -238,7 +270,14 @@ class AICRetrievalEngine:
             "yes",
         }:
             self.preload_features()
-        for video_id in self._features:
+        for video_id in track(
+            self._features,
+            desc="Preload mapping/metadata",
+            total=len(self._features),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
             self._mapping(video_id)
             self._metadata(video_id)
             self._keyframe_dir(video_id)
@@ -271,7 +310,12 @@ class AICRetrievalEngine:
         raw_limit = candidate_pool if allowed_video_ids is None else candidate_pool * 3
         indices = self._top_indices(scores, min(len(scores), raw_limit))
         output: list[_Candidate] = []
-        for index in indices:
+        for index in track(
+            indices,
+            desc="Ánh xạ CLIP candidates",
+            total=len(indices),
+            unit="frame",
+        ):
             video_position = int(np.searchsorted(self._ram_offsets, index, side="right") - 1)
             video_id = self._ram_video_ids[video_position]
             if allowed_video_ids is not None and video_id not in allowed_video_ids:
@@ -287,7 +331,13 @@ class AICRetrievalEngine:
             return cached
         mappings: list[FrameMapping] = []
         with (self.paths.mapping_dir / f"{video_id}.csv").open(newline="", encoding="utf-8") as stream:
-            for row in csv.DictReader(stream):
+            reader = csv.DictReader(stream)
+            for row in track(
+                reader,
+                desc=f"Đọc mapping {video_id}",
+                unit="frame",
+                nested=True,
+            ):
                 try:
                     mappings.append(
                         FrameMapping(
@@ -359,7 +409,14 @@ class AICRetrievalEngine:
         if self._metadata_ready:
             return
         document_frequency: Counter[str] = Counter()
-        for video_id in self._features:
+        for video_id in track(
+            self._features,
+            desc="Lập metadata BM25",
+            total=len(self._features),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
             terms = Counter(tokenize(self._metadata(video_id).searchable_text))
             self._metadata_tokens[video_id] = terms
             self._metadata_document_lengths[video_id] = sum(terms.values())
@@ -367,10 +424,17 @@ class AICRetrievalEngine:
         lengths = list(self._metadata_document_lengths.values())
         self._metadata_average_length = sum(lengths) / len(lengths) if lengths else 1.0
         total = max(1, len(self._metadata_tokens))
-        self._metadata_idf = {
-            term: math.log(1.0 + (total - frequency + 0.5) / (frequency + 0.5))
-            for term, frequency in document_frequency.items()
-        }
+        self._metadata_idf = {}
+        for term, frequency in track(
+            document_frequency.items(),
+            desc="Tính metadata IDF",
+            total=len(document_frequency),
+            unit="term",
+            leave=True,
+        ):
+            self._metadata_idf[term] = math.log(
+                1.0 + (total - frequency + 0.5) / (frequency + 0.5)
+            )
         self._metadata_ready = True
 
     def _metadata_scores(self, query: str, video_ids: Iterable[str]) -> dict[str, float]:
@@ -383,7 +447,12 @@ class AICRetrievalEngine:
         query_counts = Counter(tokens)
         raw_scores: dict[str, float] = {}
         k1, b = 1.2, 0.75
-        for video_id in unique_video_ids:
+        for video_id in track(
+            unique_video_ids,
+            desc="Chấm metadata BM25",
+            total=len(unique_video_ids),
+            unit="video",
+        ):
             document = self._metadata_tokens.get(video_id, Counter())
             if not document:
                 raw_scores[video_id] = 0.0
@@ -392,7 +461,13 @@ class AICRetrievalEngine:
             normalizer = 1.0 - b + b * document_length / max(self._metadata_average_length, 1.0)
             score = 0.0
             matched = 0
-            for token, query_frequency in query_counts.items():
+            for token, query_frequency in track(
+                query_counts.items(),
+                desc="Metadata query terms",
+                total=len(query_counts),
+                unit="term",
+                nested=True,
+            ):
                 frequency = document.get(token, 0)
                 if not frequency:
                     continue
@@ -428,10 +503,22 @@ class AICRetrievalEngine:
 
         def visit(node: Any, key: str = "") -> None:
             if isinstance(node, dict):
-                for child_key, child in node.items():
+                for child_key, child in track(
+                    node.items(),
+                    desc="Đọc object fields",
+                    total=len(node),
+                    unit="field",
+                    nested=True,
+                ):
                     visit(child, child_key.lower())
             elif isinstance(node, list):
-                for child in node:
+                for child in track(
+                    node,
+                    desc="Đọc object list",
+                    total=len(node),
+                    unit="item",
+                    nested=True,
+                ):
                     visit(child, key)
             elif key in LABEL_KEYS and isinstance(node, str) and node.strip():
                 labels.append(node.strip())
@@ -535,7 +622,13 @@ class AICRetrievalEngine:
             return []
         radius = max(0, min(int(radius), 5))
         output: list[tuple[int, SearchResult]] = []
-        for feature_index in range(max(0, center - radius), min(len(mapping), center + radius + 1)):
+        neighbor_indices = range(max(0, center - radius), min(len(mapping), center + radius + 1))
+        for feature_index in track(
+            neighbor_indices,
+            desc="TRAKE lân cận",
+            total=len(neighbor_indices),
+            unit="frame",
+        ):
             visual_score = 0.0
             if query_vector is not None:
                 if self._ram_features is not None and self._ram_offsets is not None:
@@ -562,7 +655,13 @@ class AICRetrievalEngine:
             return self._ram_candidates(query_vector, candidate_pool, allowed_video_ids)
         per_video_limit = max(30, min(100, candidate_pool // 8))
         all_candidates: list[_Candidate] = []
-        for video_id, feature_path in self._features.items():
+        for video_id, feature_path in track(
+            self._features.items(),
+            desc="CLIP corpus recall",
+            total=len(self._features),
+            unit="video",
+            force=True,
+        ):
             if allowed_video_ids is not None and video_id not in allowed_video_ids:
                 continue
             features = np.load(feature_path, mmap_mode="r")
@@ -572,7 +671,14 @@ class AICRetrievalEngine:
                     f"CLIP ViT-B/32 ({query_vector.shape[0]} chiều)."
                 )
             scores = self._cosine_scores(features, query_vector)
-            for index in self._top_indices(scores, per_video_limit):
+            top_indices = self._top_indices(scores, per_video_limit)
+            for index in track(
+                top_indices,
+                desc="CLIP top/video",
+                total=len(top_indices),
+                unit="frame",
+                nested=True,
+            ):
                 all_candidates.append(_Candidate(video_id, int(index), float(scores[index])))
         return heapq.nlargest(candidate_pool, all_candidates, key=lambda item: item.visual_score)
 
@@ -623,7 +729,12 @@ class AICRetrievalEngine:
         metadata_scores = self._metadata_scores(metadata_query, (r.video_id for r in results))
         query_tokens = set(tokenize(metadata_query))
 
-        for result in results:
+        for result in track(
+            results,
+            desc="Fuse CLIP/metadata",
+            total=len(results),
+            unit="frame",
+        ):
             result.metadata_score = metadata_scores.get(result.video_id, 0.0)
             result.score = (
                 (1.0 - metadata_weight) * result.visual_score
@@ -636,7 +747,13 @@ class AICRetrievalEngine:
             object_budget = max(0, min(int(os.environ.get("AIC_OBJECT_RERANK_CANDIDATES", "300")), 600))
         except ValueError:
             object_budget = 300
-        for result in results[:object_budget]:
+        object_candidates = results[:object_budget]
+        for result in track(
+            object_candidates,
+            desc="Đọc object labels",
+            total=len(object_candidates),
+            unit="frame",
+        ):
             result.object_labels = self._object_labels(result.video_id, result.keyframe_number)
             result.object_score = self._object_match_score(result.object_labels, query_tokens)
             # Faster R-CNN labels are a tie-breaker, never the primary signal.
@@ -646,7 +763,12 @@ class AICRetrievalEngine:
 
         chosen: list[SearchResult] = []
         frames_by_video: dict[str, list[int]] = {}
-        for result in results:
+        for result in track(
+            results,
+            desc="Chọn kết quả đa dạng",
+            total=len(results),
+            unit="frame",
+        ):
             nearby = frames_by_video.setdefault(result.video_id, [])
             if max_per_video is not None and len(nearby) >= max_per_video:
                 continue
@@ -678,12 +800,18 @@ class AICRetrievalEngine:
         if len(clean_events) > 12:
             raise ValueError("Giới hạn 12 mốc để demo phản hồi nhanh.")
         english_events = list(english_events or [])
-        vectors = np.stack(
-            [
+        event_vectors = []
+        for index, event in track(
+            enumerate(clean_events),
+            desc="Mã hóa TRAKE events",
+            total=len(clean_events),
+            unit="event",
+            force=True,
+        ):
+            event_vectors.append(
                 self.encoder.encode(event, english_events[index] if index < len(english_events) else "")
-                for index, event in enumerate(clean_events)
-            ]
-        )
+            )
+        vectors = np.stack(event_vectors)
 
         global_scores = (
             np.asarray(self._ram_features @ vectors.T, dtype=np.float32)
@@ -691,7 +819,13 @@ class AICRetrievalEngine:
             else None
         )
         video_candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
-        for video_id, feature_path in self._features.items():
+        for video_id, feature_path in track(
+            self._features.items(),
+            desc="TRAKE scan videos",
+            total=len(self._features),
+            unit="video",
+            force=True,
+        ):
             if global_scores is not None and self._ram_offsets is not None:
                 position = self._ram_video_positions[video_id]
                 start, end = self._ram_offsets[position : position + 2]
@@ -713,9 +847,20 @@ class AICRetrievalEngine:
 
         best_videos = heapq.nlargest(top_videos, video_candidates, key=lambda item: item[0])
         output: list[TrakeVideoResult] = []
-        for rank, (score, video_id, indices, scores) in enumerate(best_videos, start=1):
+        for rank, (score, video_id, indices, scores) in track(
+            enumerate(best_videos, start=1),
+            desc="Dựng TRAKE sequences",
+            total=len(best_videos),
+            unit="video",
+        ):
             aligned: list[SearchResult] = []
-            for feature_index, event_score in zip(indices, scores):
+            for feature_index, event_score in track(
+                zip(indices, scores),
+                desc=f"TRAKE {video_id}",
+                total=len(indices),
+                unit="event",
+                nested=True,
+            ):
                 result = self._candidate_to_result(
                     _Candidate(video_id, int(feature_index), float(event_score))
                 )
@@ -739,12 +884,26 @@ class AICRetrievalEngine:
         dp = scores[:, 0].astype(np.float32, copy=True)
         back = np.full((event_count, frame_count), -1, dtype=np.int32)
         negative_infinity = np.float32(-1e30)
-        for event_index in range(1, event_count):
+        event_indices = range(1, event_count)
+        for event_index in track(
+            event_indices,
+            desc="TRAKE Viterbi events",
+            total=len(event_indices),
+            unit="event",
+            nested=True,
+        ):
             previous_best = np.full(frame_count, negative_infinity, dtype=np.float32)
             previous_index = np.full(frame_count, -1, dtype=np.int32)
             running_score = negative_infinity
             running_index = -1
-            for frame_index in range(frame_count):
+            frame_indices = range(frame_count)
+            for frame_index in track(
+                frame_indices,
+                desc="TRAKE Viterbi frames",
+                total=len(frame_indices),
+                unit="frame",
+                nested=True,
+            ):
                 candidate_index = frame_index - 1
                 if candidate_index >= 0 and dp[candidate_index] > running_score:
                     running_score = dp[candidate_index]
@@ -758,7 +917,14 @@ class AICRetrievalEngine:
             return None
         indices = np.empty(event_count, dtype=np.int32)
         indices[-1] = final_index
-        for event_index in range(event_count - 1, 0, -1):
+        backtrack_indices = range(event_count - 1, 0, -1)
+        for event_index in track(
+            backtrack_indices,
+            desc="TRAKE Viterbi backtrack",
+            total=len(backtrack_indices),
+            unit="event",
+            nested=True,
+        ):
             indices[event_index - 1] = back[event_index, indices[event_index]]
         if np.any(indices < 0):
             return None
@@ -779,7 +945,14 @@ class AICRetrievalEngine:
         if len(previous_scores) != len(frame_indices[0]):
             return None
         back_pointers: list[np.ndarray] = []
-        for event_index in range(1, len(frame_indices)):
+        event_indices = range(1, len(frame_indices))
+        for event_index in track(
+            event_indices,
+            desc="TRAKE refine events",
+            total=len(event_indices),
+            unit="event",
+            nested=True,
+        ):
             current_indices = frame_indices[event_index]
             current_values = np.asarray(candidate_scores[event_index], dtype=np.float32)
             if len(current_values) != len(current_indices):
@@ -787,7 +960,13 @@ class AICRetrievalEngine:
             previous_indices = frame_indices[event_index - 1]
             current_dp = np.full(len(current_indices), -np.inf, dtype=np.float32)
             pointers = np.full(len(current_indices), -1, dtype=np.int32)
-            for current_position, frame_index in enumerate(current_indices):
+            for current_position, frame_index in track(
+                enumerate(current_indices),
+                desc="TRAKE refine candidates",
+                total=len(current_indices),
+                unit="frame",
+                nested=True,
+            ):
                 valid = [
                     position
                     for position, previous_frame in enumerate(previous_indices)
@@ -806,7 +985,14 @@ class AICRetrievalEngine:
             return None
         choices = [0] * len(frame_indices)
         choices[-1] = int(np.nanargmax(previous_scores))
-        for event_index in range(len(frame_indices) - 1, 0, -1):
+        backtrack_indices = range(len(frame_indices) - 1, 0, -1)
+        for event_index in track(
+            backtrack_indices,
+            desc="TRAKE refine backtrack",
+            total=len(backtrack_indices),
+            unit="event",
+            nested=True,
+        ):
             choices[event_index - 1] = int(back_pointers[event_index - 1][choices[event_index]])
             if choices[event_index - 1] < 0:
                 return None
@@ -827,7 +1013,13 @@ def write_kis_submission(
     with destination.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(["video_id", "frame_id", "answer"] if has_answer else ["video_id", "frame_id"])
-        for result in results[:100]:
+        submission_results = results[:100]
+        for result in track(
+            submission_results,
+            desc="Ghi KIS/Q&A CSV",
+            total=len(submission_results),
+            unit="row",
+        ):
             row = [result.video_id, result.frame_id]
             if has_answer:
                 row.append(result.answer or answer.strip())
@@ -843,6 +1035,12 @@ def write_trake_submission(results: Sequence[TrakeVideoResult], destination: str
     with destination.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(["video_id", *[f"frame_id_{index}" for index in range(1, max_events + 1)]])
-        for item in results[:100]:
+        submission_results = results[:100]
+        for item in track(
+            submission_results,
+            desc="Ghi TRAKE CSV",
+            total=len(submission_results),
+            unit="row",
+        ):
             writer.writerow([item.video_id, *[frame.frame_id for frame in item.frames]])
     return destination

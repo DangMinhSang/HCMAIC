@@ -24,6 +24,7 @@ from multimodal_reranker import (
     QwenVLQueryReranker,
 )
 from ocr_index import OCRMemoryIndex
+from progress import track
 from qa import VQABaseline, split_qa_query
 from query_language import normalize_query
 from query_router import QueryProfile, build_query_profile
@@ -142,7 +143,13 @@ def warmup_reranker() -> bool:
         return False
     engine = get_engine()
     try:
-        for video_id in engine._features:
+        for video_id in track(
+            engine._features,
+            desc="Tìm ảnh warmup Qwen",
+            total=len(engine._features),
+            unit="video",
+            force=True,
+        ):
             mapping = engine._mapping(video_id)
             if not mapping:
                 continue
@@ -170,7 +177,13 @@ def warmup_vqa() -> str:
     """Exercise the selected VQA backend on a real mounted keyframe."""
     engine = get_engine()
     vqa = get_vqa()
-    for video_id in engine._features:
+    for video_id in track(
+        engine._features,
+        desc="Tìm ảnh warmup VQA",
+        total=len(engine._features),
+        unit="video",
+        force=True,
+    ):
         mapping = engine._mapping(video_id)
         if not mapping:
             continue
@@ -226,7 +239,13 @@ def prune_search_jobs() -> None:
             for identifier, job in SEARCH_JOBS.items()
             if job.status in {"complete", "error"} and now - (job.finished_at or job.created_at) > ttl
         ]
-        for identifier in expired:
+        for identifier in track(
+            expired,
+            desc="Dọn search jobs hết hạn",
+            total=len(expired),
+            unit="job",
+            nested=True,
+        ):
             SEARCH_JOBS.pop(identifier, None)
         # A public share URL can be scanned by bots. Keep at most 256 compact
         # job records even if their cookies are never used again.
@@ -238,7 +257,14 @@ def prune_search_jobs() -> None:
             ),
             key=lambda item: item[1].finished_at,
         )
-        for identifier, _job in finished[: max(0, len(SEARCH_JOBS) - 256)]:
+        overflow_jobs = finished[: max(0, len(SEARCH_JOBS) - 256)]
+        for identifier, _job in track(
+            overflow_jobs,
+            desc="Dọn search job overflow",
+            total=len(overflow_jobs),
+            unit="job",
+            nested=True,
+        ):
             SEARCH_JOBS.pop(identifier, None)
         retained_sessions = {job.session_id for job in SEARCH_JOBS.values()}
 
@@ -249,7 +275,13 @@ def prune_search_jobs() -> None:
             for identifier, state in SESSIONS.items()
             if identifier not in retained_sessions and now - state.touched_at > session_ttl
         ]
-        for identifier in stale_sessions:
+        for identifier in track(
+            stale_sessions,
+            desc="Dọn session hết hạn",
+            total=len(stale_sessions),
+            unit="session",
+            nested=True,
+        ):
             SESSIONS.pop(identifier, None)
         removable = sorted(
             (
@@ -259,7 +291,14 @@ def prune_search_jobs() -> None:
             ),
             key=lambda item: item[1].touched_at,
         )
-        for identifier, _state in removable[: max(0, len(SESSIONS) - 128)]:
+        overflow_sessions = removable[: max(0, len(SESSIONS) - 128)]
+        for identifier, _state in track(
+            overflow_sessions,
+            desc="Dọn session overflow",
+            total=len(overflow_sessions),
+            unit="session",
+            nested=True,
+        ):
             SESSIONS.pop(identifier, None)
 
 
@@ -382,7 +421,12 @@ def make_kis_results(
         if maximum and not reranker_requested:
             counts: dict[str, int] = {}
             filtered = []
-            for result in results:
+            for result in track(
+                results,
+                desc="Lọc giới hạn mỗi video",
+                total=len(results),
+                unit="frame",
+            ):
                 counts[result.video_id] = counts.get(result.video_id, 0) + 1
                 if counts[result.video_id] <= maximum:
                     filtered.append(result)
@@ -390,7 +434,12 @@ def make_kis_results(
     ocr_index = get_ocr_index()
     hits = ocr_index.search(query, limit=max(200, min(top_k * 4, 400)), video_id=video_id) if ocr_index else []
     combined = {(result.video_id, result.keyframe_number): result for result in results}
-    for hit in hits:
+    for hit in track(
+        hits,
+        desc="Ghép OCR candidates",
+        total=len(hits),
+        unit="frame",
+    ):
         key = (hit.video_id, hit.keyframe_number)
         existing = combined.get(key)
         if existing is None:
@@ -443,7 +492,12 @@ def make_kis_results(
             if normalized.text_for_model.lower() != query.lower():
                 rerank_query = f"{query}\nEnglish translation: {normalized.text_for_model}"
             rerank_scores = reranker.score(rerank_query, rerank_candidates)
-            for result, rerank_score in zip(rerank_candidates, rerank_scores):
+            for result, rerank_score in track(
+                zip(rerank_candidates, rerank_scores),
+                desc="Fuse Qwen scores",
+                total=len(rerank_candidates),
+                unit="frame",
+            ):
                 result.rerank_joint_score = rerank_score.joint
                 result.rerank_visual_score = rerank_score.visual
                 result.rerank_ocr_score = rerank_score.ocr
@@ -460,7 +514,12 @@ def make_kis_results(
             if len(rerank_candidates) < len(combined):
                 candidate_ids = {id(result) for result in rerank_candidates}
                 floor = min(result.score for result in rerank_candidates)
-                for result in combined.values():
+                for result in track(
+                    combined.values(),
+                    desc="Hạ điểm ngoài Qwen pool",
+                    total=len(combined),
+                    unit="frame",
+                ):
                     if id(result) not in candidate_ids:
                         result.score = min(result.score, floor - 0.001)
             rerank_note = f" · AI rerank Qwen: {len(rerank_candidates)} ảnh"
@@ -503,7 +562,12 @@ def make_qa_results(
         vqa = get_vqa()
         predictions = vqa.predict(question, results)
         by_rank = {prediction.rank: prediction for prediction in predictions}
-        for result in results:
+        for result in track(
+            results,
+            desc="Gắn đáp án VQA",
+            total=len(results),
+            unit="frame",
+        ):
             prediction = by_rank.get(result.rank)
             if prediction:
                 result.answer = prediction.answer
@@ -511,7 +575,12 @@ def make_qa_results(
         if predictions:
             answer_scores: dict[str, float] = {}
             answer_labels: dict[str, str] = {}
-            for prediction in predictions:
+            for prediction in track(
+                predictions,
+                desc="Tổng hợp VQA",
+                total=len(predictions),
+                unit="answer",
+            ):
                 key = " ".join(prediction.answer.lower().split())
                 answer_labels.setdefault(key, prediction.answer)
                 rank_weight = 1.0 / (1.0 + 0.10 * max(prediction.rank - 1, 0))
@@ -523,7 +592,12 @@ def make_qa_results(
                 for prediction in predictions
                 if " ".join(prediction.answer.lower().split()) == best_key
             )
-            for result in results:
+            for result in track(
+                results,
+                desc="Điền VQA đồng thuận",
+                total=len(results),
+                unit="frame",
+            ):
                 if not result.answer:
                     result.answer = consensus_answer
                     result.qa_confidence = best_confidence
@@ -562,7 +636,13 @@ def make_trake_results(
         center_scored_ids = {id(sequence) for sequence in reranked_sequences}
         event_queries: list[str] = []
         event_vectors = []
-        for event in events:
+        for event in track(
+            events,
+            desc="Chuẩn hóa TRAKE events",
+            total=len(events),
+            unit="event",
+            force=True,
+        ):
             normalized = normalize_query(event)
             event_queries.append(
                 event
@@ -572,8 +652,18 @@ def make_trake_results(
             event_vectors.append(engine.encoder.encode(event))
         pair_queries: list[str] = []
         pair_frames: list[SearchResult] = []
-        for sequence in reranked_sequences:
-            for event_query, frame in zip(event_queries, sequence.frames):
+        for sequence in track(
+            reranked_sequences,
+            desc="Chuẩn bị Qwen TRAKE",
+            total=len(reranked_sequences),
+            unit="sequence",
+        ):
+            for event_query, frame in track(
+                zip(event_queries, sequence.frames),
+                desc=f"TRAKE {sequence.video_id}",
+                total=len(sequence.frames),
+                unit="event",
+            ):
                 pair_queries.append(event_query)
                 pair_frames.append(frame)
         pair_prompt = (
@@ -591,13 +681,23 @@ def make_trake_results(
                 id(sequence): clip_score for sequence, clip_score in zip(sequences, clip_scaled)
             }
             offset = 0
-            for index, sequence in enumerate(sequences):
+            for index, sequence in track(
+                enumerate(sequences),
+                desc="Fuse TRAKE center",
+                total=len(sequences),
+                unit="sequence",
+            ):
                 if index < sequence_limit:
                     values = pair_scores[offset : offset + len(events)]
                     offset += len(events)
                     model_score = 0.72 * (sum(values) / len(values)) + 0.28 * min(values)
                     sequence.score = 0.85 * model_score + 0.15 * clip_scaled[index]
-                    for frame, value in zip(sequence.frames, values):
+                    for frame, value in track(
+                        zip(sequence.frames, values),
+                        desc=f"Gắn TRAKE {sequence.video_id}",
+                        total=len(sequence.frames),
+                        unit="event",
+                    ):
                         frame.rerank_score = value
                         frame.rerank_joint_score = value
                         frame.score = value
@@ -619,9 +719,21 @@ def make_trake_results(
                 tuple[TrakeVideoResult, list[list[tuple[int, SearchResult]]]]
             ] = []
             if radius and refinement_targets:
-                for sequence in refinement_targets:
+                for sequence in track(
+                    refinement_targets,
+                    desc="Chuẩn bị TRAKE refine",
+                    total=len(refinement_targets),
+                    unit="sequence",
+                    force=True,
+                ):
                     groups: list[list[tuple[int, SearchResult]]] = []
-                    for event_index, center in enumerate(sequence.frames):
+                    for event_index, center in track(
+                        enumerate(sequence.frames),
+                        desc=f"Lấy lân cận {sequence.video_id}",
+                        total=len(sequence.frames),
+                        unit="event",
+                        nested=True,
+                    ):
                         neighbors = engine.neighboring_keyframes(
                             sequence.video_id,
                             center.keyframe_number,
@@ -638,9 +750,21 @@ def make_trake_results(
                     prompt=pair_prompt,
                 )
                 score_offset = 0
-                for sequence, groups in refinement_groups:
+                for sequence, groups in track(
+                    refinement_groups,
+                    desc="Fuse TRAKE refine",
+                    total=len(refinement_groups),
+                    unit="sequence",
+                    force=True,
+                ):
                     grouped_scores: list[list[float]] = []
-                    for group in groups:
+                    for group in track(
+                        groups,
+                        desc=f"Nhóm refine {sequence.video_id}",
+                        total=len(groups),
+                        unit="event",
+                        nested=True,
+                    ):
                         grouped_scores.append(
                             refinement_scores[score_offset : score_offset + len(group)]
                         )
@@ -662,15 +786,32 @@ def make_trake_results(
                     model_score = 0.72 * (sum(selected_scores) / len(selected_scores)) + 0.28 * min(selected_scores)
                     sequence.frames = selected_frames
                     sequence.score = 0.88 * model_score + 0.12 * clip_by_sequence[id(sequence)]
-                    for frame, value in zip(selected_frames, selected_scores):
+                    for frame, value in track(
+                        zip(selected_frames, selected_scores),
+                        desc=f"Gắn refine {sequence.video_id}",
+                        total=len(selected_frames),
+                        unit="event",
+                        nested=True,
+                    ):
                         frame.rerank_score = value
                         frame.rerank_joint_score = value
                         frame.score = value
 
             sequences.sort(key=lambda item: item.score, reverse=True)
-            for rank, sequence in enumerate(sequences, start=1):
+            for rank, sequence in track(
+                enumerate(sequences, start=1),
+                desc="Xếp hạng TRAKE",
+                total=len(sequences),
+                unit="sequence",
+            ):
                 sequence.rank = rank
-                for frame in sequence.frames:
+                for frame in track(
+                    sequence.frames,
+                    desc=f"Gắn hạng {sequence.video_id}",
+                    total=len(sequence.frames),
+                    unit="event",
+                    nested=True,
+                ):
                     frame.rank = rank
             rerank_note = (
                 f" · Qwen center: {len(pair_frames)} cặp"
@@ -680,10 +821,21 @@ def make_trake_results(
             rerank_note = f" · Qwen TRAKE fallback: {str(error)[:120]}"
     stored: list[StoredResult] = []
     indexed: dict[str, TrakeVideoResult] = {}
-    for sequence in sequences:
+    for sequence in track(
+        sequences,
+        desc="Lưu TRAKE results",
+        total=len(sequences),
+        unit="sequence",
+    ):
         group = f"trake-{sequence.rank}"
         indexed[group] = sequence
-        for event_index, frame in enumerate(sequence.frames, start=1):
+        for event_index, frame in track(
+            enumerate(sequence.frames, start=1),
+            desc=f"Lưu {sequence.video_id}",
+            total=len(sequence.frames),
+            unit="event",
+            nested=True,
+        ):
             stored.append(StoredResult(frame, group=group, event_index=event_index))
     return (
         stored,
@@ -786,7 +938,12 @@ def run_search_job(
             state.results.clear()
             state.trake_sequences = sequences
             state.touched_at = time.monotonic()
-            for item in stored:
+            for item in track(
+                stored,
+                desc="Gắn result IDs",
+                total=len(stored),
+                unit="result",
+            ):
                 identifier = uuid.uuid4().hex
                 state.results[identifier] = item
                 result_ids.append(identifier)
@@ -967,7 +1124,12 @@ def export():
     if not isinstance(raw_overrides, dict):
         return jsonify({"error": "Frame override phải là một JSON object."}), 400
     try:
-        for identifier, _entry in selected_entries:
+        for identifier, _entry in track(
+            selected_entries,
+            desc="Kiểm tra frame override",
+            total=len(selected_entries),
+            unit="row",
+        ):
             if identifier in raw_overrides:
                 frame_overrides[identifier] = max(0, int(raw_overrides[identifier]))
     except (TypeError, ValueError):
@@ -975,7 +1137,12 @@ def export():
     answer_overrides: dict[str, str] = {}
     if not isinstance(raw_answer_overrides, dict):
         return jsonify({"error": "Answer override phải là một JSON object."}), 400
-    for identifier, _entry in selected_entries:
+    for identifier, _entry in track(
+        selected_entries,
+        desc="Kiểm tra answer override",
+        total=len(selected_entries),
+        unit="row",
+    ):
         if identifier not in raw_answer_overrides:
             continue
         answer = str(raw_answer_overrides[identifier]).strip()
@@ -996,7 +1163,13 @@ def export():
         sequences.sort(key=lambda item: item.rank)
         width = max((len(item.frames) for item in sequences), default=0)
         writer.writerow(["video_id", *[f"frame_id_{index}" for index in range(1, width + 1)]])
-        for item in sequences:
+        for item in track(
+            sequences,
+            desc="Xuất TRAKE CSV",
+            total=len(sequences),
+            unit="row",
+            force=True,
+        ):
             writer.writerow(
                 [item.video_id, *[override_by_result.get(id(frame), frame.frame_id) for frame in item.frames]]
             )
@@ -1005,7 +1178,13 @@ def export():
         selected_entries.sort(key=lambda item: item[1].result.rank)
         is_qa = state.task == "qa"
         writer.writerow(["video_id", "frame_id", "answer"] if is_qa else ["video_id", "frame_id"])
-        for identifier, entry in selected_entries:
+        for identifier, entry in track(
+            selected_entries,
+            desc=f"Xuất {state.task.upper()} CSV",
+            total=len(selected_entries),
+            unit="row",
+            force=True,
+        ):
             row = [entry.result.video_id, frame_overrides.get(identifier, entry.result.frame_id)]
             if is_qa:
                 row.append(answer_overrides.get(identifier, entry.result.answer))

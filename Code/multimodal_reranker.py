@@ -12,6 +12,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from progress import progress_enabled, track
+
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-Reranker-2B"
 VISUAL_PROMPT = "Retrieve video frames whose visual scene matches the user's query."
@@ -117,7 +119,7 @@ class QwenVLQueryReranker:
             values = self.model.predict(
                 pairs,
                 batch_size=batch_size,
-                show_progress_bar=False,
+                show_progress_bar=progress_enabled(),
                 activation_fn=self._torch.nn.Sigmoid(),
                 prompt=prompt,
             )
@@ -129,7 +131,7 @@ class QwenVLQueryReranker:
                     values = self.model.predict(
                         pairs,
                         batch_size=1,
-                        show_progress_bar=False,
+                        show_progress_bar=progress_enabled(),
                         activation_fn=self._torch.nn.Sigmoid(),
                         prompt=prompt,
                     )
@@ -141,7 +143,15 @@ class QwenVLQueryReranker:
                 raise MultimodalRerankerUnavailableError(
                     f"Qwen reranker không chấm được candidate: {error}"
                 ) from error
-        return [max(0.0, min(1.0, float(value))) for value in values]
+        return [
+            max(0.0, min(1.0, float(value)))
+            for value in track(
+                values,
+                desc="Đọc điểm Qwen",
+                total=len(values),
+                unit="pair",
+            )
+        ]
 
     @staticmethod
     def _cache_key(query: str, result: Any, prompt: str) -> tuple[str, str, str, str]:
@@ -166,7 +176,12 @@ class QwenVLQueryReranker:
         missing_pairs: list[tuple[str, Any]] = []
         missing_positions: list[int] = []
         missing_keys: list[tuple[str, str, str, str]] = []
-        for index, (query, result) in enumerate(zip(queries, results)):
+        for index, (query, result) in track(
+            enumerate(zip(queries, results)),
+            desc="Chuẩn bị Qwen pairs",
+            total=len(results),
+            unit="pair",
+        ):
             key = self._cache_key(query, result, prompt)
             cached = self._score_cache.get(key)
             if cached is not None:
@@ -179,7 +194,12 @@ class QwenVLQueryReranker:
             missing_keys.append(key)
         if missing_pairs:
             values = self._predict_pairs(missing_pairs, prompt)
-            for position, key, value in zip(missing_positions, missing_keys, values):
+            for position, key, value in track(
+                zip(missing_positions, missing_keys, values),
+                desc="Cache điểm Qwen",
+                total=len(values),
+                unit="pair",
+            ):
                 output[position] = value
                 if self._cache_size:
                     self._score_cache[key] = value
@@ -190,7 +210,15 @@ class QwenVLQueryReranker:
             raise MultimodalRerankerUnavailableError(
                 "Qwen reranker trả thiếu điểm cho một hoặc nhiều candidate."
             )
-        return [float(value) for value in output]
+        return [
+            float(value)
+            for value in track(
+                output,
+                desc="Hoàn tất điểm Qwen",
+                total=len(output),
+                unit="pair",
+            )
+        ]
 
     def score_documents(
         self,
@@ -200,7 +228,15 @@ class QwenVLQueryReranker:
         prompt: str = JOINT_PROMPT,
     ) -> list[float]:
         """Score text evidence descriptions without loading another model."""
-        adapted = [_TextDocument(str(document)) for document in documents]
+        adapted = [
+            _TextDocument(str(document))
+            for document in track(
+                documents,
+                desc="Chuẩn bị Qwen documents",
+                total=len(documents),
+                unit="document",
+            )
+        ]
         return self.score_pairs([query] * len(adapted), adapted, prompt=prompt)
 
     def score(self, query: str, results: Sequence[Any]) -> list[RerankScore]:
@@ -216,7 +252,15 @@ class QwenVLQueryReranker:
         def bounded(value: Any) -> float:
             return max(0.0, min(1.0, float(value or 0.0)))
 
-        raw_visual = [float(getattr(result, "visual_score", 0.0) or 0.0) for result in results]
+        raw_visual = [
+            float(getattr(result, "visual_score", 0.0) or 0.0)
+            for result in track(
+                results,
+                desc="Chuẩn hóa visual scores",
+                total=len(results),
+                unit="frame",
+            )
+        ]
         if raw_visual:
             minimum, maximum = min(raw_visual), max(raw_visual)
             spread = maximum - minimum
@@ -232,5 +276,10 @@ class QwenVLQueryReranker:
                 ocr=bounded(getattr(result, "ocr_score", 0.0)),
                 joint=joint_scores[index],
             )
-            for index, result in enumerate(results)
+            for index, result in track(
+                enumerate(results),
+                desc="Fuse Qwen modalities",
+                total=len(results),
+                unit="frame",
+            )
         ]

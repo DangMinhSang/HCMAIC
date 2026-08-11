@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from progress import track
 from retrieval import normalize_text, tokenize
 
 
@@ -85,12 +86,24 @@ class OCRMemoryIndex:
         self._postings: dict[str, list[int]] = defaultdict(list)
         self._normalized_text: list[str] = []
         self._document_lengths: list[int] = []
-        for index, record in enumerate(self.records):
+        for index, record in track(
+            enumerate(self.records),
+            desc="Lập OCR postings",
+            total=len(self.records),
+            unit="record",
+            force=True,
+            leave=True,
+        ):
             terms = Counter(token for token in tokenize(record.text) if len(token) > 1 and token not in STOP_WORDS)
             self._terms.append(terms)
             self._normalized_text.append(normalize_text(record.text))
             self._document_lengths.append(sum(terms.values()))
-            for term in terms:
+            for term in track(
+                terms,
+                desc="OCR terms",
+                unit="term",
+                nested=True,
+            ):
                 self._postings[term].append(index)
         self._average_length = (
             sum(self._document_lengths) / len(self._document_lengths)
@@ -98,10 +111,18 @@ class OCRMemoryIndex:
             else 1.0
         )
         total = len(self.records)
-        self._idf = {
-            term: math.log(1.0 + (total - len(postings) + 0.5) / (len(postings) + 0.5))
-            for term, postings in self._postings.items()
-        }
+        self._idf: dict[str, float] = {}
+        for term, postings in track(
+            self._postings.items(),
+            desc="Tính OCR IDF",
+            total=len(self._postings),
+            unit="term",
+            force=True,
+            leave=True,
+        ):
+            self._idf[term] = math.log(
+                1.0 + (total - len(postings) + 0.5) / (len(postings) + 0.5)
+            )
 
     @property
     def record_count(self) -> int:
@@ -114,7 +135,13 @@ class OCRMemoryIndex:
             raise FileNotFoundError(f"Không tìm thấy OCR index: {index_path}")
         records: list[OCRRecord] = []
         with _open_index(index_path, "rt") as stream:
-            for line in stream:
+            for line in track(
+                stream,
+                desc="Đọc OCR index",
+                unit="record",
+                force=True,
+                leave=True,
+            ):
                 try:
                     payload = json.loads(line)
                     text = str(payload.get("text") or "").strip()
@@ -156,7 +183,7 @@ class OCRMemoryIndex:
             return []
         query_terms = Counter(terms)
         candidate_indices: set[int] = set()
-        for term in query_terms:
+        for term in track(query_terms, desc="OCR query terms", unit="term"):
             candidate_indices.update(self._postings.get(term, ()))
         if not candidate_indices:
             return []
@@ -164,7 +191,12 @@ class OCRMemoryIndex:
         scored: list[tuple[float, int, int]] = []
         normalized_query = normalize_text(query).strip()
         compact_query = " ".join(source_terms)
-        for index in candidate_indices:
+        for index in track(
+            candidate_indices,
+            desc="Chấm OCR BM25",
+            total=len(candidate_indices),
+            unit="frame",
+        ):
             record = self.records[index]
             if video_id and record.video_id != video_id:
                 continue
@@ -180,7 +212,13 @@ class OCRMemoryIndex:
             score = 0.0
             document_length = self._document_lengths[index]
             length_normalizer = 1.0 - 0.75 + 0.75 * document_length / max(self._average_length, 1.0)
-            for term, query_count in query_terms.items():
+            for term, query_count in track(
+                query_terms.items(),
+                desc="OCR BM25 terms",
+                total=len(query_terms),
+                unit="term",
+                nested=True,
+            ):
                 frequency = doc_terms.get(term, 0)
                 if not frequency:
                     continue
