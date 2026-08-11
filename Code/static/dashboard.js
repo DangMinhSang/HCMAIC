@@ -3,7 +3,9 @@
 
   const api = window.AIC_CONFIG;
   const $ = (selector) => document.querySelector(selector);
-  const state = { task: "kis", results: [], selected: new Set(), query: "", detailId: null };
+  const state = {
+    task: "kis", results: [], selected: new Set(), query: "", detailId: null, searchToken: 0,
+  };
   const taskCopy = {
     kis: {
       kicker: "TEXTUAL KNOWN ITEM SEARCH",
@@ -58,13 +60,42 @@
       data = JSON.parse(body);
     } catch (_) {
       if (response.status === 504) {
-        throw new Error("Gateway hết thời gian chờ Qwen. Hãy giảm số candidate rerank hoặc kiểm tra GPU.");
+        throw new Error("Gateway tạm hết thời gian ở request trạng thái; hệ thống sẽ an toàn khi thử lại.");
       }
       const type = response.headers.get("content-type") || "không rõ";
       throw new Error(`API trả HTML thay vì JSON (HTTP ${response.status}, ${type}).`);
     }
     if (!response.ok) throw new Error(data?.error || fallback);
     return data;
+  }
+
+  const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
+  async function waitForSearch(statusUrl, token) {
+    let transientFailures = 0;
+    while (token === state.searchToken) {
+      await wait(650);
+      try {
+        const response = await fetch(statusUrl, { cache: "no-store" });
+        const data = await jsonResponse(response, "Không đọc được trạng thái query");
+        transientFailures = 0;
+        if (data.status === "complete") return data;
+        if (data.status === "error") {
+          const failure = new Error(data.error || "Truy vấn thất bại.");
+          failure.queryFailed = true;
+          throw failure;
+        }
+        const elapsed = Number(data.elapsed_ms) > 0 ? ` · ${(data.elapsed_ms / 1000).toFixed(1)}s` : "";
+        $("#notice").textContent = `${data.stage || "Đang xử lý…"}${elapsed}`;
+      } catch (error) {
+        if (error.queryFailed) throw error;
+        transientFailures += 1;
+        if (transientFailures >= 5) throw error;
+        $("#notice").textContent = `Mất kết nối tạm thời, đang thử lại (${transientFailures}/5)…`;
+        await wait(900);
+      }
+    }
+    throw new Error("Query đã được thay thế bởi một yêu cầu mới.");
   }
 
   function scorePercent(value) {
@@ -201,7 +232,10 @@
       return;
     }
     const button = $("#search");
+    const requestedTask = state.task;
+    const token = ++state.searchToken;
     button.classList.add("loading");
+    button.disabled = true;
     button.querySelector("span").textContent = "Đang phân tích…";
     $("#notice").className = "notice";
     $("#notice").textContent = "Recall CLIP/OCR → Qwen rerank → đa dạng hóa kết quả…";
@@ -211,7 +245,9 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ task: state.task, query, options: options() }),
       });
-      const data = await jsonResponse(response, "Truy vấn thất bại");
+      const accepted = await jsonResponse(response, "Truy vấn thất bại");
+      const data = accepted.status_url ? await waitForSearch(accepted.status_url, token) : accepted;
+      if (requestedTask !== state.task || token !== state.searchToken) return;
       state.query = query;
       state.results = data.results || [];
       state.selected.clear();
@@ -222,6 +258,7 @@
       render();
       updateSelection();
     } catch (error) {
+      if (token !== state.searchToken) return;
       state.results = [];
       state.selected.clear();
       $("#count").textContent = "Truy vấn chưa hoàn thành";
@@ -231,12 +268,20 @@
       updateSelection();
       toast(error.message);
     } finally {
-      button.classList.remove("loading");
-      button.querySelector("span").textContent = "Tìm kiếm";
+      if (token === state.searchToken) {
+        button.classList.remove("loading");
+        button.disabled = false;
+        button.querySelector("span").textContent = "Tìm kiếm";
+      }
     }
   }
 
   function setTask(task) {
+    state.searchToken += 1;
+    const searchButton = $("#search");
+    searchButton.classList.remove("loading");
+    searchButton.disabled = false;
+    searchButton.querySelector("span").textContent = "Tìm kiếm";
     state.task = task;
     state.results = [];
     state.selected.clear();

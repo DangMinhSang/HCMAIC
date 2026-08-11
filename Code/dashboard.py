@@ -10,11 +10,13 @@ import secrets
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, session, url_for
+from werkzeug.exceptions import HTTPException
 
 from data_paths import DatasetNotFoundError
 from multimodal_reranker import (
@@ -31,6 +33,14 @@ from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult
 app = Flask(__name__)
 app.secret_key = os.environ.get("AIC_WEB_SECRET", secrets.token_urlsafe(32))
 
+
+@app.errorhandler(HTTPException)
+def json_api_http_error(error: HTTPException):
+    """Never make API clients parse Flask's default HTML error document."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": error.description, "status": error.code}), error.code
+    return error
+
 ENGINE: AICRetrievalEngine | None = None
 VQA: VQABaseline | None = None
 OCR_INDEX: OCRMemoryIndex | None = None
@@ -41,6 +51,23 @@ RERANKER_ERROR = ""
 ENGINE_LOCK = threading.RLock()
 SESSIONS: dict[str, "SearchSession"] = {}
 SESSIONS_LOCK = threading.RLock()
+SEARCH_JOBS: dict[str, "SearchJob"] = {}
+SEARCH_JOBS_LOCK = threading.RLock()
+
+
+def bounded_environment_integer(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(int(os.environ.get(name, str(default))), maximum))
+    except ValueError:
+        return default
+
+
+# Qwen and CLIP share one Kaggle GPU. A single worker keeps memory predictable;
+# advanced deployments can opt into two workers only when they have enough VRAM.
+SEARCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=bounded_environment_integer("AIC_SEARCH_WORKERS", 1, 1, 2),
+    thread_name_prefix="aic-search",
+)
 
 
 @dataclass
@@ -55,6 +82,23 @@ class SearchSession:
     task: str = "kis"
     results: dict[str, StoredResult] = field(default_factory=dict)
     trake_sequences: dict[str, TrakeVideoResult] = field(default_factory=dict)
+    touched_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class SearchJob:
+    session_id: str
+    task: str
+    query: str
+    status: str = "queued"
+    stage: str = "Đang chờ GPU…"
+    created_at: float = field(default_factory=time.monotonic)
+    started_at: float = 0.0
+    finished_at: float = 0.0
+    elapsed_ms: int = 0
+    notice: str = ""
+    result_ids: list[str] = field(default_factory=list)
+    error: str = ""
 
 
 def get_engine() -> AICRetrievalEngine:
@@ -129,13 +173,70 @@ def get_ocr_index() -> OCRMemoryIndex | None:
         return OCR_INDEX
 
 
-def current_session() -> SearchSession:
+def current_session_identifier() -> str:
     identifier = session.get("aic_session")
     if not identifier:
         identifier = uuid.uuid4().hex
         session["aic_session"] = identifier
+    return str(identifier)
+
+
+def session_state(identifier: str) -> SearchSession:
     with SESSIONS_LOCK:
-        return SESSIONS.setdefault(identifier, SearchSession())
+        state = SESSIONS.setdefault(identifier, SearchSession())
+        state.touched_at = time.monotonic()
+        return state
+
+
+def current_session() -> SearchSession:
+    return session_state(current_session_identifier())
+
+
+def prune_search_jobs() -> None:
+    """Bound completed job/session state without touching active GPU work."""
+    now = time.monotonic()
+    ttl = bounded_environment_integer("AIC_SEARCH_JOB_TTL", 3600, 300, 86400)
+    with SEARCH_JOBS_LOCK:
+        expired = [
+            identifier
+            for identifier, job in SEARCH_JOBS.items()
+            if job.status in {"complete", "error"} and now - (job.finished_at or job.created_at) > ttl
+        ]
+        for identifier in expired:
+            SEARCH_JOBS.pop(identifier, None)
+        # A public share URL can be scanned by bots. Keep at most 256 compact
+        # job records even if their cookies are never used again.
+        finished = sorted(
+            (
+                (identifier, job)
+                for identifier, job in SEARCH_JOBS.items()
+                if job.status in {"complete", "error"}
+            ),
+            key=lambda item: item[1].finished_at,
+        )
+        for identifier, _job in finished[: max(0, len(SEARCH_JOBS) - 256)]:
+            SEARCH_JOBS.pop(identifier, None)
+        retained_sessions = {job.session_id for job in SEARCH_JOBS.values()}
+
+    session_ttl = bounded_environment_integer("AIC_SESSION_TTL", 7200, 600, 86400)
+    with SESSIONS_LOCK:
+        stale_sessions = [
+            identifier
+            for identifier, state in SESSIONS.items()
+            if identifier not in retained_sessions and now - state.touched_at > session_ttl
+        ]
+        for identifier in stale_sessions:
+            SESSIONS.pop(identifier, None)
+        removable = sorted(
+            (
+                (identifier, state)
+                for identifier, state in SESSIONS.items()
+                if identifier not in retained_sessions
+            ),
+            key=lambda item: item[1].touched_at,
+        )
+        for identifier, _state in removable[: max(0, len(SESSIONS) - 128)]:
+            SESSIONS.pop(identifier, None)
 
 
 def time_label(seconds: float) -> str:
@@ -472,16 +573,22 @@ def health():
         return jsonify({"ok": False, "error": str(error)}), 503
 
 
-@app.post("/api/search")
-def search():
+def run_search_job(
+    job_id: str,
+    session_id: str,
+    task: str,
+    query: str,
+    body: dict[str, Any],
+) -> None:
+    """Run a potentially long GPU query outside the Gradio HTTP request."""
     started = time.perf_counter()
-    body = request.get_json(silent=True) or {}
-    task = str(body.get("task") or "kis").lower()
-    query = str(body.get("query") or "").strip()
-    if task not in {"kis", "qa", "trake"}:
-        return jsonify({"error": "Loại truy vấn không hợp lệ."}), 400
-    if not query:
-        return jsonify({"error": "Hãy nhập truy vấn."}), 400
+    with SEARCH_JOBS_LOCK:
+        job = SEARCH_JOBS.get(job_id)
+        if job is None:
+            return
+        job.status = "running"
+        job.stage = "CLIP/OCR recall → multimodal rerank…"
+        job.started_at = time.monotonic()
     try:
         engine = get_engine()
         with ENGINE_LOCK:
@@ -493,19 +600,151 @@ def search():
                 sequences = {}
             else:
                 stored, sequences, notice = make_trake_results(engine, query, body)
-        state = current_session()
-        state.task = task
-        state.results.clear()
-        state.trake_sequences = sequences
-        payload: list[dict[str, Any]] = []
-        for item in stored:
-            identifier = uuid.uuid4().hex
-            state.results[identifier] = item
-            payload.append(as_payload(identifier, item))
+        result_ids: list[str] = []
+        with SESSIONS_LOCK:
+            state = SESSIONS.setdefault(session_id, SearchSession())
+            state.task = task
+            state.results.clear()
+            state.trake_sequences = sequences
+            state.touched_at = time.monotonic()
+            for item in stored:
+                identifier = uuid.uuid4().hex
+                state.results[identifier] = item
+                result_ids.append(identifier)
         elapsed_ms = round((time.perf_counter() - started) * 1000)
-        return jsonify({"results": payload, "elapsed_ms": elapsed_ms, "notice": notice, "task": task})
+        with SEARCH_JOBS_LOCK:
+            job = SEARCH_JOBS.get(job_id)
+            if job is not None:
+                job.status = "complete"
+                job.stage = "Hoàn thành."
+                job.finished_at = time.monotonic()
+                job.elapsed_ms = elapsed_ms
+                job.notice = notice
+                job.result_ids = result_ids
     except (DatasetNotFoundError, ValueError, RuntimeError, OSError) as error:
-        return jsonify({"error": str(error)}), 400
+        with SEARCH_JOBS_LOCK:
+            job = SEARCH_JOBS.get(job_id)
+            if job is not None:
+                job.status = "error"
+                job.stage = "Truy vấn thất bại."
+                job.finished_at = time.monotonic()
+                job.elapsed_ms = round((time.perf_counter() - started) * 1000)
+                job.error = str(error)
+    except Exception as error:  # keep a worker failure observable to the UI
+        with SEARCH_JOBS_LOCK:
+            job = SEARCH_JOBS.get(job_id)
+            if job is not None:
+                job.status = "error"
+                job.stage = "Backend gặp lỗi ngoài dự kiến."
+                job.finished_at = time.monotonic()
+                job.elapsed_ms = round((time.perf_counter() - started) * 1000)
+                job.error = f"{type(error).__name__}: {error}"
+
+
+@app.post("/api/search")
+def search():
+    """Queue a search and return immediately, avoiding Gradio's 504 timeout."""
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON body phải là một object."}), 400
+    task = str(body.get("task") or "kis").lower()
+    query = str(body.get("query") or "").strip()
+    if task not in {"kis", "qa", "trake"}:
+        return jsonify({"error": "Loại truy vấn không hợp lệ."}), 400
+    if not query:
+        return jsonify({"error": "Hãy nhập truy vấn."}), 400
+    if len(query) > 4000:
+        return jsonify({"error": "Query quá dài; giới hạn 4.000 ký tự."}), 400
+    prune_search_jobs()
+    job_id = uuid.uuid4().hex
+    session_id = current_session_identifier()
+    with SEARCH_JOBS_LOCK:
+        duplicate = next(
+            (
+                (identifier, job)
+                for identifier, job in SEARCH_JOBS.items()
+                if job.session_id == session_id
+                and job.task == task
+                and job.query == query
+                and job.status in {"queued", "running"}
+            ),
+            None,
+        )
+        if duplicate is not None:
+            duplicate_id, duplicate_job = duplicate
+            return (
+                jsonify(
+                    {
+                        "job_id": duplicate_id,
+                        "status": duplicate_job.status,
+                        "stage": duplicate_job.stage,
+                        "status_url": url_for("search_status", job_id=duplicate_id),
+                    }
+                ),
+                202,
+            )
+        active_jobs = sum(job.status in {"queued", "running"} for job in SEARCH_JOBS.values())
+        queue_limit = bounded_environment_integer("AIC_SEARCH_QUEUE_LIMIT", 8, 1, 64)
+        if active_jobs >= queue_limit:
+            return jsonify({"error": "GPU queue đang đầy; hãy thử lại sau khi query hiện tại hoàn tất."}), 429
+        SEARCH_JOBS[job_id] = SearchJob(session_id=session_id, task=task, query=query)
+    SEARCH_EXECUTOR.submit(run_search_job, job_id, session_id, task, query, body)
+    return (
+        jsonify(
+            {
+                "job_id": job_id,
+                "status": "queued",
+                "stage": "Đang chờ GPU…",
+                "status_url": url_for("search_status", job_id=job_id),
+            }
+        ),
+        202,
+    )
+
+
+@app.get("/api/search/<job_id>")
+def search_status(job_id: str):
+    """Return a short polling response and materialize URLs in this mount."""
+    session_id = current_session_identifier()
+    with SEARCH_JOBS_LOCK:
+        job = SEARCH_JOBS.get(job_id)
+        if job is None or job.session_id != session_id:
+            return jsonify({"error": "Không tìm thấy query job trong phiên này."}), 404
+        status = job.status
+        response: dict[str, Any] = {
+            "job_id": job_id,
+            "status": status,
+            "stage": job.stage,
+            "elapsed_ms": job.elapsed_ms,
+        }
+        if status == "error":
+            response["error"] = job.error or "Truy vấn thất bại."
+            return jsonify(response)
+        if status != "complete":
+            if job.started_at:
+                response["elapsed_ms"] = round((time.monotonic() - job.started_at) * 1000)
+            return jsonify(response)
+        result_ids = list(job.result_ids)
+        task = job.task
+        query = job.query
+        notice = job.notice
+
+    state = session_state(session_id)
+    with SESSIONS_LOCK:
+        payload = [
+            as_payload(identifier, state.results[identifier])
+            for identifier in result_ids
+            if identifier in state.results
+        ]
+    return jsonify(
+        {
+            **response,
+            "results": payload,
+            "notice": notice,
+            "task": task,
+            "query": query,
+        }
+    )
 
 
 @app.get("/media/<identifier>")
@@ -533,6 +772,8 @@ def video(identifier: str):
 @app.post("/api/export")
 def export():
     body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON body phải là một object."}), 400
     selected = [str(value) for value in body.get("selected") or []]
     raw_overrides = body.get("frame_overrides") or {}
     state = current_session()

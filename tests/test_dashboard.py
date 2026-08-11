@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 CODE = Path(__file__).resolve().parents[1] / "Code"
@@ -39,6 +41,14 @@ class DashboardTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         dashboard.SESSIONS.pop(self.session_id, None)
+        with dashboard.SEARCH_JOBS_LOCK:
+            stale = [
+                identifier
+                for identifier, job in dashboard.SEARCH_JOBS.items()
+                if job.session_id == self.session_id
+            ]
+            for identifier in stale:
+                dashboard.SEARCH_JOBS.pop(identifier, None)
 
     def test_mounted_dashboard_uses_prefixed_api_urls(self) -> None:
         response = self.client.get("/", environ_overrides={"SCRIPT_NAME": "/dashboard"})
@@ -46,6 +56,14 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('"search": "/dashboard/api/search"', page)
         self.assertIn('"export": "/dashboard/api/export"', page)
+
+    def test_api_errors_are_json_not_html(self) -> None:
+        missing = self.client.get("/api/does-not-exist")
+        self.assertEqual(missing.status_code, 404)
+        self.assertTrue(missing.is_json)
+        malformed = self.client.post("/api/search", json=["not", "an", "object"])
+        self.assertEqual(malformed.status_code, 400)
+        self.assertTrue(malformed.is_json)
 
     def test_kis_and_trake_frame_overrides_reach_csv(self) -> None:
         kis = make_result("L01_V001", 100)
@@ -80,6 +98,35 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("L02_V002,200,333", response.get_data(as_text=True))
+
+    def test_search_runs_as_short_polled_job(self) -> None:
+        result = make_result("L04_V004", 500)
+        with (
+            patch.object(dashboard, "get_engine", return_value=object()),
+            patch.object(
+                dashboard,
+                "make_kis_results",
+                return_value=([StoredResult(result)], "pipeline complete"),
+            ),
+        ):
+            accepted = self.client.post(
+                "/api/search",
+                json={"task": "kis", "query": "a test scene"},
+                environ_overrides={"SCRIPT_NAME": "/dashboard"},
+            )
+            self.assertEqual(accepted.status_code, 202)
+            status_url = accepted.get_json()["status_url"]
+            self.assertTrue(status_url.startswith("/dashboard/api/search/"))
+            local_status_url = status_url.removeprefix("/dashboard")
+            for _attempt in range(100):
+                status = self.client.get(local_status_url)
+                payload = status.get_json()
+                if payload["status"] in {"complete", "error"}:
+                    break
+                time.sleep(0.005)
+        self.assertEqual(payload["status"], "complete")
+        self.assertEqual(payload["notice"], "pipeline complete")
+        self.assertEqual(payload["results"][0]["frame_id"], 500)
 
     def test_video_route_supports_browser_byte_ranges(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
