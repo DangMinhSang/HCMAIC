@@ -18,6 +18,10 @@ from typing import Any
 from flask import Flask, Response, jsonify, render_template_string, request, send_file, session, url_for
 
 from data_paths import DatasetNotFoundError
+from multimodal_reranker import (
+    MultimodalRerankerUnavailableError,
+    QwenVLQueryReranker,
+)
 from ocr_index import OCRMemoryIndex
 from qa import VQABaseline, split_qa_query
 from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult
@@ -30,6 +34,9 @@ ENGINE: AICRetrievalEngine | None = None
 VQA: VQABaseline | None = None
 OCR_INDEX: OCRMemoryIndex | None = None
 OCR_INDEX_LOADED = False
+RERANKER: QwenVLQueryReranker | None = None
+RERANKER_ATTEMPTED = False
+RERANKER_ERROR = ""
 ENGINE_LOCK = threading.RLock()
 SESSIONS: dict[str, "SearchSession"] = {}
 SESSIONS_LOCK = threading.RLock()
@@ -55,6 +62,23 @@ def get_engine() -> AICRetrievalEngine:
         if ENGINE is None:
             ENGINE = AICRetrievalEngine.from_environment()
         return ENGINE
+
+
+def get_reranker() -> QwenVLQueryReranker | None:
+    """Load the optional multimodal reranker once, on the first KIS query."""
+    global RERANKER, RERANKER_ATTEMPTED, RERANKER_ERROR
+    with ENGINE_LOCK:
+        if RERANKER_ATTEMPTED:
+            return RERANKER
+        RERANKER_ATTEMPTED = True
+        if os.environ.get("AIC_RERANKER", "1").lower() in {"0", "false", "no"}:
+            RERANKER_ERROR = "đã tắt qua AIC_RERANKER=0"
+            return None
+        try:
+            RERANKER = QwenVLQueryReranker()
+        except MultimodalRerankerUnavailableError as error:
+            RERANKER_ERROR = str(error)
+        return RERANKER
 
 
 def get_vqa() -> VQABaseline:
@@ -130,6 +154,10 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         "answer": getattr(result, "answer", ""),
         "ocr_score": round(getattr(result, "ocr_score", 0.0), 3),
         "ocr_text": getattr(result, "ocr_text", ""),
+        "ai_score": round(getattr(result, "rerank_score", 0.0), 3),
+        "ai_joint_score": round(getattr(result, "rerank_joint_score", 0.0), 3),
+        "ai_visual_score": round(getattr(result, "rerank_visual_score", 0.0), 3),
+        "ai_ocr_score": round(getattr(result, "rerank_ocr_score", 0.0), 3),
         "event": stored.event_index,
         # Include the WSGI mount prefix when the app is exposed under
         # /dashboard by the Kaggle Gradio share gateway.
@@ -175,10 +203,7 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
                     filtered.append(result)
             results = filtered
     ocr_index = get_ocr_index()
-    if ocr_index is None:
-        return [StoredResult(result) for result in results], language_note(engine) + " · OCR index chưa được nạp."
-
-    hits = ocr_index.search(query, limit=max(top_k * 12, 100), video_id=video_id)
+    hits = ocr_index.search(query, limit=max(top_k * 12, 100), video_id=video_id) if ocr_index else []
     combined = {(result.video_id, result.keyframe_number): result for result in results}
     for hit in hits:
         key = (hit.video_id, hit.keyframe_number)
@@ -187,9 +212,10 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
             existing = engine.result_for_keyframe(
                 hit.video_id,
                 hit.keyframe_number,
-                # Exact OCR text is a stronger signal than a generic scene
-                # embedding for queries asking what a sign says.
-                score=1.0 + hit.score,
+                # OCR is useful evidence, but must not overpower the visual
+                # signal before the multimodal reranker gets a chance to
+                # inspect the actual frame.
+                score=0.55 * hit.score,
                 ocr_score=hit.score,
                 ocr_text=hit.text,
             )
@@ -199,7 +225,43 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         else:
             existing.ocr_score = max(existing.ocr_score, hit.score)
             existing.ocr_text = hit.text
-            existing.score += 1.0 + hit.score
+            existing.score = max(
+                existing.score,
+                0.40 * existing.visual_score + 0.45 * hit.score + 0.10 * existing.metadata_score,
+            )
+
+    rerank_note = ""
+    reranker = get_reranker()
+    if reranker and combined:
+        # Qwen is a cross-attention reranker, not a corpus scanner. Keep the
+        # expensive pass bounded while ensuring OCR hits can enter the pool.
+        try:
+            rerank_budget = max(1, min(int(os.environ.get("AIC_RERANKER_CANDIDATES", "48")), 128))
+        except ValueError:
+            rerank_budget = 48
+        rerank_limit = min(rerank_budget, max(24, top_k * 2))
+        rerank_candidates = sorted(combined.values(), key=lambda item: item.score, reverse=True)[:rerank_limit]
+        try:
+            rerank_scores = reranker.score(query, rerank_candidates)
+            for result, rerank_score in zip(rerank_candidates, rerank_scores):
+                result.rerank_score = rerank_score.final
+                result.rerank_joint_score = rerank_score.joint
+                result.rerank_visual_score = rerank_score.visual
+                result.rerank_ocr_score = rerank_score.ocr
+                result.score = rerank_score.final
+            # Candidates outside the reranker budget remain available as a
+            # diversity fallback, but cannot outrank model-scored candidates.
+            if len(rerank_candidates) < len(combined):
+                candidate_ids = {id(result) for result in rerank_candidates}
+                floor = min(result.score for result in rerank_candidates)
+                for result in combined.values():
+                    if id(result) not in candidate_ids:
+                        result.score = min(result.score, floor - 0.001)
+            rerank_note = f" · AI rerank Qwen: {len(rerank_candidates)} ảnh"
+        except MultimodalRerankerUnavailableError as error:
+            rerank_note = f" · AI rerank lỗi, dùng fallback: {str(error)[:140]}"
+    elif RERANKER_ERROR:
+        rerank_note = f" · AI rerank fallback: {RERANKER_ERROR[:140]}"
 
     selected: list[SearchResult] = []
     frames_by_video: dict[str, list[int]] = {}
@@ -214,9 +276,8 @@ def make_kis_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any
         selected.append(result)
         if len(selected) == top_k:
             break
-    return [StoredResult(result) for result in selected], (
-        language_note(engine) + f" · OCR RAM: {len(hits)} keyframe khớp chữ."
-    )
+    ocr_note = f"OCR RAM: {len(hits)} keyframe khớp chữ." if ocr_index else "OCR index chưa được nạp."
+    return [StoredResult(result) for result in selected], language_note(engine) + " · " + ocr_note + rerank_note
 
 
 def make_qa_results(engine: AICRetrievalEngine, query: str, body: dict[str, Any]) -> tuple[list[StoredResult], str]:

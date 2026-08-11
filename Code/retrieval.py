@@ -86,6 +86,10 @@ class SearchResult:
     qa_confidence: float = 0.0
     ocr_score: float = 0.0
     ocr_text: str = ""
+    rerank_score: float = 0.0
+    rerank_joint_score: float = 0.0
+    rerank_visual_score: float = 0.0
+    rerank_ocr_score: float = 0.0
 
     def caption(self) -> str:
         labels = ", ".join(self.object_labels[:6]) or "không có object metadata"
