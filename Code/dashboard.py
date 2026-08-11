@@ -881,17 +881,30 @@ def export():
         return jsonify({"error": "JSON body phải là một object."}), 400
     selected = [str(value) for value in body.get("selected") or []]
     raw_overrides = body.get("frame_overrides") or {}
+    raw_answer_overrides = body.get("answer_overrides") or {}
     state = current_session()
     selected_entries = [(identifier, state.results[identifier]) for identifier in selected if identifier in state.results]
     if not selected_entries:
         return jsonify({"error": "Chọn ít nhất một kết quả trước khi xuất CSV."}), 400
     frame_overrides: dict[str, int] = {}
+    if not isinstance(raw_overrides, dict):
+        return jsonify({"error": "Frame override phải là một JSON object."}), 400
     try:
         for identifier, _entry in selected_entries:
             if identifier in raw_overrides:
                 frame_overrides[identifier] = max(0, int(raw_overrides[identifier]))
     except (TypeError, ValueError):
         return jsonify({"error": "Frame override phải là số nguyên không âm."}), 400
+    answer_overrides: dict[str, str] = {}
+    if not isinstance(raw_answer_overrides, dict):
+        return jsonify({"error": "Answer override phải là một JSON object."}), 400
+    for identifier, _entry in selected_entries:
+        if identifier not in raw_answer_overrides:
+            continue
+        answer = str(raw_answer_overrides[identifier]).strip()
+        if not answer or len(answer) > 200:
+            return jsonify({"error": "Answer override phải có 1–200 ký tự."}), 400
+        answer_overrides[identifier] = answer
     override_by_result = {
         id(entry.result): frame_overrides[identifier]
         for identifier, entry in selected_entries
@@ -918,7 +931,7 @@ def export():
         for identifier, entry in selected_entries:
             row = [entry.result.video_id, frame_overrides.get(identifier, entry.result.frame_id)]
             if is_qa:
-                row.append(entry.result.answer)
+                row.append(answer_overrides.get(identifier, entry.result.answer))
             writer.writerow(row)
         name = f"aic_{state.task}.csv"
     return Response(

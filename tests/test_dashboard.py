@@ -65,7 +65,7 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(malformed.status_code, 400)
         self.assertTrue(malformed.is_json)
 
-    def test_kis_and_trake_frame_overrides_reach_csv(self) -> None:
+    def test_frame_and_answer_overrides_reach_csv(self) -> None:
         kis = make_result("L01_V001", 100)
         dashboard.SESSIONS[self.session_id] = SearchSession(
             task="kis",
@@ -77,6 +77,19 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("L01_V001,123", response.get_data(as_text=True))
+
+        qa = make_result("L01_V002", 150)
+        qa.answer = "old answer"
+        dashboard.SESSIONS[self.session_id] = SearchSession(
+            task="qa",
+            results={"qa-card": StoredResult(qa)},
+        )
+        response = self.client.post(
+            "/api/export",
+            json={"selected": ["qa-card"], "answer_overrides": {"qa-card": "five"}},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("L01_V002,150,five", response.get_data(as_text=True))
 
         first = make_result("L02_V002", 200)
         second = make_result("L02_V002", 300)

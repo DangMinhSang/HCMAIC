@@ -216,6 +216,9 @@
     $("#detail-ocr").textContent = item.ocr_text || "Không có OCR.";
     $("#detail-objects").textContent = item.objects?.length ? item.objects.join(", ") : "Không có object metadata.";
     $("#detail-frame-input").value = item.frame_id;
+    const answerTools = $("#answer-tools");
+    answerTools.hidden = state.task !== "qa";
+    $("#detail-answer-input").value = item.answer || "";
     state.detailId = item.id;
     const videoLink = $("#detail-video");
     videoLink.hidden = !item.video_url;
@@ -351,6 +354,9 @@
           frame_overrides: Object.fromEntries(
             state.results.filter((item) => item.frameOverride && state.selected.has(item.id)).map((item) => [item.id, item.frame_id]),
           ),
+          answer_overrides: Object.fromEntries(
+            state.results.filter((item) => item.answerOverride && state.selected.has(item.id)).map((item) => [item.id, item.answer]),
+          ),
         }),
       });
       if (!response.ok) await jsonResponse(response, "Xuất CSV thất bại");
@@ -413,6 +419,18 @@
     item.frameOverride = true;
     render();
     toast(`Đã override ${item.video_id} → frame ${frame}`);
+  });
+  $("#apply-answer").addEventListener("click", () => {
+    const item = state.results.find((result) => result.id === state.detailId);
+    const answer = $("#detail-answer-input").value.trim();
+    if (!item || state.task !== "qa" || !answer) {
+      toast("Đáp án nộp không được để trống.");
+      return;
+    }
+    item.answer = answer;
+    item.answerOverride = true;
+    render();
+    toast(`Đã sửa đáp án → ${answer}`);
   });
   document.addEventListener("keydown", (event) => { if (event.key === "Escape") closeInspector(); });
 
