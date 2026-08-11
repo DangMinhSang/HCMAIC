@@ -49,7 +49,7 @@ class QwenVLQueryReranker:
     def __init__(self, model_name: str | None = None) -> None:
         try:
             import torch  # type: ignore
-            import qwen_vl_utils  # type: ignore  # noqa: F401
+            __import__("qwen_vl_utils")
             from sentence_transformers import CrossEncoder  # type: ignore
         except Exception as error:
             raise MultimodalRerankerUnavailableError(
