@@ -7,7 +7,7 @@ numpy>=1.26
 Flask>=3.0
 gradio>=5.0
 Pillow>=10.0
-# The optional Kaggle-only Qwen reranker is installed by run.py from
+# The Kaggle-only Qwen reranker/VQA stack is installed by run.py from
 # requirements-reranker.txt. Keep local installs lightweight.
 transformers>=4.44
 deep-translator>=1.11
