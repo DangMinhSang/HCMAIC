@@ -88,6 +88,7 @@ class SearchResult:
     answer: str = ""
     qa_confidence: float = 0.0
     ocr_score: float = 0.0
+    ocr_quality: float = 1.0
     ocr_text: str = ""
     rerank_score: float = 0.0
     rerank_joint_score: float = 0.0
@@ -580,6 +581,7 @@ class AICRetrievalEngine:
         *,
         score: float = 0.0,
         ocr_score: float = 0.0,
+        ocr_quality: float = 1.0,
         ocr_text: str = "",
     ) -> SearchResult | None:
         """Materialize an OCR hit with the official keyframe-to-frame mapping."""
@@ -604,6 +606,7 @@ class AICRetrievalEngine:
             image_path=str(image) if image is not None else None,
             video_path=str(video) if video is not None else None,
             ocr_score=ocr_score,
+            ocr_quality=ocr_quality,
             ocr_text=ocr_text,
         )
 

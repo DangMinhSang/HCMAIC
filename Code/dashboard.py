@@ -24,6 +24,7 @@ from multimodal_reranker import (
     QwenVLQueryReranker,
 )
 from ocr_index import OCRMemoryIndex
+from ocr_regions import OCR_INDEX_SCHEMA_VERSION
 from progress import track
 from qa import VQABaseline, split_qa_query
 from query_language import normalize_query
@@ -207,6 +208,12 @@ def get_ocr_index() -> OCRMemoryIndex | None:
         index_path = Path(configured) if configured else default_path
         if index_path.is_file():
             OCR_INDEX = OCRMemoryIndex.load(index_path)
+            if OCR_INDEX.legacy_record_count:
+                print(
+                    "[warning] OCR index v1 không có tọa độ text; đang dùng bộ lọc ticker fallback. "
+                    "Chạy lại run.py để tạo OCR index v2 chính xác hơn.",
+                    flush=True,
+                )
         return OCR_INDEX
 
 
@@ -349,6 +356,7 @@ def as_payload(identifier: str, stored: StoredResult) -> dict[str, Any]:
         "answer": getattr(result, "answer", ""),
         "qa_confidence": round(getattr(result, "qa_confidence", 0.0), 3),
         "ocr_score": round(getattr(result, "ocr_score", 0.0), 3),
+        "ocr_quality": round(getattr(result, "ocr_quality", 1.0), 3),
         "ocr_text": getattr(result, "ocr_text", ""),
         "ai_score": round(getattr(result, "rerank_score", 0.0), 3),
         "ai_joint_score": round(getattr(result, "rerank_joint_score", 0.0), 3),
@@ -441,6 +449,17 @@ def make_kis_results(
         unit="frame",
     ):
         key = (hit.video_id, hit.keyframe_number)
+        text_quality = float(getattr(hit, "text_quality", 1.0))
+        evidence_score = float(getattr(hit, "effective_score", hit.score))
+        # A coordinate-free legacy index can contain a lower-third. Never
+        # give untrusted ticker text to Qwen, or it can reinforce the same
+        # false positive after first-stage OCR recall.
+        trusted_text = (
+            hit.text
+            if text_quality >= 0.50
+            and int(getattr(hit, "schema_version", 1)) >= OCR_INDEX_SCHEMA_VERSION
+            else ""
+        )
         existing = combined.get(key)
         if existing is None:
             existing = engine.result_for_keyframe(
@@ -449,19 +468,23 @@ def make_kis_results(
                 # OCR is useful evidence, but must not overpower the visual
                 # signal before the multimodal reranker gets a chance to
                 # inspect the actual frame.
-                score=0.55 * hit.score,
-                ocr_score=hit.score,
-                ocr_text=hit.text,
+                score=0.55 * evidence_score,
+                ocr_score=evidence_score,
+                ocr_quality=text_quality,
+                ocr_text=trusted_text,
             )
             if existing is None:
                 continue
             combined[key] = existing
         else:
-            existing.ocr_score = max(existing.ocr_score, hit.score)
-            existing.ocr_text = hit.text
+            existing.ocr_score = max(existing.ocr_score, evidence_score)
+            existing.ocr_quality = text_quality
+            existing.ocr_text = trusted_text
             existing.score = max(
                 existing.score,
-                0.40 * existing.visual_score + 0.45 * hit.score + 0.10 * existing.metadata_score,
+                0.40 * existing.visual_score
+                + 0.45 * evidence_score
+                + 0.10 * existing.metadata_score,
             )
             existing.retrieval_score = existing.score
 
@@ -534,7 +557,12 @@ def make_kis_results(
         min_frame_gap=min_gap,
         max_per_video=maximum,
     )
-    ocr_note = f"OCR RAM: {len(hits)} keyframe khớp chữ." if ocr_index else "OCR index chưa được nạp."
+    if ocr_index:
+        ocr_note = f"OCR RAM v{ocr_index.schema_version}: {len(hits)} keyframe scene-text."
+        if ocr_index.legacy_record_count:
+            ocr_note += f" · legacy filter: {ocr_index.legacy_record_count:,} record"
+    else:
+        ocr_note = "OCR index chưa được nạp."
     return (
         [StoredResult(result) for result in selected],
         language_note(engine) + " · " + profile.summary() + " · " + ocr_note + rerank_note,
@@ -865,13 +893,16 @@ def index():
 def health():
     try:
         engine = get_engine()
+        ocr_index = get_ocr_index()
         return jsonify(
             {
                 "ok": True,
                 "video_count": engine.video_count,
                 "vector_count": vector_count_compat(engine),
                 "video_ids": sorted(engine._features),
-                "ocr_records": get_ocr_index().record_count if get_ocr_index() else 0,
+                "ocr_records": ocr_index.record_count if ocr_index else 0,
+                "ocr_schema": ocr_index.schema_version if ocr_index else 0,
+                "ocr_legacy_records": ocr_index.legacy_record_count if ocr_index else 0,
                 "feature_cache_loaded": engine.feature_cache_loaded,
                 "reranker_ready": RERANKER is not None,
                 "reranker_error": RERANKER_ERROR,

@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 
 from data_paths import AICPaths
+from ocr_regions import (
+    OCR_INDEX_SCHEMA_VERSION,
+    bottom_overlay_start,
+    is_broadcast_overlay_box,
+    join_unique_lines,
+)
 from progress import track
 
 
@@ -51,10 +57,17 @@ def create_reader(language: str, device: str):
     )
 
 
-def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
-    """Extract legacy PaddleOCR lines as (polygon, (text, confidence))."""
+def read_text(reader, image_path: Path, minimum_confidence: float) -> tuple[str, str, int, int]:
+    """Return scene and broadcast-overlay text as separate values."""
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError as error:
+        raise RuntimeError("Thiếu Pillow để phân vùng OCR theo kích thước ảnh.") from error
+    with Image.open(image_path) as image:
+        image_width, image_height = image.size
     output = reader.ocr(str(image_path), cls=False)
-    lines: list[str] = []
+    scene_lines: list[str] = []
+    overlay_lines: list[str] = []
     pages = output or []
     for page in track(
         pages,
@@ -72,12 +85,28 @@ def read_text(reader, image_path: Path, minimum_confidence: float) -> str:
             nested=True,
         ):
             try:
+                polygon = item[0]
                 text, confidence = item[1]
             except (IndexError, TypeError, ValueError):
                 continue
-            if str(text).strip() and float(confidence) >= minimum_confidence:
-                lines.append(str(text).strip())
-    return " ".join(dict.fromkeys(lines))
+            clean_text = str(text).strip()
+            if not clean_text or float(confidence) < minimum_confidence:
+                continue
+            if is_broadcast_overlay_box(
+                polygon,
+                clean_text,
+                image_width,
+                image_height,
+            ):
+                overlay_lines.append(clean_text)
+            else:
+                scene_lines.append(clean_text)
+    return (
+        join_unique_lines(scene_lines),
+        join_unique_lines(overlay_lines),
+        len(scene_lines),
+        len(overlay_lines),
+    )
 
 
 def main() -> None:
@@ -112,6 +141,7 @@ def main() -> None:
     complete_marker.unlink(missing_ok=True)
     opener = gzip.open if output.suffix == ".gz" else open
     processed = written = consecutive_failures = 0
+    suppressed_overlay_lines = overlay_only_frames = 0
     video_dirs = [
         video_dir
         for keyframe_root in paths.keyframe_roots
@@ -120,7 +150,18 @@ def main() -> None:
     ]
     total_frames = sum(sum(1 for _ in video_dir.glob("*.jpg")) for video_dir in video_dirs)
     print(f"Sẽ OCR {total_frames:,} keyframe trong {len(video_dirs):,} video.", flush=True)
-    with opener(output, "wt", encoding="utf-8") as stream:
+    print(
+        "Bỏ chữ TV overlay ở đáy từ "
+        f"{bottom_overlay_start():.0%} chiều cao và logo/đồng hồ góc màn hình.",
+        flush=True,
+    )
+    if output.suffix == ".gz":
+        temporary_output = output.with_name(output.name.removesuffix(".gz") + ".building.gz")
+    else:
+        temporary_output = output.with_name(output.name + ".building")
+    temporary_output.unlink(missing_ok=True)
+    limit_reached = False
+    with opener(temporary_output, "wt", encoding="utf-8") as stream:
         with tqdm(
             total=total_frames,
             desc="OCR keyframes",
@@ -140,7 +181,11 @@ def main() -> None:
                     frame_progress.update(1)
                     try:
                         keyframe_number = int(image_path.stem)
-                        text = read_text(reader, image_path, arguments.min_confidence)
+                        text, overlay_text, _scene_count, overlay_count = read_text(
+                            reader,
+                            image_path,
+                            arguments.min_confidence,
+                        )
                     except Exception as error:
                         consecutive_failures += 1
                         print(f"[skip] {image_path}: {error}", file=sys.stderr)
@@ -152,27 +197,63 @@ def main() -> None:
                             ) from error
                         continue
                     consecutive_failures = 0
+                    suppressed_overlay_lines += overlay_count
+                    if overlay_text and not text:
+                        overlay_only_frames += 1
                     if text:
                         stream.write(
                             json.dumps(
-                                {"video_id": video_dir.name, "keyframe_number": keyframe_number, "text": text},
+                                {
+                                    "ocr_schema": OCR_INDEX_SCHEMA_VERSION,
+                                    "video_id": video_dir.name,
+                                    "keyframe_number": keyframe_number,
+                                    "text": text,
+                                },
                                 ensure_ascii=False,
                             )
                             + "\n"
                         )
                         written += 1
                     if processed % 25 == 0:
-                        frame_progress.set_postfix(records=written, refresh=False)
+                        frame_progress.set_postfix(
+                            records=written,
+                            overlay=suppressed_overlay_lines,
+                            refresh=False,
+                        )
                     if processed % 250 == 0:
                         stream.flush()
                     if arguments.limit and processed >= arguments.limit:
-                        print(f"Hoàn thành smoke test: {processed:,} keyframes · {written:,} records")
-                        return
+                        limit_reached = True
+                        break
+                if limit_reached:
+                    break
+    os.replace(temporary_output, output)
+    if limit_reached:
+        print(
+            f"Hoàn thành smoke test: {processed:,} keyframes · {written:,} records · "
+            f"bỏ {suppressed_overlay_lines:,} dòng overlay"
+        )
+        return
     complete_marker.write_text(
-        json.dumps({"keyframes": processed, "records": written}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {
+                "ocr_schema": OCR_INDEX_SCHEMA_VERSION,
+                "keyframes": processed,
+                "records": written,
+                "suppressed_overlay_lines": suppressed_overlay_lines,
+                "overlay_only_frames": overlay_only_frames,
+                "bottom_overlay_start": bottom_overlay_start(),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    print(f"Hoàn thành: {processed:,} keyframes · {written:,} records → {output}")
+    print(
+        f"Hoàn thành: {processed:,} keyframes · {written:,} records · "
+        f"bỏ {suppressed_overlay_lines:,} dòng overlay ({overlay_only_frames:,} frame chỉ có overlay) "
+        f"→ {output}"
+    )
 
 
 if __name__ == "__main__":

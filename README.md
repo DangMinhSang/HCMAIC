@@ -16,7 +16,7 @@ Trước khi mở dashboard, launcher làm trước toàn bộ phần không ph�
 
 1. Fast-forward source và tự restart process nếu `run.py` vừa thay đổi.
 2. Cài/probe đúng stack Qwen với `transformers>=5,<6`, `sentence-transformers>=5.4` và `qwen-vl-utils`.
-3. Import hoặc tạo OCR index một lần bằng PaddleOCR GPU.
+3. Import hoặc tạo OCR index v2 một lần bằng PaddleOCR GPU; tọa độ box loại lower-third, subtitle, ticker, logo và đồng hồ TV khỏi scene-text.
 4. Nạp và chuẩn hóa toàn bộ CLIP feature vào RAM; cache mapping frame, thư mục keyframe/video và metadata.
 5. Precompute BM25/IDF cho 164 nghìn OCR record và toàn bộ metadata video.
 6. Nạp CLIP, Qwen3-VL-Reranker và Qwen3-VL VQA; chạy warmup bằng keyframe thật.
@@ -28,7 +28,7 @@ Hot path của KIS/Q&A:
 2. CLIP ViT-B/32 recall toàn corpus bằng một matrix multiplication; OCR BM25 và metadata BM25 bổ sung candidate mà CLIP có thể bỏ sót.
 3. Tỷ trọng query điều khiển score fusion và quota candidate của từng nguồn.
 4. Pool Qwen được khử trùng mềm theo video/thời gian để không lãng phí 32 slot vào các frame gần giống nhau.
-5. `Qwen/Qwen3-VL-Reranker-2B` chấm query + ảnh + OCR. Qwen joint chiếm 80% điểm cuối; 20% còn lại dùng đúng tỷ trọng bằng chứng do query router chọn.
+5. `Qwen/Qwen3-VL-Reranker-2B` chấm query + ảnh đã làm mờ lower-third trong RAM + scene OCR. Qwen joint chiếm 80% điểm cuối; 20% còn lại dùng đúng tỷ trọng bằng chứng do query router chọn.
 6. Kết quả cuối mới áp frame gap, giới hạn mỗi video và Top-K.
 
 TRAKE dùng một phép nhân ma trận cho tất cả event, Viterbi để bắt buộc semantic frame tăng theo thời gian, Qwen center-rerank để chọn video, rồi soi lân cận ±1 keyframe và dynamic-align lại các chuỗi tốt nhất. Q&A dùng `Qwen/Qwen3-VL-2B-Instruct` để trả lời ngắn trên tối đa sáu frame đầu; nếu T4 không đủ VRAM hoặc model lỗi, nó tự giải phóng model và chuyển sang ViLT.
@@ -85,6 +85,8 @@ python /kaggle/working/HCMAIC/run.py \
 
 `--import-ocr` đọc và kiểm tra toàn bộ JSONL trước khi tạo marker hoàn tất. Muốn mở nhanh mà chưa có OCR dùng `--no-build-ocr`; độ chính xác truy vấn chữ sẽ giảm.
 
+OCR index v2 chỉ giữ chữ thuộc vật thể/cảnh. Mặc định các OCR box ở 18% đáy màn hình và logo/đồng hồ ở góc bị loại. Nếu launcher thấy index v1 cũ không có tọa độ, nó tự rebuild v2; `--no-build-ocr` chỉ dùng bộ lọc câu ticker dự phòng và kém chính xác hơn. Sau khi build xong, hãy xuất/mount file v2 mới thay cho dataset OCR cũ nếu muốn tái sử dụng ở session khác.
+
 ## Sử dụng dashboard
 
 - KIS: mô tả một khoảnh khắc bằng Việt hoặc Anh.
@@ -121,6 +123,9 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_SEARCH_WORKERS` | `1` | Số GPU job đồng thời; giữ 1 trên T4 |
 | `AIC_SEARCH_QUEUE_LIMIT` | `8` | Chặn public queue tăng vô hạn |
 | `AIC_TRANSLATE_VI` | `1` | Dịch VI→EN có cache cho CLIP/VQA |
+| `AIC_OCR_BOTTOM_OVERLAY_START` | `0.82` | Bỏ OCR box từ 82% chiều cao ảnh trở xuống |
+| `AIC_OCR_LEGACY_MIN_QUALITY` | `0.20` | Ngưỡng loại ticker cho OCR index v1 không có tọa độ |
+| `AIC_RERANKER_MASK_OVERLAYS` | `1` | Làm mờ lower-third trong RAM trước khi Qwen chấm ảnh |
 | `AIC_PROGRESS` | `1` | Hiện progress bar cho startup và từng query; đặt `0` để tắt |
 | `AIC_PROGRESS_MIN_ITEMS` | `20` | Ẩn các bar cực nhỏ để output dễ đọc |
 | `AIC_PROGRESS_ALL` | `0` | Đặt `1` để hiện cả mọi vòng lặp nhỏ/lồng nhau khi debug |
@@ -187,6 +192,10 @@ python run.py --vilt-vqa
 ```
 
 Muốn giữ dashboard hoạt động không Qwen dùng `AIC_RERANKER=0` hoặc `--no-reranker`; app sẽ fallback CLIP/OCR và hiển thị rõ trạng thái.
+
+### Top-1 là cảnh không liên quan nhưng ticker có đúng query
+
+Health/API và notice phải hiển thị `OCR RAM v2`. Nếu vẫn là v1, chạy lại launcher không dùng `--no-build-ocr` để hệ thống pre-OCR lại. V2 loại chữ theo tọa độ trước khi index; ảnh đưa vào Qwen cũng được làm mờ phần lower-third nên model không thể đọc lại ticker từ pixel gốc.
 
 ## Kiểm thử và evaluator theo PDF
 

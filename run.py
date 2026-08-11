@@ -21,6 +21,7 @@ import sys
 import threading
 from pathlib import Path
 
+from Code.ocr_regions import OCR_INDEX_SCHEMA_VERSION
 from Code.progress import track
 
 
@@ -39,6 +40,7 @@ STALE_MODULES = (
     "share_dashboard",
     "retrieval",
     "ocr_index",
+    "ocr_regions",
     "data_paths",
     "clip_encoder",
     "qa",
@@ -143,6 +145,30 @@ def _open_ocr_text(path: Path, mode: str):
     return gzip.open(path, mode, encoding="utf-8") if path.suffix == ".gz" else path.open(mode, encoding="utf-8")
 
 
+def ocr_index_schema(index_path: Path, marker_path: Path) -> int:
+    """Read an OCR schema cheaply from its marker, then first record."""
+    try:
+        marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker_schema = int(marker_payload.get("ocr_schema") or 0)
+        if marker_schema:
+            return marker_schema
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    try:
+        with _open_ocr_text(index_path, "rt") as stream:
+            for line in track(
+                stream,
+                desc="Đọc OCR schema",
+                unit="record",
+                nested=True,
+            ):
+                if line.strip():
+                    return int(json.loads(line).get("ocr_schema") or 1)
+    except (OSError, EOFError, TypeError, ValueError, json.JSONDecodeError):
+        return 0
+    return 0
+
+
 def import_ocr_index(source: Path, destination: Path) -> int:
     """Validate and install a previously exported text-only OCR index."""
     source = source.expanduser().resolve()
@@ -150,6 +176,7 @@ def import_ocr_index(source: Path, destination: Path) -> int:
     if not source.is_file():
         raise FileNotFoundError(f"Không tìm thấy OCR index để import: {source}")
     records = 0
+    schema_version = OCR_INDEX_SCHEMA_VERSION
     try:
         with _open_ocr_text(source, "rt") as stream:
             lines = enumerate(stream, 1)
@@ -163,6 +190,7 @@ def import_ocr_index(source: Path, destination: Path) -> int:
                 payload = json.loads(line)
                 if not payload.get("video_id") or "keyframe_number" not in payload:
                     raise ValueError(f"Dòng OCR {line_number} thiếu video_id/keyframe_number")
+                schema_version = min(schema_version, int(payload.get("ocr_schema") or 1))
                 records += 1
     except (OSError, EOFError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"OCR index không hợp lệ hoặc bị thiếu: {source} ({exc})") from exc
@@ -173,10 +201,21 @@ def import_ocr_index(source: Path, destination: Path) -> int:
         shutil.copyfile(source, destination)
     marker = Path(f"{destination}.complete")
     marker.write_text(
-        json.dumps({"records": records, "imported_from": str(source)}, ensure_ascii=False) + "\n",
+        json.dumps(
+            {
+                "ocr_schema": schema_version,
+                "records": records,
+                "imported_from": str(source),
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
-    print(f"Đã import OCR index: {records:,} records → {destination}", flush=True)
+    print(
+        f"Đã import OCR index v{schema_version}: {records:,} records → {destination}",
+        flush=True,
+    )
     return records
 
 
@@ -306,7 +345,17 @@ def main() -> None:
     if arguments.import_ocr:
         import_ocr_index(arguments.import_ocr, arguments.ocr_index)
     complete_marker = Path(f"{arguments.ocr_index}.complete")
-    index_ready = arguments.ocr_index.is_file() and complete_marker.is_file()
+    index_schema = (
+        ocr_index_schema(arguments.ocr_index, complete_marker)
+        if arguments.ocr_index.is_file() and complete_marker.is_file()
+        else 0
+    )
+    index_ready = index_schema >= OCR_INDEX_SCHEMA_VERSION
+    if index_schema and not index_ready:
+        print(
+            f"OCR index v{index_schema} còn chứa subtitle/ticker; cần rebuild v{OCR_INDEX_SCHEMA_VERSION}.",
+            flush=True,
+        )
     forced_ocr = (
         arguments.build_ocr
         or arguments.pre_ocr
@@ -315,6 +364,12 @@ def main() -> None:
     # Accuracy-first default: a fresh Kaggle session pre-OCRs once. Subsequent
     # Run all executions reuse the compact text index and launch immediately.
     build_ocr = forced_ocr or (not arguments.no_build_ocr and not index_ready)
+    if arguments.no_build_ocr and index_schema and not index_ready:
+        print(
+            "[warning] --no-build-ocr giữ index cũ; runtime chỉ có thể dùng ticker fallback, "
+            "không chính xác bằng pre-OCR v2.",
+            flush=True,
+        )
     clear_source_cache()
     reranker_enabled = (
         not arguments.no_reranker

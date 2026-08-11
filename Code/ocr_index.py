@@ -10,11 +10,13 @@ from __future__ import annotations
 import gzip
 import json
 import math
+import os
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from ocr_regions import OCR_INDEX_SCHEMA_VERSION, legacy_text_quality
 from progress import track
 from retrieval import normalize_text, tokenize
 
@@ -62,6 +64,8 @@ class OCRRecord:
     video_id: str
     keyframe_number: int
     text: str
+    schema_version: int = 1
+    text_quality: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -71,6 +75,13 @@ class OCRHit:
     text: str
     score: float
     matched_terms: int
+    text_quality: float = 1.0
+    schema_version: int = 1
+
+    @property
+    def effective_score(self) -> float:
+        """Absolute OCR evidence after legacy-overlay suppression."""
+        return self.score * self.text_quality
 
 
 def _open_index(path: Path, mode: str):
@@ -86,6 +97,14 @@ class OCRMemoryIndex:
         self._postings: dict[str, list[int]] = defaultdict(list)
         self._normalized_text: list[str] = []
         self._document_lengths: list[int] = []
+        self._text_quality: list[float] = []
+        self.schema_version = min(
+            (record.schema_version for record in self.records),
+            default=OCR_INDEX_SCHEMA_VERSION,
+        )
+        self.legacy_record_count = sum(
+            record.schema_version < OCR_INDEX_SCHEMA_VERSION for record in self.records
+        )
         for index, record in track(
             enumerate(self.records),
             desc="Lập OCR postings",
@@ -98,6 +117,10 @@ class OCRMemoryIndex:
             self._terms.append(terms)
             self._normalized_text.append(normalize_text(record.text))
             self._document_lengths.append(sum(terms.values()))
+            automatic_quality = legacy_text_quality(record.text, record.schema_version)
+            self._text_quality.append(
+                max(0.0, min(1.0, min(float(record.text_quality), automatic_quality)))
+            )
             for term in track(
                 terms,
                 desc="OCR terms",
@@ -146,11 +169,14 @@ class OCRMemoryIndex:
                     payload = json.loads(line)
                     text = str(payload.get("text") or "").strip()
                     if text:
+                        schema_version = int(payload.get("ocr_schema") or 1)
                         records.append(
                             OCRRecord(
                                 video_id=str(payload["video_id"]),
                                 keyframe_number=int(payload["keyframe_number"]),
                                 text=text,
+                                schema_version=schema_version,
+                                text_quality=float(payload.get("text_quality", 1.0)),
                             )
                         )
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -191,6 +217,13 @@ class OCRMemoryIndex:
         scored: list[tuple[float, int, int]] = []
         normalized_query = normalize_text(query).strip()
         compact_query = " ".join(source_terms)
+        try:
+            minimum_quality = max(
+                0.0,
+                min(1.0, float(os.environ.get("AIC_OCR_LEGACY_MIN_QUALITY", "0.20"))),
+            )
+        except ValueError:
+            minimum_quality = 0.20
         for index in track(
             candidate_indices,
             desc="Chấm OCR BM25",
@@ -199,6 +232,9 @@ class OCRMemoryIndex:
         ):
             record = self.records[index]
             if video_id and record.video_id != video_id:
+                continue
+            text_quality = self._text_quality[index]
+            if text_quality < minimum_quality:
                 continue
             doc_terms = self._terms[index]
             matched_groups = sum(
@@ -233,6 +269,7 @@ class OCRMemoryIndex:
                 score *= 2.0
             elif len(compact_query) >= 6 and compact_query in document_text:
                 score *= 1.65
+            score *= text_quality
             scored.append((score, matched_groups, index))
         if not scored:
             return []
@@ -245,6 +282,8 @@ class OCRMemoryIndex:
                 text=self.records[index].text,
                 score=score / maximum,
                 matched_terms=shared,
+                text_quality=self._text_quality[index],
+                schema_version=self.records[index].schema_version,
             )
             for score, shared, index in scored[:limit]
         ]

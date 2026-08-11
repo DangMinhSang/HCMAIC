@@ -12,13 +12,24 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ocr_regions import prepare_reranker_image
 from progress import progress_enabled, track
 
 
 DEFAULT_MODEL = "Qwen/Qwen3-VL-Reranker-2B"
-VISUAL_PROMPT = "Retrieve video frames whose visual scene matches the user's query."
-OCR_PROMPT = "Retrieve video frames whose visible or transcribed text matches the user's query. Ignore generic unrelated text."
-JOINT_PROMPT = "Retrieve video frames that match the query in both visual context and relevant visible text. Penalize generic scenes or unrelated OCR."
+OVERLAY_RULE = (
+    "Treat TV lower-thirds, scrolling news tickers, subtitles, channel logos, watermarks, "
+    "and on-screen clocks as absent; they are not part of the depicted scene."
+)
+VISUAL_PROMPT = f"Retrieve video frames whose visual scene matches the user's query. {OVERLAY_RULE}"
+OCR_PROMPT = (
+    "Retrieve frames whose text belongs to a physical sign, document, object, or screen in the scene. "
+    f"{OVERLAY_RULE}"
+)
+JOINT_PROMPT = (
+    "Retrieve video frames that match the query in visual context and trusted scene text. "
+    f"Penalize generic or unrelated scenes. {OVERLAY_RULE}"
+)
 
 
 class MultimodalRerankerUnavailableError(RuntimeError):
@@ -93,13 +104,19 @@ class QwenVLQueryReranker:
             self._cache_size = 512
 
     @staticmethod
-    def _image_document(result: Any) -> dict[str, str] | None:
+    def _image_document(result: Any) -> dict[str, Any] | None:
         image_path = str(getattr(result, "image_path", "") or "")
-        return {"image": image_path} if image_path else None
+        if not image_path:
+            return None
+        try:
+            image = prepare_reranker_image(image_path)
+        except (ImportError, OSError, ValueError):
+            image = image_path
+        return {"image": image}
 
     @classmethod
-    def _joint_document(cls, result: Any) -> dict[str, str] | None:
-        document: dict[str, str] = {}
+    def _joint_document(cls, result: Any) -> dict[str, Any] | None:
+        document: dict[str, Any] = {}
         image = cls._image_document(result)
         ocr_text = str(getattr(result, "ocr_text", "") or "").strip()
         if image:
@@ -193,7 +210,21 @@ class QwenVLQueryReranker:
             missing_positions.append(index)
             missing_keys.append(key)
         if missing_pairs:
-            values = self._predict_pairs(missing_pairs, prompt)
+            try:
+                values = self._predict_pairs(missing_pairs, prompt)
+            finally:
+                for _query, document in track(
+                    missing_pairs,
+                    desc="Giải phóng ảnh Qwen",
+                    total=len(missing_pairs),
+                    unit="image",
+                    nested=True,
+                ):
+                    if isinstance(document, dict):
+                        image = document.get("image")
+                        close = getattr(image, "close", None)
+                        if callable(close):
+                            close()
             for position, key, value in track(
                 zip(missing_positions, missing_keys, values),
                 desc="Cache điểm Qwen",

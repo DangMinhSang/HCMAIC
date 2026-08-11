@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -15,6 +16,7 @@ if str(CODE) not in sys.path:
 import numpy as np
 
 from multimodal_reranker import QwenVLQueryReranker
+from build_ocr_index import read_text
 from evaluation import (
     Interval,
     KISGroundTruth,
@@ -26,6 +28,12 @@ from evaluation import (
     score_trake,
 )
 from ocr_index import OCRMemoryIndex, OCRRecord
+from ocr_regions import (
+    OCR_INDEX_SCHEMA_VERSION,
+    is_broadcast_overlay_box,
+    legacy_text_quality,
+    prepare_reranker_image,
+)
 from qa import VQABaseline
 from query_router import QueryProfile, build_query_profile
 from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
@@ -122,6 +130,90 @@ class PipelineTests(unittest.TestCase):
                 hits = index.search(query)
                 self.assertTrue(hits)
                 self.assertEqual(hits[0].video_id, "correct")
+
+    def test_bottom_news_ticker_is_not_scene_ocr(self) -> None:
+        ticker_box = [[0, 650], [1250, 650], [1250, 700], [0, 700]]
+        sign_box = [[250, 180], [980, 180], [980, 270], [250, 270]]
+        self.assertTrue(
+            is_broadcast_overlay_box(
+                ticker_box,
+                "Cảnh báo nguy cơ lũ quét sạt lở đất vùng núi và trung du Bắc Bộ",
+                1280,
+                720,
+            )
+        )
+        self.assertFalse(
+            is_broadcast_overlay_box(
+                sign_box,
+                "CẢNH BÁO SẠT LỞ NGUY HIỂM",
+                1280,
+                720,
+            )
+        )
+
+    def test_pre_ocr_splits_ticker_from_physical_sign(self) -> None:
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed in the local test runtime")
+
+        class FakeReader:
+            @staticmethod
+            def ocr(_path, cls=False):
+                self.assertFalse(cls)
+                return [[
+                    [
+                        [[250, 180], [980, 180], [980, 270], [250, 270]],
+                        ("CẢNH BÁO SẠT LỞ NGUY HIỂM", 0.99),
+                    ],
+                    [
+                        [[0, 650], [1250, 650], [1250, 700], [0, 700]],
+                        ("Cảnh báo nguy cơ lũ quét sạt lở đất", 0.98),
+                    ],
+                ]]
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "frame.jpg"
+            Image.new("RGB", (1280, 720), "white").save(image_path)
+            scene, overlay, scene_count, overlay_count = read_text(FakeReader(), image_path, 0.45)
+        self.assertEqual(scene, "CẢNH BÁO SẠT LỞ NGUY HIỂM")
+        self.assertIn("lũ quét", overlay)
+        self.assertEqual((scene_count, overlay_count), (1, 1))
+
+    def test_legacy_weather_ticker_is_suppressed(self) -> None:
+        # Exact noisy PaddleOCR text from the unrelated tango frame L22_V021/204.
+        ticker = "Cänh báo nguy ca lo quét sat l& dát vng núi vä trung du Bäc Bö"
+        sign = "CẢNH BÁO SẠT LỞ NGUY HIỂM TẠM DỪNG LƯU THÔNG"
+        self.assertLess(legacy_text_quality(ticker), 0.20)
+        self.assertEqual(legacy_text_quality(sign), 1.0)
+        index = OCRMemoryIndex(
+            [
+                OCRRecord("unrelated-dance", 1, ticker),
+                OCRRecord("physical-sign", 2, sign, OCR_INDEX_SCHEMA_VERSION),
+            ]
+        )
+        hits = index.search("cảnh báo sạt lở nguy hiểm")
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].video_id, "physical-sign")
+        self.assertNotIn("unrelated-dance", {hit.video_id for hit in hits})
+
+    def test_qwen_receives_an_in_memory_blurred_lower_third(self) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            self.skipTest("Pillow is not installed in the local test runtime")
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "ticker.jpg"
+            source = Image.new("RGB", (320, 180), "white")
+            draw = ImageDraw.Draw(source)
+            for x in range(0, 320, 8):
+                draw.rectangle((x, 150, x + 3, 179), fill="black")
+            source.save(image_path)
+            masked = prepare_reranker_image(image_path)
+            self.assertEqual(masked.getpixel((20, 20)), source.getpixel((20, 20)))
+            self.assertNotEqual(masked.crop((0, 150, 320, 180)).tobytes(), source.crop((0, 150, 320, 180)).tobytes())
+            masked.close()
+            source.close()
 
     def test_multisource_pool_reserves_ocr_candidate(self) -> None:
         def result(video: str, keyframe: int, score: float, metadata: float = 0.0):
