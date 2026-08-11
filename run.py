@@ -129,9 +129,9 @@ def install_reranker_requirements() -> None:
     print(f"Qwen reranker đã sẵn sàng (transformers {verify.stdout.strip().splitlines()[-1]}).", flush=True)
 
 
-def install_requirements(build_ocr: bool, enable_reranker: bool = True) -> None:
+def install_requirements(build_ocr: bool, enable_qwen_stack: bool = True) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
-    if enable_reranker:
+    if enable_qwen_stack:
         install_reranker_requirements()
 
 
@@ -244,6 +244,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ocr-device", default="gpu:0", help="OCR device; full pre-OCR requires gpu:0")
     parser.add_argument("--no-preload-features", action="store_true")
     parser.add_argument("--no-reranker", action="store_true", help="Không cài/chạy Qwen multimodal reranker")
+    parser.add_argument("--vilt-vqa", action="store_true", help="Dùng ViLT nhẹ thay cho Qwen3-VL VQA")
     return parser.parse_args()
 
 
@@ -276,8 +277,11 @@ def warmup_dashboard(reranker_enabled: bool) -> None:
     if os.environ.get("AIC_PRELOAD_VQA", "1").lower() not in {"0", "false", "no"}:
         try:
             print("Đang tải VQA model trước query đầu tiên…", flush=True)
-            dashboard.get_vqa().warmup()
-        except RuntimeError as error:
+            backend = dashboard.warmup_vqa()
+            print(f"VQA đã warmup bằng keyframe thật: {backend}.", flush=True)
+            if dashboard.get_vqa().load_error:
+                print(dashboard.get_vqa().load_error, flush=True)
+        except Exception as error:
             print(f"VQA preload bỏ qua: {error}", flush=True)
 
 
@@ -306,7 +310,16 @@ def main() -> None:
         and not arguments.pre_ocr
         and os.environ.get("AIC_RERANKER", "1").lower() not in {"0", "false", "no"}
     )
-    install_requirements(build_ocr, reranker_enabled)
+    if arguments.vilt_vqa:
+        os.environ["AIC_VQA_BACKEND"] = "vilt"
+    preload_vqa = os.environ.get("AIC_PRELOAD_VQA", "1").lower() not in {"0", "false", "no"}
+    default_vqa_backend = "qwen" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "vilt"
+    qwen_vqa_enabled = (
+        not arguments.pre_ocr
+        and preload_vqa
+        and os.environ.get("AIC_VQA_BACKEND", default_vqa_backend).lower() == "qwen"
+    )
+    install_requirements(build_ocr, reranker_enabled or qwen_vqa_enabled)
 
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)

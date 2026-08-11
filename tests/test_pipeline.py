@@ -5,6 +5,7 @@ import unittest
 from collections import Counter, OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 CODE = Path(__file__).resolve().parents[1] / "Code"
@@ -25,12 +26,31 @@ from evaluation import (
     score_trake,
 )
 from ocr_index import OCRMemoryIndex, OCRRecord
+from qa import VQABaseline
 from query_router import QueryProfile, build_query_profile
 from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
 from retrieval import AICRetrievalEngine, VideoMetadata
 
 
 class PipelineTests(unittest.TestCase):
+    def test_vqa_uses_qwen_on_kaggle_and_can_fallback_to_vilt(self) -> None:
+        with patch.dict("os.environ", {"KAGGLE_KERNEL_RUN_TYPE": "Interactive"}, clear=False):
+            vqa = VQABaseline()
+        self.assertEqual(vqa.requested_backend, "qwen")
+        self.assertEqual(vqa.model_name, "Qwen/Qwen3-VL-2B-Instruct")
+
+        def fake_vilt_load():
+            vqa._model = object()
+            vqa.backend_name = "ViLT fallback"
+
+        with (
+            patch.object(vqa, "_load_qwen", side_effect=RuntimeError("simulated VRAM limit")),
+            patch.object(vqa, "_load_vilt", side_effect=fake_vilt_load),
+        ):
+            vqa._load()
+        self.assertEqual(vqa.backend_name, "ViLT fallback")
+        self.assertIn("simulated VRAM limit", vqa.load_error)
+
     def test_pdf_final_score_example(self) -> None:
         scores = [0.5, 0.0, 0.8, *([0.0] * 97)]
         self.assertAlmostEqual(final_score(scores), 0.74)

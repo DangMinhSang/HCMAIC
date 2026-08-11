@@ -373,8 +373,11 @@
       const model = $("#model-status");
       model.classList.remove("waiting");
       model.classList.add(data.reranker_ready ? "ready" : "fallback");
-      model.lastChild.textContent = data.reranker_ready ? "Qwen sẵn sàng" : "CLIP/OCR fallback";
-      model.title = data.reranker_error || "Feature đã preload trong RAM";
+      const vqaLabel = String(data.vqa_backend || "");
+      model.lastChild.textContent = data.reranker_ready
+        ? `Qwen rerank · ${vqaLabel.startsWith("Qwen") ? "Qwen VQA" : "ViLT VQA"}`
+        : "CLIP/OCR fallback";
+      model.title = [data.reranker_error, data.vqa_error, `VQA: ${vqaLabel}`].filter(Boolean).join(" · ") || "Feature đã preload trong RAM";
       const select = $("#video");
       data.video_ids.forEach((id) => select.add(new Option(id, id)));
     } catch (error) {

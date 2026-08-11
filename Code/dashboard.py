@@ -166,6 +166,22 @@ def get_vqa() -> VQABaseline:
         return VQA
 
 
+def warmup_vqa() -> str:
+    """Exercise the selected VQA backend on a real mounted keyframe."""
+    engine = get_engine()
+    vqa = get_vqa()
+    for video_id in engine._features:
+        mapping = engine._mapping(video_id)
+        if not mapping:
+            continue
+        sample = engine.result_for_keyframe(video_id, mapping[0].keyframe_number)
+        if sample is not None and sample.image_path:
+            vqa.warmup(sample.image_path)
+            return vqa.backend_name
+    vqa.warmup()
+    return vqa.backend_name
+
+
 def get_ocr_index() -> OCRMemoryIndex | None:
     """Load text-only OCR postings into RAM once, before the first query."""
     global OCR_INDEX, OCR_INDEX_LOADED
@@ -484,7 +500,8 @@ def make_qa_results(
     )
     results = [item.result for item in stored]
     try:
-        predictions = get_vqa().predict(question, results)
+        vqa = get_vqa()
+        predictions = vqa.predict(question, results)
         by_rank = {prediction.rank: prediction for prediction in predictions}
         for result in results:
             prediction = by_rank.get(result.rank)
@@ -513,6 +530,9 @@ def make_qa_results(
             note += f" · VQA đồng thuận: {consensus_answer} ({best_confidence:.0%})"
         else:
             note += " · Không có ảnh để chạy VQA."
+        note += f" · VQA model: {vqa.backend_name}"
+        if vqa.load_error:
+            note += f" ({vqa.load_error[:100]})"
     except RuntimeError as error:
         # Retrieval must remain available if the optional VQA checkpoint is offline.
         note += f" · VQA chưa sẵn sàng: {error}"
@@ -626,6 +646,8 @@ def health():
                 "feature_cache_loaded": engine.feature_cache_loaded,
                 "reranker_ready": RERANKER is not None,
                 "reranker_error": RERANKER_ERROR,
+                "vqa_backend": VQA.backend_name if VQA is not None else "chưa tải",
+                "vqa_error": VQA.load_error if VQA is not None else "",
             }
         )
     except (DatasetNotFoundError, OSError) as error:
