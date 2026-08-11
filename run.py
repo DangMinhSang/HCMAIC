@@ -104,9 +104,10 @@ def install_reranker_requirements() -> None:
     marker_name = ".aic_reranker_requirements.sha256"
     install_if_changed(RERANKER_REQUIREMENTS, marker_name)
     probe = (
-        "import sentence_transformers, qwen_vl_utils, transformers; "
+        "import torch, qwen_vl_utils, sentence_transformers, transformers; "
+        "from sentence_transformers import CrossEncoder; "
         "from transformers import Qwen3VLForConditionalGeneration; "
-        "print(transformers.__version__)"
+        "print(transformers.__version__, sentence_transformers.__version__)"
     )
     result = subprocess.run([sys.executable, "-c", probe], text=True, capture_output=True, check=False)
     if result.returncode == 0:

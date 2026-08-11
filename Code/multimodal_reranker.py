@@ -40,11 +40,13 @@ class QwenVLQueryReranker:
     def __init__(self, model_name: str | None = None) -> None:
         try:
             import torch  # type: ignore
+            import qwen_vl_utils  # type: ignore  # noqa: F401
             from sentence_transformers import CrossEncoder  # type: ignore
-        except ImportError as error:
+        except Exception as error:
             raise MultimodalRerankerUnavailableError(
-                "Thiếu sentence-transformers/qwen-vl-utils cho Qwen3-VL-Reranker. "
-                "Chạy lại run.py trên Kaggle hoặc cài requirements-reranker.txt; "
+                "Không import được Qwen reranker stack "
+                f"({type(error).__name__}: {error}). "
+                "Chạy lại run.py để cài đúng transformers/sentence-transformers; "
                 "muốn tắt thì đặt AIC_RERANKER=0."
             ) from error
 
