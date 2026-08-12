@@ -62,6 +62,43 @@ SESSIONS_LOCK = threading.RLock()
 SEARCH_JOBS: dict[str, "SearchJob"] = {}
 SEARCH_JOBS_LOCK = threading.RLock()
 
+TRAKE_STAGE_PROMPT = (
+    "Score the exact temporal stage requested for this ordered action sequence. "
+    "Use the visible body position and contact state, not captions or generic scene similarity. "
+    "For preparation, choose the beginning of movement; for the main action, choose the first "
+    "departure from the initial position; for airborne, choose the apex when possible; for landing, "
+    "choose the first frame where the athlete visibly begins contacting the ground or landing area "
+    "after being airborne. Never substitute a pre-landing airborne frame or a frame already well after landing."
+)
+
+
+def _trake_event_query(event: str, index: int, events: list[str]) -> str:
+    """Give the reranker sequence position without changing CLIP retrieval text."""
+    previous = events[index - 1] if index else "none; this is the first stage"
+    following = events[index + 1] if index + 1 < len(events) else "none; this is the final stage"
+    return (
+        f"Ordered event {index + 1}/{len(events)}. Exact stage: {event}\n"
+        f"Previous stage: {previous}\nNext stage: {following}"
+    )
+
+
+def _is_landing_event(event: str) -> bool:
+    lowered = event.casefold()
+    return any(
+        term in lowered
+        for term in (
+            "tiếp đất",
+            "tiep dat",
+            "tiếp xúc",
+            "tiep xuc",
+            "mặt đất",
+            "mat dat",
+            "landing",
+            "lands",
+            "contact the ground",
+        )
+    )
+
 
 def bounded_environment_integer(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
@@ -664,19 +701,24 @@ def make_trake_results(
         center_scored_ids = {id(sequence) for sequence in reranked_sequences}
         event_queries: list[str] = []
         event_vectors = []
-        for event in track(
-            events,
+        for event_index, event in track(
+            enumerate(events),
             desc="Chuẩn hóa TRAKE events",
             total=len(events),
             unit="event",
             force=True,
         ):
             normalized = normalize_query(event)
-            event_queries.append(
-                event
+            translated = (
+                ""
                 if normalized.text_for_model.lower() == event.lower()
-                else f"{event}\nEnglish translation: {normalized.text_for_model}"
+                else f"\nEnglish translation: {normalized.text_for_model}"
             )
+            event_queries.append(
+                _trake_event_query(event, event_index, events) + translated
+            )
+            # CLIP recall remains focused on the event itself. Sequence
+            # context is supplied only to the expensive temporal reranker.
             event_vectors.append(engine.encoder.encode(event))
         pair_queries: list[str] = []
         pair_frames: list[SearchResult] = []
@@ -694,10 +736,7 @@ def make_trake_results(
             ):
                 pair_queries.append(event_query)
                 pair_frames.append(frame)
-        pair_prompt = (
-            "Score whether this exact video frame is the requested semantic moment. "
-            "Use the visible action, temporal stage, objects, and relevant text."
-        )
+        pair_prompt = TRAKE_STAGE_PROMPT
         try:
             pair_scores = reranker.score_pairs(
                 pair_queries,
@@ -734,10 +773,10 @@ def make_trake_results(
             sequences.sort(key=lambda item: item.score, reverse=True)
 
             try:
-                radius = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_RADIUS", "1")), 2))
-                refine_limit = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_SEQUENCES", "2")), 5))
+                radius = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_RADIUS", "2")), 4))
+                refine_limit = max(0, min(int(os.environ.get("AIC_TRAKE_REFINE_SEQUENCES", "3")), 5))
             except ValueError:
-                radius, refine_limit = 1, 2
+                radius, refine_limit = 2, 3
             refinement_targets = [
                 sequence for sequence in sequences if id(sequence) in center_scored_ids
             ][:refine_limit]
@@ -762,10 +801,14 @@ def make_trake_results(
                         unit="event",
                         nested=True,
                     ):
+                        event_radius = min(
+                            5,
+                            radius + (1 if _is_landing_event(events[event_index]) else 0),
+                        )
                         neighbors = engine.neighboring_keyframes(
                             sequence.video_id,
                             center.keyframe_number,
-                            radius=radius,
+                            radius=event_radius,
                             query_vector=event_vectors[event_index],
                         )
                         groups.append(neighbors)

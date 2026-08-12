@@ -31,7 +31,7 @@ Hot path của KIS/Q&A:
 5. `Qwen/Qwen3-VL-Reranker-2B` chấm query + ảnh đã làm mờ lower-third trong RAM + scene OCR. Qwen joint chiếm 80% điểm cuối; 20% còn lại dùng đúng tỷ trọng bằng chứng do query router chọn.
 6. Kết quả cuối mới áp frame gap, giới hạn mỗi video và Top-K.
 
-TRAKE dùng một phép nhân ma trận cho tất cả event, Viterbi để bắt buộc semantic frame tăng theo thời gian, Qwen center-rerank để chọn video, rồi soi lân cận ±1 keyframe và dynamic-align lại các chuỗi tốt nhất. Q&A dùng `Qwen/Qwen3-VL-2B-Instruct` để trả lời ngắn trên tối đa sáu frame đầu; nếu T4 không đủ VRAM hoặc model lỗi, nó tự giải phóng model và chuyển sang ViLT.
+TRAKE dùng một phép nhân ma trận cho tất cả event, Viterbi để bắt buộc semantic frame tăng theo thời gian, Qwen center-rerank theo đúng vị trí của từng event để chọn video, rồi soi lân cận quanh các chuỗi tốt nhất và dynamic-align lại. Event “tiếp đất” được soi rộng hơn một keyframe để tìm lần tiếp xúc đầu tiên sau trạng thái trên không. Q&A dùng `Qwen/Qwen3-VL-2B-Instruct` để trả lời ngắn trên các frame đã được chọn theo cả sự kiện và câu hỏi; nếu T4 không đủ VRAM hoặc model lỗi, nó tự giải phóng model và chuyển sang ViLT.
 
 Các model Qwen được dùng theo API chính thức: [Qwen3-VL-Reranker-2B](https://huggingface.co/Qwen/Qwen3-VL-Reranker-2B) và [Qwen3-VL-2B-Instruct](https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct).
 
@@ -115,8 +115,8 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_RERANKER_BATCH_SIZE` | `2` | Batch T4; OOM tự retry bằng 1 |
 | `AIC_RERANKER_CACHE` | `512` | LRU cache cặp query/frame |
 | `AIC_TRAKE_RERANK_PAIRS` | `32` | Ngân sách center event–frame |
-| `AIC_TRAKE_REFINE_RADIUS` | `1` | Bán kính keyframe refinement, tối đa 2 ở dashboard |
-| `AIC_TRAKE_REFINE_SEQUENCES` | `2` | Số chuỗi được refinement |
+| `AIC_TRAKE_REFINE_RADIUS` | `2` | Bán kính keyframe refinement; event tiếp đất tự rộng thêm 1, tối đa 5 |
+| `AIC_TRAKE_REFINE_SEQUENCES` | `3` | Số chuỗi được refinement |
 | `AIC_VQA_BACKEND` | `qwen` | Dùng `vilt` nếu cần nhẹ VRAM |
 | `AIC_VQA_CANDIDATES` | `6` | Số frame Qwen VQA trả lời, tối đa 12 |
 | `AIC_PRELOAD_VQA` | `1` | Nạp/warmup VQA trước khi mở web |
