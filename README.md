@@ -22,6 +22,12 @@ Trước khi mở dashboard, launcher làm trước toàn bộ phần không ph�
 6. Nạp CLIP, query analyzer MiniLM, Qwen3-VL-Reranker và Qwen3-VL VQA; chạy warmup bằng keyframe thật.
 7. Chỉ sau đó mới mở Gradio share URL.
 
+Direct-video là một pipeline độc lập, mặc định **tắt**. Khi bật, hệ thống đọc
+MP4 từ `/kaggle/input/datasets/doanminhtuan/video-aic`, tự lấy frame và tự tạo
+CLIP index tại `/kaggle/working/aic_direct_video_cache`; nó không đọc feature,
+mapping, keyframe gallery hay OCR index do BTC cung cấp. Chỉ khi mount không có
+video, resolver mới fallback sang `kagglehub.dataset_download("doanminhtuan/video-aic")`.
+
 Hot path của KIS/Q&A:
 
 1. Query analyzer nhẹ `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` tách query thành các cụm có vai trò, rồi trả tỷ trọng **Hình ảnh / OCR / Metadata / Object**. Ví dụ `Biển cảnh báo màu vàng có nội dung là cảnh báo sạt lở nguy hiểm` được tách thành cụm visual dùng CLIP và cụm OCR dùng BM25 OCR; lexical/structural là fallback nếu checkpoint chưa tải được.
@@ -37,7 +43,7 @@ Các model Qwen được dùng theo API chính thức: [Qwen3-VL-Reranker-2B](ht
 
 ## Dataset Kaggle
 
-Project chỉ đọc dữ liệu đã mount, không có code tải/copy AIC dataset. Thêm các input sau vào notebook:
+Pipeline mặc định chỉ đọc dữ liệu đã mount; nhánh direct-video là ngoại lệ opt-in và chỉ gọi KaggleHub khi mount raw video không tồn tại. Thêm các input sau vào notebook:
 
 | Mức độ | Kaggle dataset | Công dụng |
 | --- | --- | --- |
@@ -111,6 +117,11 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | Biến | Mặc định Kaggle | Ý nghĩa |
 | --- | --- | --- |
 | `AIC_PRELOAD_FEATURES` | `1` | Giữ ma trận CLIP đã chuẩn hóa trong RAM |
+| `AIC_DIRECT_VIDEO` | `0` | Bật pipeline raw video; tương đương `python run.py --direct-video` |
+| `AIC_DIRECT_VIDEO_ROOT` | `/kaggle/input/datasets/doanminhtuan/video-aic` | Override thư mục video direct |
+| `AIC_DIRECT_VIDEO_STRIDE` | `15` | Lấy một frame mỗi N frame khi tạo local index; nhỏ hơn tăng recall và startup |
+| `AIC_DIRECT_VIDEO_BATCH` | `64` | Batch ảnh tự encode CLIP khi precompute |
+| `AIC_DIRECT_VIDEO_MAX_SAMPLES` | `0` | Giới hạn sample/video để thử nhanh; `0` là không giới hạn |
 | `AIC_RERANKER` | `1` | Bật Qwen3-VL-Reranker |
 | `AIC_RERANKER_CANDIDATES` | `32` | Số ảnh KIS/Q&A Qwen chấm; tăng tối đa 100 |
 | `AIC_RERANKER_BATCH_SIZE` | `2` | Batch T4; OOM tự retry bằng 1 |
@@ -157,6 +168,25 @@ export AIC_TRAKE_RERANK_PAIRS=48
 export AIC_TRAKE_REFINE_SEQUENCES=3
 python run.py
 ```
+
+### Chạy thử pipeline lấy trực tiếp từ video
+
+```bash
+# Mặc định không bật. Dataset đã mount nên lệnh này không tải lại dữ liệu.
+python run.py --direct-video
+
+# Hoặc bật bằng biến môi trường; cache local sẽ được dùng ở các lần sau.
+export AIC_DIRECT_VIDEO=1
+export AIC_DIRECT_VIDEO_STRIDE=15
+python run.py
+```
+
+Direct mode hiện là nhánh thử nghiệm visual-only: OCR/object/metadata BTC bị
+khóa để không trộn sai keyframe id với frame OpenCV. `frame_id` là chỉ số frame
+decoded zero-based của video raw; hãy benchmark/đối chiếu convention của BTC
+trước khi dùng nhánh này để xuất submission chính thức. TRAKE vẫn giữ thứ tự
+thời gian và local refinement, còn ảnh candidate được giải mã lười để giảm
+disk/startup.
 
 ### Đo latency thật trên Kaggle T4
 

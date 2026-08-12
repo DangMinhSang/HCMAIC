@@ -13,12 +13,13 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, session, url_for
 from werkzeug.exceptions import HTTPException
 
 from data_paths import DatasetNotFoundError
+from direct_video_retrieval import DirectVideoRetrievalEngine, DirectVideoUnavailableError
 from multimodal_reranker import (
     QA_PROMPT,
     MultimodalRerankerUnavailableError,
@@ -57,7 +58,7 @@ def json_api_http_error(error: HTTPException):
         return jsonify({"error": error.description, "status": error.code}), error.code
     return error
 
-ENGINE: AICRetrievalEngine | None = None
+ENGINE: AICRetrievalEngine | DirectVideoRetrievalEngine | None = None
 VQA: VQABaseline | None = None
 OCR_INDEX: OCRMemoryIndex | None = None
 OCR_INDEX_LOADED = False
@@ -157,11 +158,19 @@ class SearchJob:
     error: str = ""
 
 
-def get_engine() -> AICRetrievalEngine:
+def direct_video_enabled() -> bool:
+    return os.environ.get("AIC_DIRECT_VIDEO", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_engine() -> AICRetrievalEngine | DirectVideoRetrievalEngine:
     global ENGINE
     with ENGINE_LOCK:
         if ENGINE is None:
-            ENGINE = AICRetrievalEngine.from_environment()
+            ENGINE = (
+                DirectVideoRetrievalEngine.from_environment()
+                if direct_video_enabled()
+                else AICRetrievalEngine.from_environment()
+            )
         return ENGINE
 
 
@@ -271,6 +280,12 @@ def get_ocr_index() -> OCRMemoryIndex | None:
     """Load text-only OCR postings into RAM once, before the first query."""
     global OCR_INDEX, OCR_INDEX_LOADED
     with ENGINE_LOCK:
+        if direct_video_enabled():
+            # The BTC OCR index is keyed by the supplied keyframe mapping and
+            # must never be mixed with OpenCV frame ids from the raw-video path.
+            OCR_INDEX = None
+            OCR_INDEX_LOADED = True
+            return None
         if OCR_INDEX_LOADED:
             return OCR_INDEX
         OCR_INDEX_LOADED = True
@@ -475,6 +490,21 @@ def _merge_recall_result(
     existing.object_labels = tuple(dict.fromkeys((*existing.object_labels, *result.object_labels)))
 
 
+def ensure_result_images(engine: Any, results: Sequence[SearchResult]) -> None:
+    """Materialize lazy raw-video images only for rerank/display candidates."""
+    materializer = getattr(engine, "ensure_result_image", None)
+    if not callable(materializer):
+        return
+    for result in track(
+        results,
+        desc="Giải mã ảnh direct candidates",
+        total=len(results),
+        unit="frame",
+        nested=True,
+    ):
+        materializer(result)
+
+
 def _source_recall_queries(analysis: QueryAnalysis, fallback: str) -> list[tuple[str, str]]:
     """Return unique source phrases in priority order for candidate recall."""
     queries = analysis.source_queries()
@@ -651,6 +681,7 @@ def make_kis_results(
             min_frame_gap=30,
         )
         try:
+            ensure_result_images(engine, rerank_candidates)
             normalized = normalize_query(query)
             rerank_query = query
             if normalized.text_for_model.lower() != query.lower():
@@ -710,12 +741,17 @@ def make_kis_results(
         min_frame_gap=min_gap,
         max_per_video=maximum,
     )
+    ensure_result_images(engine, selected)
     if ocr_index:
         ocr_note = f"OCR RAM v{ocr_index.schema_version}: {len(hits)} keyframe scene-text."
         if ocr_index.legacy_record_count:
             ocr_note += f" · legacy filter: {ocr_index.legacy_record_count:,} record"
     else:
-        ocr_note = "OCR index chưa được nạp."
+        ocr_note = (
+            "Direct-video: OCR BTC tắt, score hiện tại từ local CLIP"
+            if direct_video_enabled()
+            else "OCR index chưa được nạp."
+        )
     return (
         [StoredResult(result) for result in selected],
         language_note(engine)
@@ -1070,6 +1106,8 @@ def health():
         return jsonify(
             {
                 "ok": True,
+                "retrieval_source": getattr(engine, "source_mode", "btc-features"),
+                "source_description": getattr(engine, "source_description", "BTC supplied CLIP features"),
                 "video_count": engine.video_count,
                 "vector_count": vector_count_compat(engine),
                 "video_ids": sorted(engine._features),
@@ -1089,7 +1127,7 @@ def health():
                 "vqa_error": VQA.load_error if VQA is not None else "",
             }
         )
-    except (DatasetNotFoundError, OSError) as error:
+    except (DatasetNotFoundError, DirectVideoUnavailableError, OSError) as error:
         return jsonify({"ok": False, "error": str(error)}), 503
 
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any, Sequence
 
+from progress import track
 from query_language import NormalizedQuery, normalize_query
 
 
@@ -26,6 +28,7 @@ class ClipTextEncoder:
         self._model = None
         self._clip = None
         self._torch = None
+        self._preprocess = None
         self.last_query: NormalizedQuery | None = None
 
     def _load(self) -> None:
@@ -43,7 +46,7 @@ class ClipTextEncoder:
         device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         cache = Path(os.environ.get("AIC_CLIP_CACHE", "~/.cache/clip")).expanduser()
         try:
-            model, _ = clip.load(self.model_name, device=device, download_root=str(cache))
+            model, preprocess = clip.load(self.model_name, device=device, download_root=str(cache))
         except Exception as error:  # package-specific model/cache errors
             raise ClipModelUnavailableError(
                 "Không tải được trọng số CLIP ViT-B/32. Bật Internet cho Kaggle "
@@ -52,7 +55,7 @@ class ClipTextEncoder:
             ) from error
         model.eval()
         self.device = device
-        self._model, self._clip, self._torch = model, clip, torch
+        self._model, self._clip, self._torch, self._preprocess = model, clip, torch, preprocess
 
     def encode(self, query: str, english_expansion: str = ""):
         """Return one L2-normalized NumPy query vector.
@@ -95,3 +98,40 @@ class ClipTextEncoder:
     def warmup(self) -> None:
         """Load CLIP and execute one text pass before the first web query."""
         self.encode("a person in a video")
+
+    def encode_images(
+        self,
+        images: Sequence[Any],
+        *,
+        batch_size: int = 64,
+        progress_desc: str = "CLIP image batches",
+        nested: bool = False,
+    ):
+        """Encode PIL-like images with the same CLIP checkpoint as text recall.
+
+        This is used only by the opt-in direct-video index builder. The normal
+        BTC-feature path never sends gallery images through CLIP at query time.
+        """
+        if not images:
+            raise ValueError("Cần ít nhất một ảnh để encode CLIP.")
+        self._load()
+        if self._preprocess is None:
+            raise ClipModelUnavailableError("CLIP image preprocess chưa được khởi tạo.")
+        import numpy as np
+
+        batch_size = max(1, int(batch_size))
+        outputs = []
+        for start in track(
+            range(0, len(images), batch_size),
+            desc=progress_desc,
+            total=(len(images) + batch_size - 1) // batch_size,
+            unit="batch",
+            nested=nested,
+        ):
+            batch = images[start : start + batch_size]
+            tensors = self._torch.stack([self._preprocess(image) for image in batch]).to(self.device)
+            with self._torch.inference_mode():
+                embeddings = self._model.encode_image(tensors).float()
+                embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            outputs.append(embeddings.cpu().numpy().astype("float32", copy=False))
+        return np.concatenate(outputs, axis=0)

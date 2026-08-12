@@ -129,6 +129,8 @@ def main() -> None:
         "warm_query_mean_seconds": round(statistics.fmean(timings), 3),
         "warm_query_min_seconds": round(min(timings), 3),
         "corpus": {
+            "retrieval_source": getattr(engine, "source_mode", "btc-features"),
+            "source_description": getattr(engine, "source_description", "BTC supplied CLIP features"),
             "videos": engine.video_count,
             "vectors": engine.vector_count,
             "ocr_records": ocr_index.record_count if ocr_index else 0,

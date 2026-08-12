@@ -1,0 +1,3 @@
+# Installed only when --direct-video/AIC_DIRECT_VIDEO=1 is explicitly enabled.
+# Kaggle's video-aic input is preferred; this package is the clean-kernel fallback.
+kagglehub>=0.3.0

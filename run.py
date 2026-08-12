@@ -1,9 +1,10 @@
 """Stable Kaggle launcher for the AIC dashboard.
 
-Keep ``run_kaggle.ipynb`` unchanged.  This script pulls the latest source,
+Keep ``run_kaggle.ipynb`` unchanged. This script pulls the latest source,
 re-executes itself when it changed, clears source-level Python caches, and
-starts the dashboard in a fresh process.  It never downloads or copies the
-AIC dataset: data is read only from the Kaggle Inputs mount.
+starts the dashboard in a fresh process. The default feature path reads only
+Kaggle Inputs; the explicit ``--direct-video`` path may resolve KaggleHub only
+when its video mount is absent.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
 RERANKER_REQUIREMENTS = CODE / "requirements-reranker.txt"
 QUERY_ANALYZER_REQUIREMENTS = CODE / "requirements-query-analyzer.txt"
+DIRECT_VIDEO_REQUIREMENTS = CODE / "requirements-direct-video.txt"
 # Kaggle's CPython image has no ``ensurepip``, so a virtualenv cannot be
 # bootstrapped reliably there.  Keep Paddle packages in this private directory
 # and expose it only to the pre-OCR subprocess via PYTHONPATH.
@@ -49,6 +51,7 @@ STALE_MODULES = (
     "query_router",
     "query_analyzer",
     "multimodal_reranker",
+    "direct_video_retrieval",
     "ranking",
     "progress",
 )
@@ -142,14 +145,22 @@ def install_query_analyzer_requirements() -> None:
     install_if_changed(QUERY_ANALYZER_REQUIREMENTS, ".aic_query_analyzer_requirements.sha256")
 
 
+def install_direct_video_requirements() -> None:
+    """Install KaggleHub only for the explicit raw-video mode."""
+    install_if_changed(DIRECT_VIDEO_REQUIREMENTS, ".aic_direct_video_requirements.sha256")
+
+
 def install_requirements(
     build_ocr: bool,
     enable_qwen_stack: bool = True,
     enable_query_analyzer: bool = True,
+    enable_direct_video: bool = False,
 ) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
     if enable_query_analyzer:
         install_query_analyzer_requirements()
+    if enable_direct_video:
+        install_direct_video_requirements()
     if enable_qwen_stack:
         install_reranker_requirements()
 
@@ -306,19 +317,36 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--data-root", default="/kaggle/input")
     parser.add_argument("--ocr-device", default="gpu:0", help="OCR device; full pre-OCR requires gpu:0")
     parser.add_argument("--no-preload-features", action="store_true")
+    parser.add_argument(
+        "--direct-video",
+        action="store_true",
+        help=(
+            "Dùng video-aic raw và tự tạo/cache CLIP index; mặc định tắt, "
+            "không dùng feature/mapping BTC"
+        ),
+    )
     parser.add_argument("--no-reranker", action="store_true", help="Không cài/chạy Qwen multimodal reranker")
     parser.add_argument("--vilt-vqa", action="store_true", help="Dùng ViLT nhẹ thay cho Qwen3-VL VQA")
     return parser.parse_args()
 
 
-def warmup_dashboard(reranker_enabled: bool) -> None:
+def warmup_dashboard(reranker_enabled: bool, direct_video_enabled: bool = False) -> None:
     """Load query-time resources before Gradio can receive HTTP requests."""
     import dashboard
 
-    print("Đang khởi tạo feature engine và OCR index trước khi mở dashboard…", flush=True)
+    if direct_video_enabled:
+        print("Đang khởi tạo direct-video engine và local CLIP index trước khi mở dashboard…", flush=True)
+    else:
+        print("Đang khởi tạo feature engine và OCR index trước khi mở dashboard…", flush=True)
     engine = dashboard.get_engine()
     engine.prepare_runtime()
-    dashboard.get_ocr_index()
+    ocr_index = dashboard.get_ocr_index()
+    if direct_video_enabled:
+        print(
+            "Direct-video mode: bỏ qua OCR index/features BTC; "
+            f"đã sẵn sàng {engine.vector_count:,} sampled frames.",
+            flush=True,
+        )
     print("Đang tải query analyzer nhẹ trước query đầu tiên…", flush=True)
     if dashboard.warmup_query_analyzer():
         analyzer = dashboard.get_query_analyzer()
@@ -361,6 +389,29 @@ def warmup_dashboard(reranker_enabled: bool) -> None:
 
 def main() -> None:
     arguments = parse_arguments()
+    direct_video_enabled = arguments.direct_video or os.environ.get("AIC_DIRECT_VIDEO", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if direct_video_enabled:
+        os.environ["AIC_DIRECT_VIDEO"] = "1"
+        if arguments.pre_ocr or arguments.build_ocr:
+            raise ValueError(
+                "--direct-video dùng raw video và local CLIP index; "
+                "không dùng đồng thời pre-OCR/build-ocr."
+            )
+        if arguments.import_ocr:
+            # The protected Kaggle notebook always passes --import-ocr. Keep
+            # that notebook reusable: raw-video mode must not mix the BTC OCR
+            # keyframe ids, so skip the import instead of forcing a notebook edit.
+            print("Direct-video: bỏ qua --import-ocr vì OCR BTC đang bị tắt.", flush=True)
+            arguments.import_ocr = None
+        if os.environ.get("AIC_BUILD_OCR", "0").lower() in {"1", "true", "yes", "on"}:
+            raise ValueError("AIC_BUILD_OCR không áp dụng cho --direct-video; hãy bỏ biến này.")
+    else:
+        os.environ["AIC_DIRECT_VIDEO"] = "0"
     if arguments.pre_ocr and arguments.import_ocr:
         raise ValueError("Không dùng đồng thời --pre-ocr và --import-ocr.")
     if arguments.pre_ocr and arguments.no_build_ocr:
@@ -387,7 +438,7 @@ def main() -> None:
     )
     # Accuracy-first default: a fresh Kaggle session pre-OCRs once. Subsequent
     # Run all executions reuse the compact text index and launch immediately.
-    build_ocr = forced_ocr or (not arguments.no_build_ocr and not index_ready)
+    build_ocr = not direct_video_enabled and (forced_ocr or (not arguments.no_build_ocr and not index_ready))
     if arguments.no_build_ocr and index_schema and not index_ready:
         print(
             "[warning] --no-build-ocr giữ index cũ; runtime chỉ có thể dùng ticker fallback, "
@@ -413,11 +464,12 @@ def main() -> None:
         build_ocr,
         reranker_enabled or qwen_vqa_enabled,
         enable_query_analyzer=not arguments.pre_ocr,
+        enable_direct_video=direct_video_enabled,
     )
 
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)
-    os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features else "1"
+    os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features or direct_video_enabled else "1"
     os.environ["AIC_RERANKER"] = "1" if reranker_enabled else "0"
     # Keep site-packages ahead of the app directory. The project has a
     # compatibility module named ``Code/datasets.py``; putting Code first
@@ -449,14 +501,23 @@ def main() -> None:
             print("Pre-OCR hoàn tất; index đã lưu, không khởi động dashboard.", flush=True)
             return
 
-    warmup_dashboard(reranker_enabled)
-    from data_paths import AICPaths
+    warmup_dashboard(reranker_enabled, direct_video_enabled)
+    import dashboard
     from share_dashboard import launch_dashboard
 
-    paths = AICPaths.from_environment()
-    print("CLIP features:", paths.features_dir, flush=True)
-    print("Keyframe roots:", len(paths.keyframe_roots), flush=True)
-    print("OCR index:", arguments.ocr_index if arguments.ocr_index.is_file() else "chưa build — CLIP-only", flush=True)
+    if direct_video_enabled:
+        engine = dashboard.get_engine()
+        print("Direct video root:", engine.dataset_root, flush=True)
+        print("Direct sampled vectors:", f"{engine.vector_count:,}", flush=True)
+        print("BTC features/mapping:", "tắt trong direct-video mode", flush=True)
+        print("OCR index:", "tắt trong direct-video mode", flush=True)
+    else:
+        from data_paths import AICPaths
+
+        paths = AICPaths.from_environment()
+        print("CLIP features:", paths.features_dir, flush=True)
+        print("Keyframe roots:", len(paths.keyframe_roots), flush=True)
+        print("OCR index:", arguments.ocr_index if arguments.ocr_index.is_file() else "chưa build — CLIP-only", flush=True)
     dashboard_url = launch_dashboard(share=True)
     print("Open dashboard:", dashboard_url or "không tạo được share URL", flush=True)
     print("Giữ cell này chạy để dashboard hoạt động. Dừng cell để tắt dashboard.", flush=True)
