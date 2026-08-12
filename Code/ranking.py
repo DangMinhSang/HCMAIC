@@ -24,6 +24,23 @@ def normalized_scores(values: Sequence[float], *, flat_value: float = 0.5) -> li
     return [(value - minimum) / spread for value in values]
 
 
+def fuse_multimodal_rerank_score(
+    joint: float,
+    visual: float,
+    support: float,
+    *,
+    explicit_ocr: bool,
+) -> float:
+    """Fuse joint/visual evidence without letting OCR-only slides win scenes."""
+    joint = max(0.0, min(1.0, float(joint)))
+    visual = max(0.0, min(1.0, float(visual)))
+    support = max(0.0, min(1.0, float(support)))
+    if explicit_ocr:
+        return 0.72 * joint + 0.28 * support
+    visual_context = 0.70 * visual + 0.30 * support
+    return 0.42 * joint + 0.58 * visual_context
+
+
 def select_multisource_candidates(
     visual_results: Sequence[Any],
     ocr_hits: Sequence[Any],

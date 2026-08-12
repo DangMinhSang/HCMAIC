@@ -20,17 +20,19 @@ from werkzeug.exceptions import HTTPException
 
 from data_paths import DatasetNotFoundError
 from multimodal_reranker import (
+    QA_PROMPT,
     MultimodalRerankerUnavailableError,
     QwenVLQueryReranker,
 )
 from ocr_index import OCRMemoryIndex
 from ocr_regions import OCR_INDEX_SCHEMA_VERSION
 from progress import track
-from qa import VQABaseline, split_qa_query
+from qa import VQABaseline, normalize_answer, question_kind, split_qa_query
 from query_language import normalize_query, parse_trake_events
-from query_router import QueryProfile, build_query_profile
+from query_router import QueryProfile, build_query_profile, has_explicit_ocr_intent
 from ranking import (
     fuse_adaptive_retrieval_scores,
+    fuse_multimodal_rerank_score,
     normalized_scores,
     select_diverse_results,
     select_multisource_candidates,
@@ -424,6 +426,7 @@ def make_kis_results(
     *,
     profile: QueryProfile | None = None,
     reranker: QwenVLQueryReranker | None = None,
+    rerank_prompt: str | None = None,
 ) -> tuple[list[StoredResult], str]:
     top_k, min_gap, maximum, video_id = search_options(body)
     if profile is None:
@@ -551,7 +554,14 @@ def make_kis_results(
             rerank_query = query
             if normalized.text_for_model.lower() != query.lower():
                 rerank_query = f"{query}\nEnglish translation: {normalized.text_for_model}"
-            rerank_scores = reranker.score(rerank_query, rerank_candidates)
+            if rerank_prompt is None:
+                rerank_scores = reranker.score(rerank_query, rerank_candidates)
+            else:
+                rerank_scores = reranker.score(
+                    rerank_query,
+                    rerank_candidates,
+                    prompt=rerank_prompt,
+                )
             for result, rerank_score in track(
                 zip(rerank_candidates, rerank_scores),
                 desc="Fuse Qwen scores",
@@ -567,7 +577,12 @@ def make_kis_results(
                     metadata=result.metadata_score,
                     object_score=result.object_score,
                 )
-                result.score = 0.80 * rerank_score.joint + 0.20 * adaptive_support
+                result.score = fuse_multimodal_rerank_score(
+                    rerank_score.joint,
+                    rerank_score.visual,
+                    adaptive_support,
+                    explicit_ocr=has_explicit_ocr_intent(query),
+                )
                 result.rerank_score = result.score
             # Candidates outside the reranker budget remain available as a
             # diversity fallback, but cannot outrank model-scored candidates.
@@ -615,12 +630,18 @@ def make_qa_results(
     reranker: QwenVLQueryReranker | None = None,
 ) -> tuple[list[StoredResult], str]:
     event, question = split_qa_query(query)
+    retrieval_query = event
+    if question.casefold() != event.casefold():
+        # The event finds the right moment broadly; the question adds the
+        # object/count/person cues needed to choose among nearby frames.
+        retrieval_query = f"{event}\nVisual question: {question}"
     stored, note = make_kis_results(
         engine,
-        event,
+        retrieval_query,
         body,
         profile=profile,
         reranker=reranker,
+        rerank_prompt=QA_PROMPT,
     )
     results = [item.result for item in stored]
     try:
@@ -646,7 +667,7 @@ def make_qa_results(
                 total=len(predictions),
                 unit="answer",
             ):
-                key = " ".join(prediction.answer.lower().split())
+                key = normalize_answer(prediction.answer, question_kind(question)).casefold()
                 answer_labels.setdefault(key, prediction.answer)
                 rank_weight = 1.0 / (1.0 + 0.10 * max(prediction.rank - 1, 0))
                 answer_scores[key] = answer_scores.get(key, 0.0) + prediction.confidence * rank_weight
@@ -976,7 +997,15 @@ def run_search_job(
     try:
         engine = get_engine()
         reranker = get_reranker()
-        profile_query = split_qa_query(query)[0] if task == "qa" else query
+        if task == "qa":
+            qa_event, qa_question = split_qa_query(query)
+            profile_query = (
+                qa_event
+                if qa_question.casefold() == qa_event.casefold()
+                else f"{qa_event}\nVisual question: {qa_question}"
+            )
+        else:
+            profile_query = query
         profile = build_query_profile(profile_query, reranker)
         with ENGINE_LOCK:
             if task == "kis":

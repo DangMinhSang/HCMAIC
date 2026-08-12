@@ -21,14 +21,28 @@ OVERLAY_RULE = (
     "Treat TV lower-thirds, scrolling news tickers, subtitles, channel logos, watermarks, "
     "and on-screen clocks as absent; they are not part of the depicted scene."
 )
-VISUAL_PROMPT = f"Retrieve video frames whose visual scene matches the user's query. {OVERLAY_RULE}"
+VISUAL_PROMPT = (
+    "Retrieve video frames whose visual scene and action match the user's query. Ignore words on "
+    "slides, documents, captions, or overlays unless the query explicitly asks for visible text. "
+    f"{OVERLAY_RULE}"
+)
 OCR_PROMPT = (
     "Retrieve frames whose text belongs to a physical sign, document, object, or screen in the scene. "
     f"{OVERLAY_RULE}"
 )
 JOINT_PROMPT = (
-    "Retrieve video frames that match the query in visual context and trusted scene text. "
+    "Retrieve the exact requested video moment using visual context and trusted scene text. "
+    "Do not reward a generic presentation slide, document, or screen that merely repeats query words "
+    "when the query describes a real-world scene or action. Prefer the physical sign, incident, people, "
+    "and surrounding context that make the request true. Only make exact text the primary evidence when "
+    "the query explicitly asks to read or find words. "
     f"Penalize generic or unrelated scenes. {OVERLAY_RULE}"
+)
+QA_PROMPT = (
+    "Retrieve the frame that best lets a visual question be answered. The requested event and the "
+    "question must both be visually supported; do not select a slide, caption, ticker, or poster merely "
+    "because it contains a matching word. Prioritize the actual people, objects, count, clothing, and "
+    f"spatial relationship in the scene. {OVERLAY_RULE}"
 )
 
 
@@ -97,7 +111,7 @@ class QwenVLQueryReranker:
                 f"Không tải được Qwen reranker `{self.model_name}`: {error}"
             ) from error
         self.device = device
-        self._score_cache: OrderedDict[tuple[str, str, str, str], float] = OrderedDict()
+        self._score_cache: OrderedDict[tuple[str, str, str, str, str], float] = OrderedDict()
         try:
             self._cache_size = max(0, min(int(os.environ.get("AIC_RERANKER_CACHE", "512")), 4096))
         except ValueError:
@@ -171,12 +185,18 @@ class QwenVLQueryReranker:
         ]
 
     @staticmethod
-    def _cache_key(query: str, result: Any, prompt: str) -> tuple[str, str, str, str]:
+    def _cache_key(
+        query: str,
+        result: Any,
+        prompt: str,
+        visual_only: bool = False,
+    ) -> tuple[str, str, str, str, str]:
         return (
             query,
             str(getattr(result, "image_path", "") or ""),
             str(getattr(result, "ocr_text", "") or "").strip(),
             prompt,
+            "visual-only" if visual_only else "joint",
         )
 
     def score_pairs(
@@ -185,6 +205,7 @@ class QwenVLQueryReranker:
         results: Sequence[Any],
         *,
         prompt: str = JOINT_PROMPT,
+        visual_only: bool = False,
     ) -> list[float]:
         """Score aligned query/result pairs with one batched model call."""
         if len(queries) != len(results):
@@ -199,13 +220,16 @@ class QwenVLQueryReranker:
             total=len(results),
             unit="pair",
         ):
-            key = self._cache_key(query, result, prompt)
+            key = self._cache_key(query, result, prompt, visual_only)
             cached = self._score_cache.get(key)
             if cached is not None:
                 self._score_cache.move_to_end(key)
                 output[index] = cached
                 continue
-            document = self._joint_document(result) or {"text": "No image or OCR evidence available."}
+            if visual_only:
+                document = self._image_document(result) or {"text": "No image evidence available."}
+            else:
+                document = self._joint_document(result) or {"text": "No image or OCR evidence available."}
             missing_pairs.append((query, document))
             missing_positions.append(index)
             missing_keys.append(key)
@@ -270,40 +294,34 @@ class QwenVLQueryReranker:
         ]
         return self.score_pairs([query] * len(adapted), adapted, prompt=prompt)
 
-    def score(self, query: str, results: Sequence[Any]) -> list[RerankScore]:
+    def score(
+        self,
+        query: str,
+        results: Sequence[Any],
+        *,
+        prompt: str = JOINT_PROMPT,
+    ) -> list[RerankScore]:
         """Return visual/OCR/joint probabilities for each result.
 
-        Use one multimodal pass per candidate.  Three independent Qwen passes
-        (image, OCR, and joint) made a synchronous Gradio request exceed the
-        gateway timeout.  The joint score is the model score; visual/OCR are
-        calibrated first-stage signals retained as cheap supporting evidence.
+        Use batched joint and visual-only passes per candidate. A joint score
+        alone can over-rank a slide that repeats the query, so the visual-only
+        pass is retained as a real context signal rather than a cheap CLIP
+        approximation. Pair scores are cached independently.
         """
-        joint_scores = self.score_pairs([query] * len(results), results)
+        joint_scores = self.score_pairs([query] * len(results), results, prompt=prompt)
+        visual_model_scores = self.score_pairs(
+            [query] * len(results),
+            results,
+            prompt=VISUAL_PROMPT,
+            visual_only=True,
+        )
 
         def bounded(value: Any) -> float:
             return max(0.0, min(1.0, float(value or 0.0)))
 
-        raw_visual = [
-            float(getattr(result, "visual_score", 0.0) or 0.0)
-            for result in track(
-                results,
-                desc="Chuẩn hóa visual scores",
-                total=len(results),
-                unit="frame",
-            )
-        ]
-        if raw_visual:
-            minimum, maximum = min(raw_visual), max(raw_visual)
-            spread = maximum - minimum
-            visual_scores = [0.5] * len(raw_visual) if spread < 1e-9 else [
-                (value - minimum) / spread for value in raw_visual
-            ]
-        else:
-            visual_scores = []
-
         return [
             RerankScore(
-                visual=bounded(visual_scores[index]),
+                visual=bounded(visual_model_scores[index]),
                 ocr=bounded(getattr(result, "ocr_score", 0.0)),
                 joint=joint_scores[index],
             )

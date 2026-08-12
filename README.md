@@ -28,7 +28,7 @@ Hot path của KIS/Q&A:
 2. CLIP ViT-B/32 recall toàn corpus bằng một matrix multiplication; OCR BM25 và metadata BM25 bổ sung candidate mà CLIP có thể bỏ sót.
 3. Tỷ trọng query điều khiển score fusion và quota candidate của từng nguồn.
 4. Pool Qwen được khử trùng mềm theo video/thời gian để không lãng phí 32 slot vào các frame gần giống nhau.
-5. `Qwen/Qwen3-VL-Reranker-2B` chấm query + ảnh đã làm mờ lower-third trong RAM + scene OCR. Qwen joint chiếm 80% điểm cuối; 20% còn lại dùng đúng tỷ trọng bằng chứng do query router chọn.
+5. `Qwen/Qwen3-VL-Reranker-2B` chấm hai góc nhìn theo batch: joint (ảnh + scene OCR) và visual-only trên ảnh đã làm mờ lower-third trong RAM. Với query mô tả cảnh, visual-only giúp hạ slide/tài liệu chỉ khớp chữ; query yêu cầu đọc chữ vẫn giữ OCR-first.
 6. Kết quả cuối mới áp frame gap, giới hạn mỗi video và Top-K.
 
 TRAKE dùng một phép nhân ma trận cho tất cả event, Viterbi để bắt buộc semantic frame tăng theo thời gian, Qwen center-rerank theo đúng vị trí của từng event để chọn video, rồi soi lân cận quanh các chuỗi tốt nhất và dynamic-align lại. Event “tiếp đất” được soi rộng hơn một keyframe để tìm lần tiếp xúc đầu tiên sau trạng thái trên không. Q&A dùng `Qwen/Qwen3-VL-2B-Instruct` để trả lời ngắn trên các frame đã được chọn theo cả sự kiện và câu hỏi; nếu T4 không đủ VRAM hoặc model lỗi, nó tự giải phóng model và chuyển sang ViLT.
@@ -118,7 +118,7 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_TRAKE_REFINE_RADIUS` | `2` | Bán kính keyframe refinement; event tiếp đất tự rộng thêm 1, tối đa 5 |
 | `AIC_TRAKE_REFINE_SEQUENCES` | `3` | Số chuỗi được refinement |
 | `AIC_VQA_BACKEND` | `qwen` | Dùng `vilt` nếu cần nhẹ VRAM |
-| `AIC_VQA_CANDIDATES` | `6` | Số frame Qwen VQA trả lời, tối đa 12 |
+| `AIC_VQA_CANDIDATES` | `8` | Số frame Qwen VQA trả lời, tối đa 12 |
 | `AIC_PRELOAD_VQA` | `1` | Nạp/warmup VQA trước khi mở web |
 | `AIC_SEARCH_WORKERS` | `1` | Số GPU job đồng thời; giữ 1 trên T4 |
 | `AIC_SEARCH_QUEUE_LIMIT` | `8` | Chặn public queue tăng vô hạn |

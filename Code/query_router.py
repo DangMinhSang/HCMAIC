@@ -39,11 +39,14 @@ ROUTING_PROMPT = (
     "Score each source independently; the application will normalize the scores into percentages."
 )
 
-OCR_CUES = (
+EXPLICIT_OCR_CUES = (
     "noi dung", "dong chu", "chu viet", "ghi gi", "viet gi", "doc chu", "van ban",
     "bien bao", "bang hieu", "phu de", "tieu de tren", "tai lieu", "logo", "nhan hieu",
     "bien so", "man hinh hien", "text", "written", "word", "words", "says", "sign",
-    "banner", "subtitle", "caption", "document", "license plate", "warning",
+    "banner", "subtitle", "caption", "document", "license plate",
+)
+AMBIGUOUS_WARNING_CUES = (
+    "canh bao", "nguy hiem", "sat lo", "lu quet", "warning", "dangerous", "landslide",
 )
 METADATA_CUES = (
     "ten video", "tieu de video", "ten chuong trinh", "chuong trinh nao", "kenh nao",
@@ -68,6 +71,24 @@ def normalize_text(value: str) -> str:
     return " ".join(plain.replace("đ", "d").split())
 
 
+def has_explicit_ocr_intent(query: str) -> bool:
+    """Whether the user explicitly asks for visible text evidence."""
+    text = normalize_text(query)
+    if any(cue in text for cue in EXPLICIT_OCR_CUES):
+        return True
+    if re.search(r"[\"“”'][^\"“”']{3,}[\"“”']", query):
+        return True
+    return bool(re.search(r"\b[A-ZÀ-ỸĐ][A-ZÀ-ỸĐ\s]{5,}\b", query))
+
+
+def is_ambiguous_warning_query(query: str) -> bool:
+    text = normalize_text(query)
+    return (
+        not has_explicit_ocr_intent(query)
+        and sum(1 for cue in AMBIGUOUS_WARNING_CUES if cue in text) >= 1
+    )
+
+
 def normalize_distribution(values: Mapping[str, float], *, floor: float = 0.02) -> dict[str, float]:
     bounded = {name: max(floor, float(values.get(name, 0.0))) for name in MODALITIES}
     total = sum(bounded.values()) or 1.0
@@ -90,11 +111,16 @@ def lexical_distribution(query: str) -> dict[str, float]:
     def cue_count(cues: Sequence[str]) -> int:
         return sum(1 for cue in cues if cue in text)
 
-    ocr_matches = cue_count(OCR_CUES)
+    ocr_matches = cue_count(EXPLICIT_OCR_CUES)
+    warning_matches = cue_count(AMBIGUOUS_WARNING_CUES)
     metadata_matches = cue_count(METADATA_CUES)
     object_matches = cue_count(OBJECT_CUES)
     visual_matches = cue_count(VISUAL_CUES)
     strengths["ocr"] += min(3.2, 1.35 * ocr_matches)
+    # Warning language helps OCR recall, but does not mean the user wants a
+    # presentation slide containing those words instead of the real scene.
+    strengths["ocr"] += min(0.55, 0.18 * warning_matches)
+    strengths["visual"] += min(1.10, 0.32 * warning_matches)
     strengths["metadata"] += min(2.4, 1.20 * metadata_matches)
     strengths["object"] += min(2.6, 1.15 * object_matches)
     strengths["visual"] += min(2.0, 0.55 * visual_matches)
@@ -180,5 +206,12 @@ def build_query_profile(query: str, reranker: Any | None = None) -> QueryProfile
     else:
         combined = lexical
         source = "lexical fallback"
+    if is_ambiguous_warning_query(query):
+        # A text-only router can over-read "warning" as an exact OCR request.
+        # Keep OCR candidates in recall, but return the excess route mass to
+        # visual context unless the query explicitly asks for words.
+        excess = max(0.0, combined["ocr"] - 0.28)
+        combined["ocr"] -= excess
+        combined["visual"] += excess
     weights = normalize_distribution(combined)
     return QueryProfile(source=source, **weights)

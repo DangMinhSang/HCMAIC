@@ -6,16 +6,38 @@ import gc
 import math
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from ocr_regions import prepare_reranker_image
 from progress import track
 from query_language import normalize_query
 from retrieval import SearchResult
 
 
 QUESTION_RE = re.compile(r"(?:câu\s*hỏi|question)\s*[:\-]\s*(.+)$", flags=re.IGNORECASE | re.DOTALL)
+COUNT_RE = re.compile(
+    r"\b(?:bao\s*nhiêu|bao\s*nhieu|how\s*many|number\s+of|count|"
+    r"số\s*lượng|so\s*luong|dem\s*so)\b",
+    re.IGNORECASE,
+)
+HOLDING_RE = re.compile(
+    r"\b(?:cầm|cam|holding|hold|carrying|carry|nắm|nam)\b|\bwhat\s+is\s+.+\s+holding\b",
+    re.IGNORECASE,
+)
+APPEARANCE_RE = re.compile(
+    r"\b(?:màu|mau|color|colour|mặc|mac|wearing|áo|ao)\b",
+    re.IGNORECASE,
+)
+NUMBER_WORDS = {
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "khong": "0", "mot": "1", "hai": "2", "ba": "3",
+    "bon": "4", "tu": "4", "nam": "5", "sau": "6", "bay": "7",
+    "tam": "8", "chin": "9", "muoi": "10",
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +68,68 @@ def split_qa_query(value: str) -> tuple[str, str]:
     if not event or not question:
         raise ValueError("Q&A cần cả mô tả sự kiện và câu hỏi.")
     return event, question
+
+
+def question_kind(question: str) -> str:
+    """Classify the small set of question forms needing stricter grounding."""
+    if COUNT_RE.search(question):
+        return "count"
+    if HOLDING_RE.search(question):
+        return "holding"
+    if APPEARANCE_RE.search(question):
+        return "appearance"
+    return "general"
+
+
+def _question_prompt(question: str, kind: str) -> str:
+    instruction = (
+        "Inspect the entire visible scene and answer only from visual evidence. Ignore TV lower-thirds, "
+        "scrolling tickers, subtitles, logos, clocks, and words on presentation slides. Do not infer from "
+        "the event description or common sense. Return only the shortest direct answer. "
+    )
+    if kind == "count":
+        instruction += (
+            "This is a counting question: count distinct, clearly visible instances of the requested "
+            "subject in the scene, not people or objects printed on a screen, poster, or photograph. "
+            "Return one Arabic integer only; if the subject cannot be seen clearly, return 0. "
+        )
+    elif kind == "holding":
+        instruction += (
+            "This asks what a person is holding: first locate the person using the clothing/color clue, "
+            "then inspect the hands. Return only the object name; if no object is visibly held, return "
+            "'nothing' or 'unclear', never an inferred activity. "
+        )
+    elif kind == "appearance":
+        instruction += "Answer the requested visible color or clothing attribute, not a background object. "
+    return instruction + f"Question: {question}"
+
+
+def normalize_answer(answer: str, kind: str = "general") -> str:
+    cleaned = re.sub(r"^(?:answer|đáp\s*án)\s*[:\-]\s*", "", answer, flags=re.IGNORECASE).strip()
+    if kind == "count":
+        match = re.search(r"\b\d+\b", cleaned)
+        if match:
+            return match.group(0)
+        words = re.findall(r"[\wÀ-ỹĐđ]+", cleaned.lower())
+        for word in words:
+            normalized = "".join(
+                character
+                for character in unicodedata.normalize("NFD", word)
+                if unicodedata.category(character) != "Mn"
+            )
+            normalized = normalized.replace("đ", "d")
+            if normalized in NUMBER_WORDS:
+                return NUMBER_WORDS[normalized]
+    if kind == "holding":
+        cleaned = re.sub(
+            r"^(?:the\s+)?(?:red[- ]shirt(?:ed)?\s+)?(?:person|man|woman)\s+"
+            r"(?:is\s+)?(?:holding|carrying)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" .,:;")
+        cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned or "unknown"
 
 
 class VQABaseline:
@@ -138,7 +222,7 @@ class VQABaseline:
         self._load()
         if image_path and Path(image_path).is_file():
             try:
-                self._predict_one("What is visible in this image?", Path(image_path))
+                self._predict_one("What is visible in this image?", Path(image_path), "general")
             except Exception as error:
                 if not self.backend_name.startswith("Qwen"):
                     raise
@@ -146,7 +230,7 @@ class VQABaseline:
                 self.requested_backend = "vilt"
                 self._release_model()
                 self._load_vilt()
-                self._predict_one("What is visible in this image?", Path(image_path))
+                self._predict_one("What is visible in this image?", Path(image_path), "general")
 
     def predict(
         self,
@@ -157,10 +241,11 @@ class VQABaseline:
         self._load()
         if limit is None:
             try:
-                limit = max(1, min(int(os.environ.get("AIC_VQA_CANDIDATES", "6")), 12))
+                limit = max(1, min(int(os.environ.get("AIC_VQA_CANDIDATES", "8")), 12))
             except ValueError:
-                limit = 6
+                limit = 8
         normalized = normalize_query(question)
+        kind = question_kind(normalized.text_for_model)
         source_results = results[:limit]
         candidates = [
             result
@@ -185,7 +270,7 @@ class VQABaseline:
                 predictions.append(
                     QAPrediction(
                         result.rank,
-                        *self._predict_one(normalized.text_for_model, Path(result.image_path)),
+                        *self._predict_one(normalized.text_for_model, Path(result.image_path), kind),
                     )
                 )
             return predictions
@@ -207,28 +292,29 @@ class VQABaseline:
                     predictions.append(
                         QAPrediction(
                             result.rank,
-                            *self._predict_one(normalized.text_for_model, Path(result.image_path)),
+                            *self._predict_one(normalized.text_for_model, Path(result.image_path), kind),
                         )
                     )
                 return predictions
             raise
 
-    def _predict_one(self, question: str, image_path: Path) -> tuple[str, float]:
+    def _predict_one(self, question: str, image_path: Path, kind: str = "general") -> tuple[str, float]:
         if self.backend_name.startswith("Qwen"):
-            return self._predict_qwen(question, image_path)
+            return self._predict_qwen(question, image_path, kind)
         return self._predict_vilt(question, image_path)
 
-    def _predict_qwen(self, question: str, image_path: Path) -> tuple[str, float]:
+    def _predict_qwen(self, question: str, image_path: Path, kind: str = "general") -> tuple[str, float]:
         try:
             from PIL import Image  # type: ignore
         except ImportError as error:
             raise RuntimeError("Thiếu Pillow cho Q&A.") from error
-        with Image.open(image_path) as source:
-            image = source.convert("RGB").copy()
-        prompt = (
-            "Answer the visual question using only the image. Return only the shortest direct answer, "
-            f"without explanation. Question: {question}"
-        )
+        prepared = prepare_reranker_image(image_path)
+        if isinstance(prepared, (str, Path)):
+            with Image.open(prepared) as source:
+                image = source.convert("RGB").copy()
+        else:
+            image = prepared
+        prompt = _question_prompt(question, kind)
         messages = [
             {
                 "role": "user",
@@ -263,7 +349,7 @@ class VQABaseline:
         answer = self._processor.batch_decode(
             [token_ids], skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
-        answer = re.sub(r"^(?:answer|đáp\s*án)\s*[:\-]\s*", "", answer, flags=re.IGNORECASE).strip()
+        answer = normalize_answer(answer, kind)
         probabilities: list[float] = []
         for logits, token_id in track(
             zip(generated.scores, token_ids),
@@ -275,15 +361,27 @@ class VQABaseline:
             probability = logits[0].float().softmax(dim=-1)[int(token_id)]
             probabilities.append(max(1e-8, float(probability)))
         confidence = math.exp(sum(math.log(value) for value in probabilities) / len(probabilities)) if probabilities else 0.0
-        return answer or "unknown", confidence
+        close = getattr(image, "close", None)
+        if callable(close):
+            close()
+        return answer, confidence
 
     def _predict_vilt(self, question: str, image_path: Path) -> tuple[str, float]:
         try:
             from PIL import Image  # type: ignore
         except ImportError as error:
             raise RuntimeError("Thiếu Pillow cho Q&A.") from error
-        with Image.open(image_path) as image:
-            inputs = self._processor(images=image.convert("RGB"), text=question, return_tensors="pt")
+        prepared = prepare_reranker_image(image_path)
+        if isinstance(prepared, (str, Path)):
+            with Image.open(prepared) as image:
+                inputs = self._processor(images=image.convert("RGB"), text=question, return_tensors="pt")
+        else:
+            try:
+                inputs = self._processor(images=prepared, text=question, return_tensors="pt")
+            finally:
+                close = getattr(prepared, "close", None)
+                if callable(close):
+                    close()
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         with self._torch.inference_mode():
             logits = self._model(**inputs).logits[0]

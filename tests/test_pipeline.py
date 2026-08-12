@@ -34,14 +34,50 @@ from ocr_regions import (
     legacy_text_quality,
     prepare_reranker_image,
 )
-from qa import VQABaseline
+from qa import VQABaseline, normalize_answer, question_kind
 from query_language import parse_trake_events
-from query_router import QueryProfile, build_query_profile
-from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
+from query_router import (
+    QueryProfile,
+    build_query_profile,
+    has_explicit_ocr_intent,
+    is_ambiguous_warning_query,
+)
+from ranking import (
+    fuse_adaptive_retrieval_scores,
+    fuse_multimodal_rerank_score,
+    select_diverse_results,
+    select_multisource_candidates,
+)
 from retrieval import AICRetrievalEngine, VideoMetadata
 
 
 class PipelineTests(unittest.TestCase):
+    def test_warning_phrase_prefers_visual_context_without_disabling_ocr_recall(self) -> None:
+        self.assertTrue(is_ambiguous_warning_query("Cảnh báo sạt lở nguy hiểm"))
+        self.assertFalse(has_explicit_ocr_intent("Cảnh báo sạt lở nguy hiểm"))
+        profile = build_query_profile("Cảnh báo sạt lở nguy hiểm")
+        self.assertGreater(profile.visual, profile.ocr)
+
+        explicit = build_query_profile("Biển báo có chữ CẢNH BÁO SẠT LỞ")
+        self.assertGreater(explicit.ocr, explicit.visual)
+
+    def test_vqa_prompt_normalizes_count_and_holding_answers(self) -> None:
+        self.assertEqual(question_kind("Có bao nhiêu người trong ảnh?"), "count")
+        self.assertEqual(normalize_answer("There are two people.", "count"), "2")
+        self.assertEqual(
+            normalize_answer("The red-shirted person is holding a microphone.", "holding"),
+            "microphone",
+        )
+
+    def test_visual_context_beats_ocr_only_slide_for_scene_query(self) -> None:
+        slide = fuse_multimodal_rerank_score(0.96, 0.20, 0.45, explicit_ocr=False)
+        physical_scene = fuse_multimodal_rerank_score(0.86, 0.84, 0.62, explicit_ocr=False)
+        self.assertGreater(physical_scene, slide)
+        self.assertGreater(
+            fuse_multimodal_rerank_score(0.90, 0.30, 0.70, explicit_ocr=True),
+            fuse_multimodal_rerank_score(0.80, 0.85, 0.25, explicit_ocr=True),
+        )
+
     def test_trake_parser_ignores_demo_introduction_and_keeps_four_events(self) -> None:
         prompt = """Hãy tìm video ghi lại một chuỗi hành động.
 Video cần chứa đầy đủ các sự kiện sau theo đúng thứ tự:
@@ -357,6 +393,20 @@ Sự kiện 4 — Tiếp đất: Bắt đầu tiếp xúc trở lại với mặ
         self.assertEqual(model.score_documents("route", ["OCR evidence", "visual evidence"]), [0.9, 0.9])
         self.assertEqual(model.score_documents("route", ["OCR evidence", "visual evidence"]), [0.9, 0.9])
         self.assertEqual(calls, [1, 2])
+
+    def test_qwen_frame_score_runs_joint_and_visual_only_passes(self) -> None:
+        model = QwenVLQueryReranker.__new__(QwenVLQueryReranker)
+        calls: list[bool] = []
+
+        def fake_score_pairs(_queries, _results, *, prompt, visual_only=False):
+            calls.append(visual_only)
+            return [0.8]
+
+        model.score_pairs = fake_score_pairs
+        result = SimpleNamespace(visual_score=0.2, ocr_score=0.9)
+        scores = model.score("scene", [result])
+        self.assertEqual(calls, [False, True])
+        self.assertEqual(scores[0].visual, 0.8)
 
 
 if __name__ == "__main__":
