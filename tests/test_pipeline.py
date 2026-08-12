@@ -34,6 +34,7 @@ from ocr_regions import (
     legacy_text_quality,
     prepare_reranker_image,
 )
+from query_analyzer import LightweightQueryAnalyzer, split_query_clauses
 from qa import VQABaseline, normalize_answer, question_kind
 from query_language import parse_trake_events
 from query_router import (
@@ -52,6 +53,36 @@ from retrieval import AICRetrievalEngine, VideoMetadata
 
 
 class PipelineTests(unittest.TestCase):
+    def test_query_analyzer_splits_visual_and_ocr_clauses(self) -> None:
+        analyzer = LightweightQueryAnalyzer(model_name="offline-test-model")
+        analysis = analyzer.analyze(
+            "Biển cảnh báo màu vàng có nội dung là cảnh báo sạt lở nguy hiểm"
+        )
+        self.assertEqual(
+            [clause.text for clause in analysis.clauses],
+            ["Biển cảnh báo màu vàng", "cảnh báo sạt lở nguy hiểm"],
+        )
+        self.assertEqual(analysis.clauses[0].dominant, "visual")
+        self.assertEqual(analysis.clauses[1].dominant, "ocr")
+        self.assertEqual(analysis.query_for("visual"), "Biển cảnh báo màu vàng")
+        self.assertEqual(analysis.query_for("ocr"), "cảnh báo sạt lở nguy hiểm")
+        self.assertGreater(analysis.weights["visual"], 0.25)
+        self.assertGreater(analysis.weights["ocr"], 0.25)
+        self.assertAlmostEqual(sum(analysis.weights.values()), 1.0)
+
+    def test_query_analyzer_keeps_plain_query_usable_without_model(self) -> None:
+        seeds = split_query_clauses("Một vận động viên nhảy lên trong sân thi đấu")
+        self.assertEqual(len(seeds), 1)
+        analysis = LightweightQueryAnalyzer(model_name="offline-test-model").analyze(seeds[0].text)
+        self.assertTrue(analysis.query_for("visual"))
+
+    def test_short_warning_query_keeps_secondary_ocr_recall(self) -> None:
+        analysis = LightweightQueryAnalyzer(model_name="offline-test-model").analyze(
+            "Cảnh báo sạt lở nguy hiểm"
+        )
+        self.assertTrue(analysis.query_for("visual"))
+        self.assertEqual(analysis.query_for("ocr"), "Cảnh báo sạt lở nguy hiểm")
+
     def test_warning_phrase_prefers_visual_context_without_disabling_ocr_recall(self) -> None:
         self.assertTrue(is_ambiguous_warning_query("Cảnh báo sạt lở nguy hiểm"))
         self.assertFalse(has_explicit_ocr_intent("Cảnh báo sạt lở nguy hiểm"))
@@ -344,13 +375,8 @@ Sự kiện 4 — Tiếp đất: Bắt đầu tiếp xúc trở lại với mặ
         self.assertGreater(scores["specific"], scores["generic"])
 
     def test_qwen_query_router_returns_normalized_ocr_priority(self) -> None:
-        class FakeReranker:
-            def score_documents(self, _query, _documents, *, prompt):
-                self.prompt = prompt
-                return [0.15, 0.96, 0.10, 0.25]
-
-        profile = build_query_profile("Biển có nội dung cảnh báo sạt lở", FakeReranker())
-        self.assertEqual(profile.source, "Qwen+lexical")
+        profile = build_query_profile("Biển có nội dung cảnh báo sạt lở")
+        self.assertIn("structure", profile.source)
         self.assertGreater(profile.ocr, max(profile.visual, profile.metadata, profile.object))
         self.assertAlmostEqual(sum(profile.values().values()), 1.0)
 

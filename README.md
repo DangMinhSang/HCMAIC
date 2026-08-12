@@ -15,18 +15,18 @@ Mỗi query được phép tối đa 100 đáp án. Final score là trung bình 
 Trước khi mở dashboard, launcher làm trước toàn bộ phần không phụ thuộc query:
 
 1. Fast-forward source và tự restart process nếu `run.py` vừa thay đổi.
-2. Cài/probe đúng stack Qwen với `transformers>=5,<6`, `sentence-transformers>=5.4` và `qwen-vl-utils`.
+2. Cài/probe query analyzer MiniLM nhẹ và stack Qwen với `transformers>=5,<6`, `sentence-transformers>=5.4` và `qwen-vl-utils`.
 3. Import hoặc tạo OCR index v2 một lần bằng PaddleOCR GPU; tọa độ box loại lower-third, subtitle, ticker, logo và đồng hồ TV khỏi scene-text.
 4. Nạp và chuẩn hóa toàn bộ CLIP feature vào RAM; cache mapping frame, thư mục keyframe/video và metadata.
 5. Precompute BM25/IDF cho 164 nghìn OCR record và toàn bộ metadata video.
-6. Nạp CLIP, Qwen3-VL-Reranker và Qwen3-VL VQA; chạy warmup bằng keyframe thật.
+6. Nạp CLIP, query analyzer MiniLM, Qwen3-VL-Reranker và Qwen3-VL VQA; chạy warmup bằng keyframe thật.
 7. Chỉ sau đó mới mở Gradio share URL.
 
 Hot path của KIS/Q&A:
 
-1. Qwen đọc query ở chế độ text-only và trả tỷ trọng **Hình ảnh / OCR / Metadata / Object**; lexical Việt–Anh là lớp hiệu chỉnh/fallback.
-2. CLIP ViT-B/32 recall toàn corpus bằng một matrix multiplication; OCR BM25 và metadata BM25 bổ sung candidate mà CLIP có thể bỏ sót.
-3. Tỷ trọng query điều khiển score fusion và quota candidate của từng nguồn.
+1. Query analyzer nhẹ `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` tách query thành các cụm có vai trò, rồi trả tỷ trọng **Hình ảnh / OCR / Metadata / Object**. Ví dụ `Biển cảnh báo màu vàng có nội dung là cảnh báo sạt lở nguy hiểm` được tách thành cụm visual dùng CLIP và cụm OCR dùng BM25 OCR; lexical/structural là fallback nếu checkpoint chưa tải được.
+2. CLIP ViT-B/32 recall từng cụm visual/object/metadata cần thiết; OCR BM25 chỉ nhận cụm được analyzer gán cho OCR; metadata BM25 và object labels bổ sung candidate mà một nguồn có thể bỏ sót.
+3. Tỷ trọng query điều khiển score fusion và quota candidate của từng nguồn. Qwen không còn bị dùng để phân tích 4 modality ở mỗi query; Qwen chỉ rerank pool ảnh nhỏ.
 4. Pool Qwen được khử trùng mềm theo video/thời gian để không lãng phí 32 slot vào các frame gần giống nhau.
 5. `Qwen/Qwen3-VL-Reranker-2B` chấm hai góc nhìn theo batch: joint (ảnh + scene OCR) và visual-only trên ảnh đã làm mờ lower-third trong RAM. Với query mô tả cảnh, visual-only giúp hạ slide/tài liệu chỉ khớp chữ; query yêu cầu đọc chữ vẫn giữ OCR-first.
 6. Kết quả cuối mới áp frame gap, giới hạn mỗi video và Top-K.
@@ -61,6 +61,7 @@ Một startup thành công cần có các dòng tương tự:
 
 ```text
 Qwen reranker đã sẵn sàng (transformers 5.x ...).
+Query analyzer đã sẵn sàng (paraphrase-multilingual-MiniLM-L12-v2, device=cpu).
 PyTorch ...; CUDA available=True; GPU=Tesla T4
 Qwen reranker đã warmup bằng một keyframe thật.
 VQA đã warmup bằng keyframe thật: Qwen3-VL-2B-Instruct.
@@ -114,6 +115,9 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_RERANKER_CANDIDATES` | `32` | Số ảnh KIS/Q&A Qwen chấm; tăng tối đa 100 |
 | `AIC_RERANKER_BATCH_SIZE` | `2` | Batch T4; OOM tự retry bằng 1 |
 | `AIC_RERANKER_CACHE` | `512` | LRU cache cặp query/frame |
+| `AIC_QUERY_ANALYZER_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Model nhẹ tách cụm và phân loại 4 nguồn |
+| `AIC_QUERY_ANALYZER_DEVICE` | `cpu` | Thiết bị cho analyzer; giữ CPU để không tranh VRAM với Qwen |
+| `AIC_QUERY_ANALYZER_CACHE` | `512` | LRU cache kết quả phân tích query |
 | `AIC_TRAKE_RERANK_PAIRS` | `32` | Ngân sách center event–frame |
 | `AIC_TRAKE_REFINE_RADIUS` | `2` | Bán kính keyframe refinement; event tiếp đất tự rộng thêm 1, tối đa 5 |
 | `AIC_TRAKE_REFINE_SEQUENCES` | `3` | Số chuỗi được refinement |

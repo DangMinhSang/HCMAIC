@@ -12,7 +12,7 @@ from typing import Any
 import dashboard
 from progress import track
 from qa import split_qa_query
-from query_router import build_query_profile
+from query_router import build_query_analysis, build_query_profile
 
 
 DEFAULT_QUERIES = {
@@ -61,6 +61,7 @@ def main() -> None:
     engine = dashboard.get_engine()
     engine.prepare_runtime()
     ocr_index = dashboard.get_ocr_index()
+    dashboard.warmup_query_analyzer()
     if not arguments.skip_model_warmup:
         dashboard.warmup_reranker()
         if arguments.task == "qa":
@@ -77,7 +78,14 @@ def main() -> None:
         )
     else:
         profile_query = query
-    profile = build_query_profile(profile_query, reranker)
+    analyzer = dashboard.get_query_analyzer()
+    analysis = build_query_analysis(profile_query, analyzer)
+    profile = build_query_profile(
+        profile_query,
+        reranker,
+        analyzer=analyzer,
+        analysis=analysis,
+    )
     runs: list[dict[str, Any]] = []
     run_indices = range(1, repeat + 1)
     for run_index in track(
@@ -92,11 +100,11 @@ def main() -> None:
         with dashboard.ENGINE_LOCK:
             if arguments.task == "kis":
                 stored, notice = dashboard.make_kis_results(
-                    engine, query, body, profile=profile, reranker=reranker
+                    engine, query, body, profile=profile, reranker=reranker, analysis=analysis
                 )
             elif arguments.task == "qa":
                 stored, notice = dashboard.make_qa_results(
-                    engine, query, body, profile=profile, reranker=reranker
+                    engine, query, body, profile=profile, reranker=reranker, analysis=analysis
                 )
             else:
                 stored, _sequences, notice = dashboard.make_trake_results(

@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -15,6 +16,8 @@ if str(CODE) not in sys.path:
 import dashboard
 from dashboard import SearchSession, StoredResult
 from retrieval import SearchResult, TrakeVideoResult
+from query_analyzer import LightweightQueryAnalyzer
+from query_router import build_query_analysis, build_query_profile
 
 
 def make_result(video_id: str, frame_id: int, *, video_path: str | None = None) -> SearchResult:
@@ -145,6 +148,45 @@ class DashboardTests(unittest.TestCase):
             1.0,
             places=3,
         )
+
+    def test_kis_uses_source_specific_visual_and_ocr_phrases(self) -> None:
+        query = "Biển cảnh báo màu vàng có nội dung là cảnh báo sạt lở nguy hiểm"
+        analyzer = LightweightQueryAnalyzer(model_name="offline-test-model")
+        analysis = build_query_analysis(query, analyzer)
+        profile = build_query_profile(query, analyzer=analyzer, analysis=analysis)
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+                self.encoder = SimpleNamespace(last_query=None)
+
+            def search(self, source_query: str, **_kwargs):
+                self.queries.append(source_query)
+                return [make_result(f"L{len(self.queries):02d}_V001", len(self.queries) * 100)]
+
+        fake_engine = FakeEngine()
+        ocr_queries: list[str] = []
+
+        def fake_ocr_search(source_query: str, **_kwargs):
+            ocr_queries.append(source_query)
+            return []
+
+        fake_ocr = SimpleNamespace(
+            schema_version=2,
+            legacy_record_count=0,
+            search=fake_ocr_search,
+        )
+        with patch.object(dashboard, "get_ocr_index", return_value=fake_ocr):
+            _stored, _note = dashboard.make_kis_results(
+                fake_engine,
+                query,
+                {"options": {"top_k": 5, "dedupe": 0, "max_per_video": 0}},
+                profile=profile,
+                analysis=analysis,
+                reranker=None,
+            )
+        self.assertEqual(fake_engine.queries, ["Biển cảnh báo màu vàng"])
+        self.assertEqual(ocr_queries, ["cảnh báo sạt lở nguy hiểm"])
 
     def test_video_route_supports_browser_byte_ranges(self) -> None:
         with tempfile.NamedTemporaryFile(suffix=".mp4") as video:

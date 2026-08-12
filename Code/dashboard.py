@@ -28,8 +28,14 @@ from ocr_index import OCRMemoryIndex
 from ocr_regions import OCR_INDEX_SCHEMA_VERSION
 from progress import track
 from qa import VQABaseline, normalize_answer, question_kind, split_qa_query
+from query_analyzer import LightweightQueryAnalyzer, QueryAnalysis
 from query_language import normalize_query, parse_trake_events
-from query_router import QueryProfile, build_query_profile, has_explicit_ocr_intent
+from query_router import (
+    QueryProfile,
+    build_query_analysis,
+    build_query_profile,
+    has_explicit_ocr_intent,
+)
 from ranking import (
     fuse_adaptive_retrieval_scores,
     fuse_multimodal_rerank_score,
@@ -58,6 +64,8 @@ OCR_INDEX_LOADED = False
 RERANKER: QwenVLQueryReranker | None = None
 RERANKER_ATTEMPTED = False
 RERANKER_ERROR = ""
+QUERY_ANALYZER: LightweightQueryAnalyzer | None = None
+QUERY_ANALYZER_ERROR = ""
 ENGINE_LOCK = threading.RLock()
 SESSIONS: dict[str, "SearchSession"] = {}
 SESSIONS_LOCK = threading.RLock()
@@ -155,6 +163,30 @@ def get_engine() -> AICRetrievalEngine:
         if ENGINE is None:
             ENGINE = AICRetrievalEngine.from_environment()
         return ENGINE
+
+
+def get_query_analyzer() -> LightweightQueryAnalyzer:
+    """Create the small text router once; weights are cached per query."""
+    global QUERY_ANALYZER
+    with ENGINE_LOCK:
+        if QUERY_ANALYZER is None:
+            QUERY_ANALYZER = LightweightQueryAnalyzer()
+        return QUERY_ANALYZER
+
+
+def warmup_query_analyzer() -> bool:
+    """Load the lightweight encoder and exercise the two-clause demo query."""
+    global QUERY_ANALYZER_ERROR
+    analyzer = get_query_analyzer()
+    try:
+        analysis = analyzer.warmup()
+        if not analyzer.ready:
+            QUERY_ANALYZER_ERROR = analyzer.load_error or "model chưa sẵn sàng"
+            return False
+        return bool(analysis.clauses)
+    except Exception as error:
+        QUERY_ANALYZER_ERROR = f"{type(error).__name__}: {error}"
+        return False
 
 
 def get_reranker() -> QwenVLQueryReranker | None:
@@ -419,6 +451,48 @@ def search_options(body: dict[str, Any]) -> tuple[int, int, int | None, str | No
     return top_k, min_gap, max_per_video, video_id
 
 
+def _merge_recall_result(
+    combined: dict[tuple[str, int], SearchResult],
+    result: SearchResult,
+) -> None:
+    """Merge candidates from source-specific CLIP queries deterministically."""
+    key = (result.video_id, result.keyframe_number)
+    existing = combined.get(key)
+    if existing is None:
+        combined[key] = result
+        return
+    existing.visual_score = max(existing.visual_score, result.visual_score)
+    existing.metadata_score = max(existing.metadata_score, result.metadata_score)
+    existing.object_score = max(existing.object_score, result.object_score)
+    existing.score = max(existing.score, result.score)
+    existing.retrieval_score = max(existing.retrieval_score, result.retrieval_score)
+    if not existing.title:
+        existing.title = result.title
+    if not existing.image_path:
+        existing.image_path = result.image_path
+    if not existing.video_path:
+        existing.video_path = result.video_path
+    existing.object_labels = tuple(dict.fromkeys((*existing.object_labels, *result.object_labels)))
+
+
+def _source_recall_queries(analysis: QueryAnalysis, fallback: str) -> list[tuple[str, str]]:
+    """Return unique source phrases in priority order for candidate recall."""
+    queries = analysis.source_queries()
+    output: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    # Visual is the main scene recall. Object and metadata clauses get their
+    # own CLIP recall so a frame absent from the visual top pool can still be
+    # recovered before object/metadata fusion.
+    for modality in ("visual", "object", "metadata"):
+        text = queries.get(modality, "").strip()
+        if text and text not in seen:
+            output.append((modality, text))
+            seen.add(text)
+    if not output:
+        output.append(("visual", fallback))
+    return output
+
+
 def make_kis_results(
     engine: AICRetrievalEngine,
     query: str,
@@ -427,11 +501,14 @@ def make_kis_results(
     profile: QueryProfile | None = None,
     reranker: QwenVLQueryReranker | None = None,
     rerank_prompt: str | None = None,
+    analysis: QueryAnalysis | None = None,
 ) -> tuple[list[StoredResult], str]:
     top_k, min_gap, maximum, video_id = search_options(body)
+    analyzer = get_query_analyzer()
+    analysis = analysis or build_query_analysis(query, analyzer)
     if profile is None:
         reranker = reranker or get_reranker()
-        profile = build_query_profile(query, reranker)
+        profile = build_query_profile(query, reranker, analyzer=analyzer, analysis=analysis)
     default_reranker_enabled = "1" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "0"
     reranker_requested = os.environ.get("AIC_RERANKER", default_reranker_enabled).lower() not in {
         "0",
@@ -444,44 +521,68 @@ def make_kis_results(
     recall_top_k = 100 if reranker_requested else top_k
     recall_min_gap = 0 if reranker_requested else min_gap
     recall_max_per_video = None if reranker_requested else maximum
-    try:
-        results = engine.search(
-            query,
-            top_k=recall_top_k,
-            min_frame_gap=recall_min_gap,
-            max_per_video=recall_max_per_video,
-            video_id=video_id,
-            metadata_weight=profile.metadata_weight,
-        )
-    except TypeError as error:
-        # A running Kaggle kernel can retain an older retrieval module in
-        # sys.modules after git pull. Keep the dashboard usable until restart.
-        if "unexpected keyword" not in str(error):
-            raise
-        results = engine.search(
-            query,
-            top_k=recall_top_k,
-            min_frame_gap=recall_min_gap,
-            metadata_weight=profile.metadata_weight,
-        )
-        if video_id:
-            results = [result for result in results if result.video_id == video_id]
-        if maximum and not reranker_requested:
-            counts: dict[str, int] = {}
-            filtered = []
-            for result in track(
-                results,
-                desc="Lọc giới hạn mỗi video",
-                total=len(results),
-                unit="frame",
-            ):
-                counts[result.video_id] = counts.get(result.video_id, 0) + 1
-                if counts[result.video_id] <= maximum:
-                    filtered.append(result)
-            results = filtered
+    combined: dict[tuple[str, int], SearchResult] = {}
+    recall_sources = _source_recall_queries(analysis, query)
+    for source_name, source_query in track(
+        recall_sources,
+        desc="Recall theo modality",
+        total=len(recall_sources),
+        unit="source",
+        force=True,
+    ):
+        metadata_weight = profile.metadata_weight if source_name == "metadata" else 0.025
+        try:
+            source_results = engine.search(
+                source_query,
+                top_k=recall_top_k,
+                min_frame_gap=recall_min_gap,
+                max_per_video=recall_max_per_video,
+                video_id=video_id,
+                metadata_weight=metadata_weight,
+            )
+        except TypeError as error:
+            # A running Kaggle kernel can retain an older retrieval module in
+            # sys.modules after git pull. Keep the dashboard usable until restart.
+            if "unexpected keyword" not in str(error):
+                raise
+            source_results = engine.search(
+                source_query,
+                top_k=recall_top_k,
+                min_frame_gap=recall_min_gap,
+                metadata_weight=metadata_weight,
+            )
+            if video_id:
+                source_results = [result for result in source_results if result.video_id == video_id]
+            if maximum and not reranker_requested:
+                counts: dict[str, int] = {}
+                filtered = []
+                for result in track(
+                    source_results,
+                    desc=f"Lọc {source_name} mỗi video",
+                    total=len(source_results),
+                    unit="frame",
+                ):
+                    counts[result.video_id] = counts.get(result.video_id, 0) + 1
+                    if counts[result.video_id] <= maximum:
+                        filtered.append(result)
+                source_results = filtered
+        for result in track(
+            source_results,
+            desc=f"Ghép {source_name} candidates",
+            total=len(source_results),
+            unit="frame",
+            nested=True,
+        ):
+            _merge_recall_result(combined, result)
+
+    results = list(combined.values())
     ocr_index = get_ocr_index()
-    hits = ocr_index.search(query, limit=max(200, min(top_k * 4, 400)), video_id=video_id) if ocr_index else []
-    combined = {(result.video_id, result.keyframe_number): result for result in results}
+    ocr_query = analysis.query_for("ocr")
+    hits = (
+        ocr_index.search(ocr_query, limit=max(200, min(top_k * 4, 400)), video_id=video_id)
+        if ocr_index and ocr_query
+        else []
+    )
     for hit in track(
         hits,
         desc="Ghép OCR candidates",
@@ -617,7 +718,13 @@ def make_kis_results(
         ocr_note = "OCR index chưa được nạp."
     return (
         [StoredResult(result) for result in selected],
-        language_note(engine) + " · " + profile.summary() + " · " + ocr_note + rerank_note,
+        language_note(engine)
+        + " · "
+        + profile.summary()
+        + (f" · Query split: {profile.analysis_summary()}" if profile.analysis_summary() else "")
+        + " · "
+        + ocr_note
+        + rerank_note,
     )
 
 
@@ -628,6 +735,7 @@ def make_qa_results(
     *,
     profile: QueryProfile | None = None,
     reranker: QwenVLQueryReranker | None = None,
+    analysis: QueryAnalysis | None = None,
 ) -> tuple[list[StoredResult], str]:
     event, question = split_qa_query(query)
     retrieval_query = event
@@ -642,6 +750,7 @@ def make_qa_results(
         profile=profile,
         reranker=reranker,
         rerank_prompt=QA_PROMPT,
+        analysis=analysis,
     )
     results = [item.result for item in stored]
     try:
@@ -970,6 +1079,12 @@ def health():
                 "feature_cache_loaded": engine.feature_cache_loaded,
                 "reranker_ready": RERANKER is not None,
                 "reranker_error": RERANKER_ERROR,
+                "query_analyzer_ready": QUERY_ANALYZER.ready if QUERY_ANALYZER else False,
+                "query_analyzer_model": QUERY_ANALYZER.model_name if QUERY_ANALYZER else "chưa tải",
+                "query_analyzer_error": (
+                    QUERY_ANALYZER_ERROR
+                    or (QUERY_ANALYZER.load_error if QUERY_ANALYZER else "")
+                ),
                 "vqa_backend": VQA.backend_name if VQA is not None else "chưa tải",
                 "vqa_error": VQA.load_error if VQA is not None else "",
             }
@@ -997,6 +1112,7 @@ def run_search_job(
     try:
         engine = get_engine()
         reranker = get_reranker()
+        analyzer = get_query_analyzer()
         if task == "qa":
             qa_event, qa_question = split_qa_query(query)
             profile_query = (
@@ -1006,7 +1122,13 @@ def run_search_job(
             )
         else:
             profile_query = query
-        profile = build_query_profile(profile_query, reranker)
+        analysis = build_query_analysis(profile_query, analyzer)
+        profile = build_query_profile(
+            profile_query,
+            reranker,
+            analyzer=analyzer,
+            analysis=analysis,
+        )
         with ENGINE_LOCK:
             if task == "kis":
                 stored, notice = make_kis_results(
@@ -1015,6 +1137,7 @@ def run_search_job(
                     body,
                     profile=profile,
                     reranker=reranker,
+                    analysis=analysis,
                 )
                 sequences: dict[str, TrakeVideoResult] = {}
             elif task == "qa":
@@ -1024,6 +1147,7 @@ def run_search_job(
                     body,
                     profile=profile,
                     reranker=reranker,
+                    analysis=analysis,
                 )
                 sequences = {}
             else:

@@ -30,6 +30,7 @@ CODE = REPO / "Code"
 DEFAULT_OCR_INDEX = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
 RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
 RERANKER_REQUIREMENTS = CODE / "requirements-reranker.txt"
+QUERY_ANALYZER_REQUIREMENTS = CODE / "requirements-query-analyzer.txt"
 # Kaggle's CPython image has no ``ensurepip``, so a virtualenv cannot be
 # bootstrapped reliably there.  Keep Paddle packages in this private directory
 # and expose it only to the pre-OCR subprocess via PYTHONPATH.
@@ -46,6 +47,7 @@ STALE_MODULES = (
     "qa",
     "query_language",
     "query_router",
+    "query_analyzer",
     "multimodal_reranker",
     "ranking",
     "progress",
@@ -135,8 +137,19 @@ def install_reranker_requirements() -> None:
     print(f"Qwen reranker đã sẵn sàng (transformers {verify.stdout.strip().splitlines()[-1]}).", flush=True)
 
 
-def install_requirements(build_ocr: bool, enable_qwen_stack: bool = True) -> None:
+def install_query_analyzer_requirements() -> None:
+    """Install only the small text encoder used to split query evidence."""
+    install_if_changed(QUERY_ANALYZER_REQUIREMENTS, ".aic_query_analyzer_requirements.sha256")
+
+
+def install_requirements(
+    build_ocr: bool,
+    enable_qwen_stack: bool = True,
+    enable_query_analyzer: bool = True,
+) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
+    if enable_query_analyzer:
+        install_query_analyzer_requirements()
     if enable_qwen_stack:
         install_reranker_requirements()
 
@@ -306,6 +319,17 @@ def warmup_dashboard(reranker_enabled: bool) -> None:
     engine = dashboard.get_engine()
     engine.prepare_runtime()
     dashboard.get_ocr_index()
+    print("Đang tải query analyzer nhẹ trước query đầu tiên…", flush=True)
+    if dashboard.warmup_query_analyzer():
+        analyzer = dashboard.get_query_analyzer()
+        print(
+            f"Query analyzer đã sẵn sàng ({analyzer.model_name}, device={analyzer.device}).",
+            flush=True,
+        )
+    else:
+        detail = dashboard.QUERY_ANALYZER_ERROR or "không có thông tin lỗi"
+        print(f"Query analyzer model không sẵn sàng: {detail}", flush=True)
+        print("Dashboard sẽ dùng lexical/structural query fallback.", flush=True)
     if reranker_enabled:
         print("Đang tải Qwen reranker trước query đầu tiên…", flush=True)
         try:
@@ -385,7 +409,11 @@ def main() -> None:
         and preload_vqa
         and os.environ.get("AIC_VQA_BACKEND", default_vqa_backend).lower() == "qwen"
     )
-    install_requirements(build_ocr, reranker_enabled or qwen_vqa_enabled)
+    install_requirements(
+        build_ocr,
+        reranker_enabled or qwen_vqa_enabled,
+        enable_query_analyzer=not arguments.pre_ocr,
+    )
 
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)

@@ -14,6 +14,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from query_analyzer import LightweightQueryAnalyzer, QueryAnalysis
 
 MODALITIES = ("visual", "ocr", "metadata", "object")
 MODALITY_DOCUMENTS: dict[str, str] = {
@@ -140,6 +141,7 @@ class QueryProfile:
     metadata: float
     object: float
     source: str
+    analysis: QueryAnalysis | None = None
 
     def as_dict(self) -> dict[str, float | str]:
         return {
@@ -148,6 +150,8 @@ class QueryProfile:
             "metadata": round(self.metadata, 4),
             "object": round(self.object, 4),
             "source": self.source,
+            "analysis_source": self.analysis.source if self.analysis else self.source,
+            "analysis": self.analysis.summary() if self.analysis else "",
         }
 
     def values(self) -> dict[str, float]:
@@ -162,6 +166,9 @@ class QueryProfile:
             f"Router {self.source}: hình {self.visual:.0%} · OCR {self.ocr:.0%} · "
             f"metadata {self.metadata:.0%} · object {self.object:.0%}"
         )
+
+    def analysis_summary(self) -> str:
+        return self.analysis.summary() if self.analysis else ""
 
     def support_score(
         self,
@@ -179,39 +186,27 @@ class QueryProfile:
         )
 
 
-def build_query_profile(query: str, reranker: Any | None = None) -> QueryProfile:
-    lexical = lexical_distribution(query)
-    model_scores: dict[str, float] = {}
-    if reranker is not None:
-        try:
-            values = reranker.score_documents(
-                query,
-                [MODALITY_DOCUMENTS[name] for name in MODALITIES],
-                prompt=ROUTING_PROMPT,
-            )
-            if len(values) == len(MODALITIES) and all(math.isfinite(float(value)) for value in values):
-                model_scores = dict(zip(MODALITIES, (float(value) for value in values)))
-        except (RuntimeError, ValueError, OSError):
-            model_scores = {}
+def build_query_analysis(
+    query: str,
+    analyzer: LightweightQueryAnalyzer | None = None,
+) -> QueryAnalysis:
+    """Analyze a query once; the dashboard owns the long-lived analyzer."""
+    return (analyzer or LightweightQueryAnalyzer()).analyze(query)
 
-    if model_scores:
-        semantic = model_distribution(model_scores)
-        # Qwen carries most of the decision; bilingual lexical cues anchor
-        # exact text/count queries where a generic semantic score may be flat.
-        combined = {
-            name: 0.68 * semantic[name] + 0.32 * lexical[name]
-            for name in MODALITIES
-        }
-        source = "Qwen+lexical"
-    else:
-        combined = lexical
-        source = "lexical fallback"
-    if is_ambiguous_warning_query(query):
-        # A text-only router can over-read "warning" as an exact OCR request.
-        # Keep OCR candidates in recall, but return the excess route mass to
-        # visual context unless the query explicitly asks for words.
-        excess = max(0.0, combined["ocr"] - 0.28)
-        combined["ocr"] -= excess
-        combined["visual"] += excess
-    weights = normalize_distribution(combined)
-    return QueryProfile(source=source, **weights)
+
+def build_query_profile(
+    query: str,
+    reranker: Any | None = None,
+    *,
+    analyzer: LightweightQueryAnalyzer | None = None,
+    analysis: QueryAnalysis | None = None,
+) -> QueryProfile:
+    """Build four-source weights from the lightweight clause analyzer.
+
+    ``reranker`` remains an accepted compatibility argument for callers from
+    older dashboard processes, but Qwen is deliberately not used for routing:
+    its image-capable cross-encoder is reserved for the small frame pool.
+    """
+    del reranker
+    analysis = analysis or build_query_analysis(query, analyzer)
+    return QueryProfile(source=analysis.source, analysis=analysis, **analysis.values())

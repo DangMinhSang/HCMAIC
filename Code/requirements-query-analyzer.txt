@@ -1,0 +1,4 @@
+# Small multilingual text encoder for query clause/modality analysis.
+# The model checkpoint is cached by Hugging Face on first Kaggle startup;
+# it is not an AIC dataset and is never committed to the repository.
+sentence-transformers>=5.4.0,<6.0.0
