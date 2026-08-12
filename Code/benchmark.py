@@ -68,7 +68,15 @@ def main() -> None:
     startup_seconds = time.perf_counter() - startup_started
 
     reranker = dashboard.get_reranker()
-    profile_query = split_qa_query(query)[0] if arguments.task == "qa" else query
+    if arguments.task == "qa":
+        event, question = split_qa_query(query)
+        profile_query = (
+            event
+            if event.casefold() == question.casefold()
+            else f"{event}\nVisual question: {question}"
+        )
+    else:
+        profile_query = query
     profile = build_query_profile(profile_query, reranker)
     runs: list[dict[str, Any]] = []
     run_indices = range(1, repeat + 1)
