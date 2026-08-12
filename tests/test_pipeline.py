@@ -35,12 +35,31 @@ from ocr_regions import (
     prepare_reranker_image,
 )
 from qa import VQABaseline
+from query_language import parse_trake_events
 from query_router import QueryProfile, build_query_profile
 from ranking import fuse_adaptive_retrieval_scores, select_diverse_results, select_multisource_candidates
 from retrieval import AICRetrievalEngine, VideoMetadata
 
 
 class PipelineTests(unittest.TestCase):
+    def test_trake_parser_ignores_demo_introduction_and_keeps_four_events(self) -> None:
+        prompt = """Hãy tìm video ghi lại một chuỗi hành động.
+Video cần chứa đầy đủ các sự kiện sau theo đúng thứ tự:
+
+Sự kiện 1 — Chuẩn bị: Vận động viên bắt đầu di chuyển.
+Sự kiện 2 — Thực hiện động tác: Cơ thể bắt đầu rời vị trí.
+Sự kiện 3 — Ở trên không: Vận động viên đạt vị trí cao nhất.
+Sự kiện 4 — Tiếp đất: Bắt đầu tiếp xúc trở lại với mặt đất."""
+        events = parse_trake_events(prompt)
+        self.assertEqual(len(events), 4)
+        self.assertTrue(events[0].startswith("Chuẩn bị:"))
+        self.assertTrue(events[-1].startswith("Tiếp đất:"))
+        self.assertNotIn("Hãy tìm video", " ".join(events))
+
+    def test_trake_parser_supports_plain_numbered_lines(self) -> None:
+        events = parse_trake_events("1. Chuẩn bị\n2. Nhảy\n3. Tiếp đất")
+        self.assertEqual(events, ["Chuẩn bị", "Nhảy", "Tiếp đất"])
+
     def test_vqa_uses_qwen_on_kaggle_and_can_fallback_to_vilt(self) -> None:
         with patch.dict("os.environ", {"KAGGLE_KERNEL_RUN_TYPE": "Interactive"}, clear=False):
             vqa = VQABaseline()

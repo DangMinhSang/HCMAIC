@@ -27,7 +27,7 @@ from ocr_index import OCRMemoryIndex
 from ocr_regions import OCR_INDEX_SCHEMA_VERSION
 from progress import track
 from qa import VQABaseline, split_qa_query
-from query_language import normalize_query
+from query_language import normalize_query, parse_trake_events
 from query_router import QueryProfile, build_query_profile
 from ranking import (
     fuse_adaptive_retrieval_scores,
@@ -649,7 +649,7 @@ def make_trake_results(
     profile: QueryProfile | None = None,
     reranker: QwenVLQueryReranker | None = None,
 ) -> tuple[list[StoredResult], dict[str, TrakeVideoResult], str]:
-    events = [line.strip().lstrip("-0123456789. ") for line in query.splitlines() if line.strip()]
+    events = parse_trake_events(query)
     top_k, _gap, _maximum, _video_id = search_options(body)
     sequences = engine.search_trake(events, top_videos=min(top_k, 100))
     rerank_note = ""

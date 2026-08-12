@@ -15,6 +15,14 @@ VIETNAMESE_HINTS = {
     "trong", "tren", "vao", "voi", "xe",
 }
 WORD_RE = re.compile(r"[\w]+", flags=re.UNICODE)
+TRAKE_EVENT_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?:sự\s*kiện|su\s*kien|event)\s*"
+    r"(?P<number>\d+)\s*(?:[—–:]|-|\.)\s*(?P<body>.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+NUMBERED_EVENT_RE = re.compile(
+    r"^\s*(?:[-*•]\s*)?(?P<number>\d+)\s*[.)\-:]\s*(?P<body>.+?)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +46,49 @@ def looks_vietnamese(text: str) -> bool:
         return True
     tokens = set(WORD_RE.findall(lowered))
     return len(tokens & VIETNAMESE_HINTS) >= 2
+
+
+def parse_trake_events(value: str, *, minimum: int = 2, maximum: int = 12) -> list[str]:
+    """Extract only the numbered temporal stages from a TRAKE prompt.
+
+    The demo prompt contains an introduction followed by lines such as
+    ``Sự kiện 1 — Chuẩn bị: ...``. Treating every non-empty line as an event
+    makes the introduction become an extra frame. Numbered event lines are
+    therefore authoritative; plain newline-separated text remains supported
+    for the compact input format used by the dashboard.
+    """
+    lines = [line.strip() for line in (value or "").splitlines() if line.strip()]
+    explicit: list[tuple[int, str]] = []
+    for line in lines:
+        match = TRAKE_EVENT_RE.match(line)
+        if match:
+            body = match.group("body").strip(" \t:-—–")
+            if body:
+                explicit.append((int(match.group("number")), body))
+
+    if not explicit:
+        numbered: list[tuple[int, str]] = []
+        for line in lines:
+            match = NUMBERED_EVENT_RE.match(line)
+            if match:
+                body = match.group("body").strip(" \t:-—–")
+                if body:
+                    numbered.append((int(match.group("number")), body))
+        explicit = numbered
+
+    if explicit:
+        numbers = [number for number, _body in explicit]
+        if len(numbers) != len(set(numbers)):
+            raise ValueError("TRAKE có số thứ tự sự kiện bị trùng.")
+        events = [body for _number, body in sorted(explicit)]
+    else:
+        events = [line.lstrip("-*• ").strip() for line in lines]
+
+    if len(events) < minimum:
+        raise ValueError(f"TRAKE cần ít nhất {minimum} mốc sự kiện.")
+    if len(events) > maximum:
+        raise ValueError(f"TRAKE tối đa {maximum} mốc sự kiện.")
+    return events
 
 
 @lru_cache(maxsize=512)
