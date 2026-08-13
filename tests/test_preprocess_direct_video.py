@@ -5,8 +5,10 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -17,6 +19,7 @@ if str(CODE) not in sys.path:
 import numpy as np
 
 import dashboard
+import preprocess_direct_video as direct_preprocess
 from direct_video_retrieval import (
     DirectVideoRetrievalEngine,
     parse_frame_steps,
@@ -27,18 +30,143 @@ from preprocess_direct_video import (
     DIRECT_PREPROCESS_SCHEMA,
     TemporalFrameSampler,
     VideoWindow,
+    _run_gpu_stage,
     artifact_paths,
     build_parser,
+    discover_gpu_ids,
     finalize_artifacts,
+    parse_gpu_ids,
+    resolve_worker_gpu_ids,
     select_video_window,
     write_json_atomic,
 )
 
 
+_FAKE_GPU_ID = ""
+
+
+def _initialize_fake_worker(
+    gpu_id: str,
+    _initialization_lock,
+    _output_root: str | Path,
+    _arguments,
+) -> None:
+    global _FAKE_GPU_ID
+    if _initialization_lock is None:
+        _FAKE_GPU_ID = str(gpu_id)
+    else:
+        with _initialization_lock:
+            _FAKE_GPU_ID = str(gpu_id)
+
+
+def _initialize_fake_pool_worker(gpu_queue, initialization_lock, output_root, arguments) -> None:
+    _initialize_fake_worker(gpu_queue.get(), initialization_lock, output_root, arguments)
+
+
+def _run_fake_video(_ordinal: int, _total: int, video_path_value: str) -> dict:
+    time.sleep(0.03)
+    return {
+        "stage": "test",
+        "video_id": Path(video_path_value).stem,
+        "gpu_id": _FAKE_GPU_ID,
+        "frames": 1,
+        "seconds": 0.03,
+    }
+
+
 class DirectVideoPreprocessTests(unittest.TestCase):
     def test_preprocess_defaults_to_every_frame(self) -> None:
-        arguments = build_parser().parse_args(["--stage", "visual"])
+        with patch.dict(
+            os.environ,
+            {"AIC_PRE_DIRECT_GPUS": "auto", "AIC_PRE_DIRECT_WORKERS": "0"},
+        ):
+            arguments = build_parser().parse_args(["--stage", "visual"])
         self.assertEqual(arguments.sample_fps, 0.0)
+        self.assertEqual(arguments.gpus, "auto")
+        self.assertEqual(arguments.workers, 0)
+
+    def test_gpu_worker_plan_uses_each_device_once(self) -> None:
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}):
+            self.assertEqual(discover_gpu_ids(), ("0", "1"))
+        self.assertEqual(parse_gpu_ids("0,1"), ("0", "1"))
+        self.assertEqual(parse_gpu_ids("auto", discovered=("0", "1")), ("0", "1"))
+        self.assertEqual(
+            resolve_worker_gpu_ids("auto", 0, discovered=("0", "1")),
+            ("0", "1"),
+        )
+        self.assertEqual(
+            resolve_worker_gpu_ids("0,1", 1, discovered=("0", "1")),
+            ("0",),
+        )
+        for value, workers in (
+            ("", 0),
+            ("abc", 0),
+            ("0,0", 0),
+            ("0", -1),
+            ("0", 2),
+        ):
+            with self.subTest(value=value, workers=workers), self.assertRaises(ValueError):
+                resolve_worker_gpu_ids(value, workers)
+        with self.assertRaises(ValueError):
+            resolve_worker_gpu_ids("auto", 0, discovered=())
+        with self.assertRaisesRegex(ValueError, "không nằm trong CUDA"):
+            resolve_worker_gpu_ids("0,1", 2, discovered=("0",))
+
+    def test_gpu_pool_dynamically_uses_both_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            videos = tuple(Path(temporary) / f"L21_V{index:03d}.mp4" for index in range(1, 9))
+            window = VideoWindow(videos, 1, len(videos), len(videos))
+            results = _run_gpu_stage(
+                stage="test",
+                window=window,
+                output_root=Path(temporary) / "output",
+                arguments=SimpleNamespace(),
+                gpu_ids=("0", "1"),
+                local_initializer=_initialize_fake_worker,
+                pool_initializer=_initialize_fake_pool_worker,
+                task=_run_fake_video,
+            )
+
+        self.assertEqual(len(results), len(videos))
+        self.assertEqual({result["gpu_id"] for result in results}, {"0", "1"})
+        self.assertEqual({result["video_id"] for result in results}, {path.stem for path in videos})
+
+    def test_visual_worker_maps_physical_gpu_to_logical_zero(self) -> None:
+        created = {}
+
+        class FakeEncoder:
+            def __init__(self, model_name: str, device: str) -> None:
+                created.update(model_name=model_name, device=device)
+
+            @staticmethod
+            def warmup() -> None:
+                return None
+
+        fake_clip_module = SimpleNamespace(ClipTextEncoder=FakeEncoder)
+        fake_torch_module = SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: True,
+                device_count=lambda: 1,
+                get_device_name=lambda _index: "Fake T4",
+            )
+        )
+        arguments = SimpleNamespace(clip_model="fake-clip", object_model="fake-yolo")
+        try:
+            with patch.dict(os.environ, {}, clear=False), patch.dict(
+                sys.modules,
+                {"clip_encoder": fake_clip_module, "torch": fake_torch_module},
+            ), patch.object(direct_preprocess, "create_object_detector", return_value="detector"):
+                direct_preprocess._initialize_visual_worker(
+                    "1",
+                    None,
+                    Path("/tmp/output"),
+                    arguments,
+                )
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "1")
+                self.assertEqual(created, {"model_name": "fake-clip", "device": "cuda:0"})
+                self.assertEqual(direct_preprocess._VISUAL_WORKER_STATE["gpu_id"], "1")
+        finally:
+            direct_preprocess._VISUAL_WORKER_STATE.clear()
 
     def test_video_window_is_sorted_and_one_based_inclusive(self) -> None:
         files = [Path("L22_V003.mp4"), Path("L21_V002.mp4"), Path("L21_V001.mp4")]

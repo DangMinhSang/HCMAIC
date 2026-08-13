@@ -122,6 +122,8 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_DIRECT_VIDEO` | `0` | Bật pipeline raw video; tương đương `python run.py --direct-video` |
 | `AIC_DIRECT_VIDEO_ROOT` | `/kaggle/input/datasets/doanminhtuan/video-aic` | Override thư mục video direct |
 | `AIC_DIRECT_PREPROCESSED_ROOT` | `/kaggle/working/aic_direct_preprocessed` | Root chứa PNG/NPY/OCR/Object đã dựng bằng `--pre-direct-video 1` |
+| `AIC_PRE_DIRECT_GPUS` | `auto` | GPU vật lý cho pre-direct; Kaggle T4x2 tự phát hiện `0,1` |
+| `AIC_PRE_DIRECT_WORKERS` | `0` | Số process pre-direct; `0` = một worker cho mỗi GPU đã chọn |
 | `AIC_DIRECT_VIDEO_STRIDE` | `15` | Lấy một frame mỗi N frame khi tạo local index; nhỏ hơn tăng recall và startup |
 | `AIC_DIRECT_VIDEO_BATCH` | `64` | Batch ảnh tự encode CLIP khi precompute |
 | `AIC_DIRECT_VIDEO_MAX_SAMPLES` | `0` | Giới hạn sample/video để thử nhanh; `0` là không giới hạn |
@@ -186,18 +188,32 @@ inclusive**; `end=0` nghĩa là video cuối. Lệnh chạy đủ ba stage visua
 finalize rồi thoát, không mở dashboard:
 
 ```bash
-# Shard đầu: video thứ 1 đến 100 (bao gồm cả hai đầu).
+# Kaggle T4x2: auto phát hiện GPU 0,1 và chạy hai video đồng thời.
+# Shard đầu: video thứ 1 đến 25 (bao gồm cả hai đầu).
 python -u run.py --pre-direct-video 1 \
-  --start-pre-video 1 --end-pre-video 100
+  --start-pre-video 1 --end-pre-video 25 \
+  --pre-direct-gpus 0,1 --pre-direct-workers 2
 
 # Chạy tiếp shard khác trong cùng output root; video đã hoàn tất sẽ được resume/skip.
 python -u run.py --pre-direct-video 1 \
-  --start-pre-video 101 --end-pre-video 200
+  --start-pre-video 26 --end-pre-video 50
 
 # Từ video 801 tới cuối corpus.
 python -u run.py --pre-direct-video 1 \
   --start-pre-video 801 --end-pre-video 0
 ```
+
+`--pre-direct-gpus auto` và `--pre-direct-workers 0` là mặc định, nên trên
+Kaggle T4x2 có thể bỏ hai tham số cuối: preprocessor dùng `nvidia-smi` để tạo
+một process cho mỗi T4. Video được đưa vào hàng đợi động; GPU hoàn tất trước sẽ
+lấy video tiếp theo thay vì chia cứng hai nửa. Mỗi worker chỉ nhìn thấy GPU vật
+lý của mình qua `CUDA_VISIBLE_DEVICES` và dùng logical GPU 0 cho CLIP, YOLO và
+PaddleOCR. Chỉ tiến trình cha ghi `video_order.json` và chỉ stage finalize hợp
+nhất global OCR/object index, nên hai worker không ghi đè nhau.
+
+Không chạy thủ công hai lệnh `run.py --pre-direct-video` đồng thời vào cùng một
+output root. Hãy dùng worker pool tích hợp ở trên. Nếu muốn ép một GPU để so
+sánh baseline, dùng `--pre-direct-gpus 0 --pre-direct-workers 1`.
 
 Mặc định mới là `--pre-direct-fps 0`: decode và tiền xử lý **mọi frame**. Tham
 số FPS vẫn được giữ để chạy thí nghiệm nhỏ, nhưng artifact đã bỏ frame sẽ không
@@ -224,7 +240,9 @@ nhận marker cũ và rebuild trước khi dùng hierarchy `%4→%2→%1`.
 
 Mỗi video được ghi riêng và chỉ có marker sau khi file hoàn tất, nên cell bị
 ngắt có thể chạy lại an toàn. Mọi vòng decode, CLIP, YOLO, OCR và merge đều có
-`tqdm`. Full-frame PNG + OCR + CLIP + object có thể rất lớn: chạy thử video
+`tqdm`. Marker visual ghi riêng tổng thời gian PNG/CLIP/YOLO và marker OCR ghi
+thời gian OCR để xác định bottleneck thật trên T4x2. Full-frame PNG + OCR +
+CLIP + object có thể rất lớn: chạy thử video
 `1..3`, đo dung lượng/thời gian thực tế, rồi chia shard khoảng 5–25 video phù
 hợp quota session. Lưu output thành Kaggle Dataset trước khi đổi session.
 

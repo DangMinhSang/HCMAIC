@@ -13,9 +13,13 @@ import argparse
 import gzip
 import json
 import math
+import multiprocessing as mp
 import os
+import subprocess
 import sys
+import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import count
@@ -27,6 +31,10 @@ from progress import track
 
 DIRECT_PREPROCESS_SCHEMA = 2
 DEFAULT_OUTPUT_ROOT = Path("/kaggle/working/aic_direct_preprocessed")
+
+
+_VISUAL_WORKER_STATE: dict[str, Any] = {}
+_OCR_WORKER_STATE: dict[str, Any] = {}
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,83 @@ class VideoArtifacts:
     ocr: Path
     ocr_marker: Path
     complete_marker: Path
+
+
+def discover_gpu_ids() -> tuple[str, ...]:
+    """Return CUDA devices visible to this Kaggle process."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible and visible != "-1":
+        devices = tuple(part.strip() for part in visible.split(",") if part.strip())
+        if devices:
+            return devices
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise RuntimeError(
+            "Không tìm thấy nvidia-smi; --pre-direct-video cần Kaggle GPU."
+        ) from error
+    devices = tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+    if result.returncode != 0 or not devices:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            "Không phát hiện CUDA GPU cho direct preprocessing. "
+            + (detail or "Bật Accelerator GPU rồi restart Kaggle session.")
+        )
+    return devices
+
+
+def parse_gpu_ids(value: str, *, discovered: Sequence[str] | None = None) -> tuple[str, ...]:
+    """Parse ``auto`` or a unique CUDA device list such as ``0,1``."""
+    requested = str(value or "").strip()
+    if requested.casefold() == "auto":
+        available = discover_gpu_ids() if discovered is None else discovered
+        devices = tuple(str(device).strip() for device in available)
+    else:
+        devices = tuple(part.strip() for part in requested.split(",") if part.strip())
+    if not devices:
+        raise ValueError("--gpus phải là auto hoặc danh sách như 0,1.")
+    if any(
+        not (device.isdigit() or device.startswith(("GPU-", "MIG-")))
+        for device in devices
+    ):
+        raise ValueError("GPU id không hợp lệ; dùng auto hoặc danh sách như 0,1.")
+    if len(set(devices)) != len(devices):
+        raise ValueError("Danh sách GPU bị trùng; mỗi worker phải sở hữu một GPU riêng.")
+    return devices
+
+
+def resolve_worker_gpu_ids(
+    value: str,
+    workers: int,
+    *,
+    discovered: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Resolve one distinct CUDA device per preprocessing worker."""
+    devices = parse_gpu_ids(value, discovered=discovered)
+    if str(value or "").strip().casefold() != "auto" and discovered is not None:
+        available = {str(device).strip() for device in discovered}
+        missing = [device for device in devices if device not in available]
+        if missing:
+            raise ValueError(
+                f"GPU {','.join(missing)} không nằm trong CUDA devices nhìn thấy: "
+                f"{','.join(sorted(available)) or 'none'}."
+            )
+    if workers < 0:
+        raise ValueError("--workers phải >= 0; 0 nghĩa là một worker cho mỗi GPU.")
+    worker_count = len(devices) if workers == 0 else workers
+    if worker_count < 1:
+        raise ValueError("Direct preprocessing cần ít nhất một GPU worker.")
+    if worker_count > len(devices):
+        raise ValueError(
+            f"Yêu cầu {worker_count} worker nhưng chỉ cấu hình {len(devices)} GPU; "
+            "không chạy hai model worker trên cùng một T4."
+        )
+    return devices[:worker_count]
 
 
 class TemporalFrameSampler:
@@ -328,6 +413,7 @@ def preprocess_visual_video(
     force: bool,
 ) -> dict[str, Any]:
     """Decode one video once and create PNG/CLIP/object artifacts."""
+    visual_started = time.perf_counter()
     try:
         import cv2  # type: ignore
         import numpy as np
@@ -415,16 +501,21 @@ def preprocess_visual_video(
     clip_image_batch: list[Any] = []
     record_batch: list[dict[str, Any]] = []
     batch_limit = max(1, min(int(clip_batch), int(object_batch)))
+    png_seconds = clip_seconds = object_seconds = 0.0
 
     def flush_batch(object_stream: Any) -> None:
+        nonlocal clip_seconds, object_seconds
         if not image_batch:
             return
+        clip_started = time.perf_counter()
         vectors = encoder.encode_images(
             clip_image_batch,
             batch_size=max(1, int(clip_batch)),
             progress_desc=f"CLIP direct {video_id}",
             nested=True,
         )
+        clip_seconds += time.perf_counter() - clip_started
+        object_started = time.perf_counter()
         predictions = detector.predict(
             source=image_batch,
             batch=max(1, int(object_batch)),
@@ -432,6 +523,7 @@ def preprocess_visual_video(
             device=object_device,
             verbose=False,
         )
+        object_seconds += time.perf_counter() - object_started
         if len(vectors) != len(record_batch) or len(predictions) != len(record_batch):
             raise RuntimeError(f"CLIP/object batch không khớp frame ở {video_id}.")
         clip_parts.append(np.asarray(vectors, dtype=np.float32))
@@ -485,8 +577,10 @@ def preprocess_visual_video(
                 filename = f"{frame_index:09d}.png"
                 image_path = artifacts.frames_dir / filename
                 image_temporary = image_path.with_name(f"{image_path.stem}.building.png")
+                png_started = time.perf_counter()
                 image.save(image_temporary, format="PNG", compress_level=3)
                 image_temporary.replace(image_path)
+                png_seconds += time.perf_counter() - png_started
                 sample_index = len(mapping_records)
                 record = {
                     "schema": DIRECT_PREPROCESS_SCHEMA,
@@ -573,6 +667,13 @@ def preprocess_visual_video(
         "sampled_frames": len(mapping_records),
         "clip_shape": list(clip_matrix.shape),
         "object_shape": list(object_matrix.shape),
+        "worker_gpu": os.environ.get("AIC_PRE_DIRECT_WORKER_GPU", ""),
+        "timing_seconds": {
+            "total": round(time.perf_counter() - visual_started, 3),
+            "png": round(png_seconds, 3),
+            "clip": round(clip_seconds, 3),
+            "object": round(object_seconds, 3),
+        },
         "generated_at": utc_now(),
     }
     write_json_atomic(artifacts.visual_marker, marker)
@@ -595,35 +696,240 @@ def run_visual_stage(
     output_root: Path,
     arguments: argparse.Namespace,
 ) -> None:
-    from clip_encoder import ClipTextEncoder
+    available = discover_gpu_ids()
+    gpu_ids = resolve_worker_gpu_ids(
+        arguments.gpus,
+        arguments.workers,
+        discovered=available,
+    )
+    _run_gpu_stage(
+        stage="visual",
+        window=window,
+        output_root=output_root,
+        arguments=arguments,
+        gpu_ids=gpu_ids,
+        local_initializer=_initialize_visual_worker,
+        pool_initializer=_visual_pool_initializer,
+        task=_visual_worker_task,
+    )
 
-    encoder = ClipTextEncoder(model_name=arguments.clip_model)
-    encoder.warmup()
-    detector = create_object_detector(arguments.object_model)
+
+def _bind_cuda_worker(gpu_id: str, stage: str) -> None:
+    """Expose one physical GPU as logical device zero before model imports."""
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    os.environ["AIC_PRE_DIRECT_WORKER_GPU"] = str(gpu_id)
+    print(
+        f"[{stage} worker pid={os.getpid()}] physical GPU {gpu_id} → logical GPU 0",
+        flush=True,
+    )
+
+
+def _with_optional_lock(lock: Any, callback: Any) -> Any:
+    if lock is None:
+        return callback()
+    with lock:
+        return callback()
+
+
+def _initialize_visual_worker(
+    gpu_id: str,
+    initialization_lock: Any,
+    output_root: str | Path,
+    arguments: argparse.Namespace,
+) -> None:
+    """Load one CLIP and one YOLO instance on a worker's isolated GPU."""
+    _bind_cuda_worker(gpu_id, "visual")
+
+    def load_models() -> tuple[Any, Any]:
+        from clip_encoder import ClipTextEncoder
+        import torch
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError(
+                f"Visual worker GPU {gpu_id} không được cô lập thành đúng một CUDA device."
+            )
+        print(
+            f"[visual GPU {gpu_id}] CUDA logical 0 = {torch.cuda.get_device_name(0)}",
+            flush=True,
+        )
+
+        encoder = ClipTextEncoder(model_name=arguments.clip_model, device="cuda:0")
+        encoder.warmup()
+        detector = create_object_detector(arguments.object_model)
+        return encoder, detector
+
+    encoder, detector = _with_optional_lock(initialization_lock, load_models)
+    _VISUAL_WORKER_STATE.clear()
+    _VISUAL_WORKER_STATE.update(
+        gpu_id=str(gpu_id),
+        output_root=Path(output_root),
+        arguments=arguments,
+        encoder=encoder,
+        detector=detector,
+    )
+    print(f"[visual GPU {gpu_id}] CLIP + YOLO sẵn sàng.", flush=True)
+
+
+def _visual_pool_initializer(
+    gpu_queue: Any,
+    initialization_lock: Any,
+    output_root: str | Path,
+    arguments: argparse.Namespace,
+) -> None:
+    _initialize_visual_worker(gpu_queue.get(), initialization_lock, output_root, arguments)
+
+
+def _visual_worker_task(ordinal: int, total: int, video_path_value: str) -> dict[str, Any]:
+    if not _VISUAL_WORKER_STATE:
+        raise RuntimeError("Visual GPU worker chưa được khởi tạo.")
+    video_path = Path(video_path_value)
+    arguments = _VISUAL_WORKER_STATE["arguments"]
+    gpu_id = str(_VISUAL_WORKER_STATE["gpu_id"])
+    started = time.perf_counter()
+    print(f"[{ordinal}/{total}] [GPU {gpu_id}] visual {video_path.stem}", flush=True)
+    marker = preprocess_visual_video(
+        video_path,
+        _VISUAL_WORKER_STATE["output_root"],
+        encoder=_VISUAL_WORKER_STATE["encoder"],
+        detector=_VISUAL_WORKER_STATE["detector"],
+        sample_fps=arguments.sample_fps,
+        max_side=arguments.max_side,
+        clip_batch=arguments.clip_batch,
+        object_batch=arguments.object_batch,
+        object_model=arguments.object_model,
+        object_device="0",
+        object_confidence=arguments.object_confidence,
+        mask_clip_overlays=arguments.mask_clip_overlays,
+        force=arguments.force,
+    )
+    return {
+        "stage": "visual",
+        "video_id": video_path.stem,
+        "gpu_id": gpu_id,
+        "frames": int(marker.get("sampled_frames") or 0),
+        "seconds": time.perf_counter() - started,
+    }
+
+
+def _print_stage_result(result: dict[str, Any]) -> None:
+    print(
+        f"[done] {result['stage']} {result['video_id']} · GPU {result['gpu_id']} · "
+        f"{int(result.get('frames') or 0):,} frame · {float(result['seconds']):.1f}s",
+        flush=True,
+    )
+
+
+def _run_gpu_stage(
+    *,
+    stage: str,
+    window: VideoWindow,
+    output_root: Path,
+    arguments: argparse.Namespace,
+    gpu_ids: tuple[str, ...],
+    local_initializer: Any,
+    pool_initializer: Any,
+    task: Any,
+) -> list[dict[str, Any]]:
+    """Run dynamically scheduled per-video jobs with one process per GPU."""
+    stage_started = time.perf_counter()
+    print(
+        f"Direct {stage}: {len(gpu_ids)} worker · GPU {','.join(gpu_ids)} · "
+        f"{len(window.videos)} video",
+        flush=True,
+    )
+    jobs: list[tuple[int, int, str]] = []
     for ordinal, video_path in track(
         enumerate(window.videos, start=window.start),
-        desc=f"Visual videos {window.start}..{window.end}",
+        desc=f"Lập hàng đợi {stage}",
         total=len(window.videos),
         unit="video",
-        force=True,
-        leave=True,
+        nested=True,
     ):
-        print(f"[{ordinal}/{window.total}] visual {video_path.stem}", flush=True)
-        preprocess_visual_video(
-            video_path,
-            output_root,
-            encoder=encoder,
-            detector=detector,
-            sample_fps=arguments.sample_fps,
-            max_side=arguments.max_side,
-            clip_batch=arguments.clip_batch,
-            object_batch=arguments.object_batch,
-            object_model=arguments.object_model,
-            object_device=arguments.object_device,
-            object_confidence=arguments.object_confidence,
-            mask_clip_overlays=arguments.mask_clip_overlays,
-            force=arguments.force,
+        jobs.append((ordinal, window.total, str(video_path)))
+    results: list[dict[str, Any]] = []
+    if len(gpu_ids) == 1:
+        local_initializer(gpu_ids[0], None, output_root, arguments)
+        for job in track(
+            jobs,
+            desc=f"{stage.title()} videos {window.start}..{window.end}",
+            total=len(jobs),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
+            result = task(*job)
+            results.append(result)
+            _print_stage_result(result)
+        elapsed = time.perf_counter() - stage_started
+        print(
+            f"Direct {stage} hoàn tất {len(results)}/{len(jobs)} video trong {elapsed:.1f}s.",
+            flush=True,
         )
+        return results
+
+    context = mp.get_context("spawn")
+    gpu_queue = context.Queue()
+    for gpu_id in track(
+        gpu_ids,
+        desc=f"Gán GPU {stage}",
+        total=len(gpu_ids),
+        unit="GPU",
+        nested=True,
+    ):
+        gpu_queue.put(gpu_id)
+    initialization_lock = context.Lock()
+    executor = ProcessPoolExecutor(
+        max_workers=len(gpu_ids),
+        mp_context=context,
+        initializer=pool_initializer,
+        initargs=(gpu_queue, initialization_lock, output_root, arguments),
+    )
+    futures = []
+    for job in track(
+        jobs,
+        desc=f"Submit {stage} videos",
+        total=len(jobs),
+        unit="video",
+        nested=True,
+    ):
+        futures.append(executor.submit(task, *job))
+    try:
+        completed = as_completed(futures)
+        for future in track(
+            completed,
+            desc=f"{stage.title()} GPU workers",
+            total=len(futures),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
+            result = future.result()
+            results.append(result)
+            _print_stage_result(result)
+    except BaseException:
+        for future in track(
+            futures,
+            desc=f"Hủy {stage} jobs",
+            total=len(futures),
+            unit="job",
+            nested=True,
+        ):
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+    finally:
+        gpu_queue.close()
+        gpu_queue.join_thread()
+    elapsed = time.perf_counter() - stage_started
+    print(
+        f"Direct {stage} hoàn tất {len(results)}/{len(jobs)} video trên "
+        f"{len(gpu_ids)} GPU trong {elapsed:.1f}s.",
+        flush=True,
+    )
+    return results
 
 
 def preprocess_ocr_video(
@@ -639,6 +945,7 @@ def preprocess_ocr_video(
     from build_ocr_index import read_text
     from ocr_regions import OCR_INDEX_SCHEMA_VERSION, bottom_overlay_start
 
+    ocr_started = time.perf_counter()
     video_id = video_path.stem
     artifacts = artifact_paths(output_root, video_id)
     visual_marker = read_json(artifacts.visual_marker)
@@ -716,6 +1023,8 @@ def preprocess_ocr_video(
         "suppressed_overlay_lines": overlay_lines,
         "overlay_only_frames": overlay_only_frames,
         "failures": failures,
+        "worker_gpu": os.environ.get("AIC_PRE_DIRECT_WORKER_GPU", ""),
+        "timing_seconds": {"total": round(time.perf_counter() - ocr_started, 3)},
         "generated_at": utc_now(),
     }
     write_json_atomic(artifacts.ocr_marker, marker)
@@ -732,29 +1041,89 @@ def run_ocr_stage(
     output_root: Path,
     arguments: argparse.Namespace,
 ) -> None:
-    from build_ocr_index import create_reader, resolve_device
+    available = discover_gpu_ids()
+    gpu_ids = resolve_worker_gpu_ids(
+        arguments.gpus,
+        arguments.workers,
+        discovered=available,
+    )
+    _run_gpu_stage(
+        stage="ocr",
+        window=window,
+        output_root=output_root,
+        arguments=arguments,
+        gpu_ids=gpu_ids,
+        local_initializer=_initialize_ocr_worker,
+        pool_initializer=_ocr_pool_initializer,
+        task=_ocr_worker_task,
+    )
 
-    device = resolve_device(arguments.ocr_device)
-    print(f"Direct OCR device: {device}", flush=True)
-    reader = create_reader(arguments.ocr_language, device)
-    for ordinal, video_path in track(
-        enumerate(window.videos, start=window.start),
-        desc=f"OCR videos {window.start}..{window.end}",
-        total=len(window.videos),
-        unit="video",
-        force=True,
-        leave=True,
-    ):
-        print(f"[{ordinal}/{window.total}] OCR {video_path.stem}", flush=True)
-        preprocess_ocr_video(
-            video_path,
-            output_root,
-            reader=reader,
-            language=arguments.ocr_language,
-            device=device,
-            minimum_confidence=arguments.ocr_min_confidence,
-            force=arguments.force,
-        )
+
+def _initialize_ocr_worker(
+    gpu_id: str,
+    initialization_lock: Any,
+    output_root: str | Path,
+    arguments: argparse.Namespace,
+) -> None:
+    """Load one PaddleOCR reader on a worker's isolated GPU."""
+    _bind_cuda_worker(gpu_id, "ocr")
+
+    def load_reader() -> tuple[Any, str]:
+        from build_ocr_index import create_reader, resolve_device
+        import paddle
+
+        device = resolve_device("gpu:0")
+        if paddle.device.cuda.device_count() != 1:
+            raise RuntimeError(
+                f"OCR worker GPU {gpu_id} không được cô lập thành đúng một CUDA device."
+            )
+        return create_reader(arguments.ocr_language, device), device
+
+    reader, device = _with_optional_lock(initialization_lock, load_reader)
+    _OCR_WORKER_STATE.clear()
+    _OCR_WORKER_STATE.update(
+        gpu_id=str(gpu_id),
+        output_root=Path(output_root),
+        arguments=arguments,
+        reader=reader,
+        device=device,
+    )
+    print(f"[OCR GPU {gpu_id}] PaddleOCR sẵn sàng trên logical {device}.", flush=True)
+
+
+def _ocr_pool_initializer(
+    gpu_queue: Any,
+    initialization_lock: Any,
+    output_root: str | Path,
+    arguments: argparse.Namespace,
+) -> None:
+    _initialize_ocr_worker(gpu_queue.get(), initialization_lock, output_root, arguments)
+
+
+def _ocr_worker_task(ordinal: int, total: int, video_path_value: str) -> dict[str, Any]:
+    if not _OCR_WORKER_STATE:
+        raise RuntimeError("OCR GPU worker chưa được khởi tạo.")
+    video_path = Path(video_path_value)
+    arguments = _OCR_WORKER_STATE["arguments"]
+    gpu_id = str(_OCR_WORKER_STATE["gpu_id"])
+    started = time.perf_counter()
+    print(f"[{ordinal}/{total}] [GPU {gpu_id}] OCR {video_path.stem}", flush=True)
+    marker = preprocess_ocr_video(
+        video_path,
+        _OCR_WORKER_STATE["output_root"],
+        reader=_OCR_WORKER_STATE["reader"],
+        language=arguments.ocr_language,
+        device=_OCR_WORKER_STATE["device"],
+        minimum_confidence=arguments.ocr_min_confidence,
+        force=arguments.force,
+    )
+    return {
+        "stage": "ocr",
+        "video_id": video_path.stem,
+        "gpu_id": gpu_id,
+        "frames": int(marker.get("records") or 0),
+        "seconds": time.perf_counter() - started,
+    }
 
 
 def _copy_jsonl_records(source: Path, destination: Any, *, require_text: bool = False) -> int:
@@ -902,6 +1271,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--start-video", type=int, default=1)
     parser.add_argument("--end-video", type=int, default=0)
+    parser.add_argument(
+        "--gpus",
+        default=os.environ.get("AIC_PRE_DIRECT_GPUS", "auto"),
+        help="CUDA GPU vật lý, mặc định auto dùng mọi GPU nhìn thấy; ví dụ 0,1",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("AIC_PRE_DIRECT_WORKERS", "0")),
+        help="Số process GPU; 0 mặc định tạo một worker cho mỗi GPU trong --gpus",
+    )
     parser.add_argument("--sample-fps", type=float, default=0.0, help="0 means every decoded frame (default)")
     parser.add_argument("--max-side", type=int, default=0, help="0 preserves original PNG resolution")
     parser.add_argument("--clip-model", default=os.environ.get("AIC_DIRECT_CLIP_MODEL", "ViT-B/32"))
@@ -932,6 +1312,10 @@ def main() -> None:
         raise ValueError("--object-confidence phải trong [0, 1].")
     if not math.isfinite(arguments.ocr_min_confidence) or not 0.0 <= arguments.ocr_min_confidence <= 1.0:
         raise ValueError("--ocr-min-confidence phải trong [0, 1].")
+    if arguments.workers < 0:
+        raise ValueError("--workers phải >= 0; 0 nghĩa là một worker cho mỗi GPU.")
+    if arguments.stage == "ocr" and not str(arguments.ocr_device).startswith("gpu"):
+        raise ValueError("Direct multi-worker OCR yêu cầu --ocr-device gpu:0.")
 
     from direct_video_retrieval import resolve_video_dataset
 

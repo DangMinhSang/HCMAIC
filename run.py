@@ -366,6 +366,19 @@ def parse_arguments() -> argparse.Namespace:
         help="Số frame/giây cần lưu; mặc định 0 = tiền xử lý mọi frame",
     )
     parser.add_argument(
+        "--pre-direct-gpus",
+        default=os.environ.get("AIC_PRE_DIRECT_GPUS", "auto"),
+        metavar="GPUS",
+        help="GPU cho pre-direct; mặc định auto dùng cả T4x2, hoặc chỉ định 0,1",
+    )
+    parser.add_argument(
+        "--pre-direct-workers",
+        type=int,
+        default=int(os.environ.get("AIC_PRE_DIRECT_WORKERS", "0")),
+        metavar="N",
+        help="Số GPU worker; 0 = một worker/GPU đã chọn",
+    )
+    parser.add_argument(
         "--direct-frame-steps",
         default=os.environ.get("AIC_DIRECT_FRAME_STEPS", "4,2,1"),
         metavar="STEPS",
@@ -468,6 +481,8 @@ def main() -> None:
             raise ValueError("--pre-direct-fps phải >= 0; dùng 0 để lấy tất cả frame.")
         if arguments.pre_direct_max_side < 0:
             raise ValueError("--pre-direct-max-side phải >= 0.")
+        if arguments.pre_direct_workers < 0:
+            raise ValueError("--pre-direct-workers phải >= 0; 0 nghĩa là một worker/GPU.")
     direct_video_enabled = (
         arguments.direct_video
         or pre_direct_enabled
@@ -587,6 +602,10 @@ def main() -> None:
             str(arguments.pre_direct_fps),
             "--max-side",
             str(arguments.pre_direct_max_side),
+            "--gpus",
+            arguments.pre_direct_gpus,
+            "--workers",
+            str(arguments.pre_direct_workers),
         ]
         if arguments.force_pre_direct:
             common.append("--force")
@@ -594,6 +613,11 @@ def main() -> None:
             "mọi decoded frame"
             if arguments.pre_direct_fps == 0
             else f"{arguments.pre_direct_fps:g} frame/giây"
+        )
+        print(
+            f"Direct preprocess GPU={arguments.pre_direct_gpus}, "
+            f"workers={arguments.pre_direct_workers or 'auto'}.",
+            flush=True,
         )
         print(
             f"Direct preprocess 1/3 ({frame_plan}): cắt PNG, CLIP embedding và YOLO object…",
