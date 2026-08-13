@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -361,13 +362,24 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--pre-direct-fps",
         type=float,
-        default=2.0,
-        help="Số frame/giây cần lưu; 0 nghĩa là lưu mọi frame",
+        default=0.0,
+        help="Số frame/giây cần lưu; mặc định 0 = tiền xử lý mọi frame",
+    )
+    parser.add_argument(
+        "--direct-frame-steps",
+        default=os.environ.get("AIC_DIRECT_FRAME_STEPS", "4,2,1"),
+        metavar="STEPS",
+        help="Các tầng query frame_idx %% step, mặc định 4,2,1",
     )
     parser.add_argument(
         "--pre-direct-output",
         type=Path,
-        default=Path("/kaggle/working/aic_direct_preprocessed"),
+        default=Path(
+            os.environ.get(
+                "AIC_DIRECT_PREPROCESSED_ROOT",
+                "/kaggle/working/aic_direct_preprocessed",
+            )
+        ),
     )
     parser.add_argument(
         "--pre-direct-max-side",
@@ -398,7 +410,7 @@ def warmup_dashboard(reranker_enabled: bool, direct_video_enabled: bool = False)
         )
         print(
             "Direct-video mode: bỏ qua features/OCR BTC; "
-            f"đã sẵn sàng {engine.vector_count:,} sampled frames · "
+            f"đã sẵn sàng {engine.vector_count:,} indexed frames · "
             f"direct OCR={'đã nạp' if ocr_index else ('chưa có' if not direct_ocr.is_file() else 'rỗng')}.",
             flush=True,
         )
@@ -452,7 +464,7 @@ def main() -> None:
             raise ValueError(
                 "--end-pre-video phải >= --start-pre-video; dùng 0 để chạy tới video cuối."
             )
-        if arguments.pre_direct_fps < 0:
+        if not math.isfinite(arguments.pre_direct_fps) or arguments.pre_direct_fps < 0:
             raise ValueError("--pre-direct-fps phải >= 0; dùng 0 để lấy tất cả frame.")
         if arguments.pre_direct_max_side < 0:
             raise ValueError("--pre-direct-max-side phải >= 0.")
@@ -539,6 +551,7 @@ def main() -> None:
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)
     os.environ["AIC_DIRECT_PREPROCESSED_ROOT"] = str(arguments.pre_direct_output.expanduser())
+    os.environ["AIC_DIRECT_FRAME_STEPS"] = arguments.direct_frame_steps
     os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features or direct_video_enabled else "1"
     os.environ["AIC_RERANKER"] = "1" if reranker_enabled else "0"
     # Keep site-packages ahead of the app directory. The project has a
@@ -549,6 +562,16 @@ def main() -> None:
     while code_path in sys.path:
         sys.path.remove(code_path)
     sys.path.append(code_path)
+
+    if direct_video_enabled and not pre_direct_enabled:
+        from direct_video_retrieval import parse_frame_steps
+
+        parsed_steps = parse_frame_steps(arguments.direct_frame_steps)
+        print(
+            "Direct query hierarchy: "
+            + " → ".join(f"frame_id % {step}" for step in parsed_steps),
+            flush=True,
+        )
 
     if pre_direct_enabled:
         common = [
@@ -567,7 +590,15 @@ def main() -> None:
         ]
         if arguments.force_pre_direct:
             common.append("--force")
-        print("Direct preprocess 1/3: cắt PNG, CLIP embedding và YOLO object…", flush=True)
+        frame_plan = (
+            "mọi decoded frame"
+            if arguments.pre_direct_fps == 0
+            else f"{arguments.pre_direct_fps:g} frame/giây"
+        )
+        print(
+            f"Direct preprocess 1/3 ({frame_plan}): cắt PNG, CLIP embedding và YOLO object…",
+            flush=True,
+        )
         command([*common, "--stage", "visual"])
         print("Direct preprocess 2/3: PaddleOCR scene-text, loại TV overlay…", flush=True)
         ocr_env = ensure_paddle_ocr_packages()
@@ -612,7 +643,16 @@ def main() -> None:
     if direct_video_enabled:
         engine = dashboard.get_engine()
         print("Direct video root:", engine.dataset_root, flush=True)
-        print("Direct sampled vectors:", f"{engine.vector_count:,}", flush=True)
+        print("Direct indexed frames:", f"{engine.vector_count:,}", flush=True)
+        print(
+            "Direct query steps:",
+            (
+                " → ".join(map(str, engine.frame_steps))
+                if engine._preprocessed_video_count
+                else f"fallback stride {engine.sample_stride}"
+            ),
+            flush=True,
+        )
         print("BTC features/mapping:", "tắt trong direct-video mode", flush=True)
         direct_ocr_path = Path(os.environ["AIC_DIRECT_PREPROCESSED_ROOT"]) / "ocr_index.jsonl.gz"
         print("Direct OCR index:", direct_ocr_path if direct_ocr_path.is_file() else "chưa có", flush=True)

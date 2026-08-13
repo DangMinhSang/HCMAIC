@@ -36,7 +36,7 @@ class DirectVideoUnavailableError(RuntimeError):
 
 @dataclass(frozen=True)
 class DirectFrame:
-    """One sampled frame in the locally generated direct-video index."""
+    """One indexed frame in the locally generated direct-video artifacts."""
 
     keyframe_number: int
     frame_id: int
@@ -51,6 +51,75 @@ class _DirectCandidate:
     video_id: str
     feature_index: int
     visual_score: float
+
+
+@dataclass(frozen=True)
+class _PreprocessedShard:
+    """Memory-mapped full-frame arrays for one preprocessed video."""
+
+    video_id: str
+    root: Path
+    source_path: Path
+    embeddings: np.ndarray
+    frame_ids: np.ndarray
+    pts_times: np.ndarray
+    fps: float
+    all_frames: bool
+
+
+def parse_frame_steps(value: str | Sequence[int]) -> tuple[int, ...]:
+    """Validate a coarse-to-fine modulo schedule such as ``4,2,1``."""
+    try:
+        if isinstance(value, str):
+            steps = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+        else:
+            steps = tuple(int(part) for part in value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("AIC_DIRECT_FRAME_STEPS phải có dạng 4,2,1.") from error
+    if not steps or steps[-1] != 1:
+        raise ValueError("AIC_DIRECT_FRAME_STEPS phải kết thúc bằng 1 để refinement dùng mọi frame.")
+    if any(step < 1 or step > 300 for step in steps):
+        raise ValueError("Mỗi direct frame step phải nằm trong 1..300.")
+    if any(previous <= current or previous % current for previous, current in zip(steps, steps[1:])):
+        raise ValueError("Direct frame steps phải giảm dần và chia hết nhau, ví dụ 4,2,1.")
+    return steps
+
+
+def temporal_modulo_indices(
+    frame_ids: np.ndarray,
+    centers: Sequence[int],
+    previous_step: int,
+    next_step: int,
+) -> np.ndarray:
+    """Return finer modulo rows near coarser candidate rows.
+
+    ``centers`` are local row indices, while modulo and radius use decoded
+    ``frame_id`` coordinates. With 4→2→1, every decoded frame surrounding a
+    retained ``%4`` frame becomes reachable without scanning the full matrix.
+    """
+    values = np.asarray(frame_ids)
+    if values.ndim != 1 or not len(values):
+        return np.empty(0, dtype=np.int32)
+    selected: set[int] = set()
+    radius = max(1, int(previous_step))
+    for center in track(
+        centers,
+        desc=f"Refine frame %{previous_step}→%{next_step}",
+        total=len(centers),
+        unit="center",
+        nested=True,
+    ):
+        local_index = int(center)
+        if local_index < 0 or local_index >= len(values):
+            continue
+        center_frame = int(values[local_index])
+        left = int(np.searchsorted(values, center_frame - radius, side="left"))
+        right = int(np.searchsorted(values, center_frame + radius, side="right"))
+        candidates = np.arange(left, right, dtype=np.int32)
+        if next_step > 1:
+            candidates = candidates[np.asarray(values[candidates]) % next_step == 0]
+        selected.update(int(index) for index in candidates)
+    return np.asarray(sorted(selected), dtype=np.int32)
 
 
 def discover_video_files(root: str | Path) -> list[Path]:
@@ -145,7 +214,7 @@ class DirectVideoRetrievalEngine:
     """CLIP retrieval built from raw videos, without BTC feature arrays.
 
     Frame ids in this mode are decoded OpenCV frame indices (zero-based), and
-    ``keyframe_number`` is the sampled-frame ordinal. This preserves temporal
+    ``keyframe_number`` is the artifact-row ordinal. This preserves temporal
     ordering for the dashboard/TRAKE path, but the generated index must be
     benchmarked against the official submission convention before submission.
     """
@@ -185,6 +254,9 @@ class DirectVideoRetrievalEngine:
         self.sample_stride = self._bounded_int("AIC_DIRECT_VIDEO_STRIDE", 15, 1, 300)
         self.batch_size = self._bounded_int("AIC_DIRECT_VIDEO_BATCH", 64, 1, 256)
         self.max_samples_per_video = self._bounded_int("AIC_DIRECT_VIDEO_MAX_SAMPLES", 0, 0, 1000000)
+        self.frame_steps = parse_frame_steps(os.environ.get("AIC_DIRECT_FRAME_STEPS", "4,2,1"))
+        self.refine_pool = self._bounded_int("AIC_DIRECT_REFINE_POOL", 1200, 100, 10000)
+        self.trake_refine_videos = self._bounded_int("AIC_DIRECT_TRAKE_REFINE_VIDEOS", 50, 10, 200)
         runtime_dir = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working")) / "aic_direct_video_cache"
         self.runtime_dir = runtime_dir
         self.preprocessed_root = Path(
@@ -202,6 +274,13 @@ class DirectVideoRetrievalEngine:
         self._video_order = tuple(self._features)
         self._preprocessed_checked = False
         self._preprocessed_video_count = 0
+        self._preprocessed_frame_count = 0
+        self._preprocessed_all_frame_videos = 0
+        self._preprocessed_shards: dict[str, _PreprocessedShard] = {}
+        self._coarse_embeddings: np.ndarray | None = None
+        self._coarse_video_positions: np.ndarray | None = None
+        self._coarse_local_indices: np.ndarray | None = None
+        self._coarse_offsets: np.ndarray | None = None
         self._direct_object_cache: dict[str, dict[int, tuple[str, ...]]] = {}
         self._direct_object_matrices: dict[
             str,
@@ -247,21 +326,29 @@ class DirectVideoRetrievalEngine:
 
     @property
     def vector_count(self) -> int:
+        if self._preprocessed_shards:
+            return self._preprocessed_frame_count
         return int(len(self._embeddings)) if self._embeddings is not None else len(self._records)
 
     @property
     def feature_cache_loaded(self) -> bool:
-        return self._embeddings is not None
+        return self._embeddings is not None or self._coarse_embeddings is not None
 
     @property
     def source_description(self) -> str:
         preprocessed = (
             f" · preprocessed={self._preprocessed_video_count}/{len(self._video_order)} video"
+            f" · all-frame={self._preprocessed_all_frame_videos}/{self._preprocessed_video_count}"
             if self._preprocessed_video_count
             else ""
         )
+        sampling = (
+            f"query modulo={'→'.join(map(str, self.frame_steps))}"
+            if self._preprocessed_video_count
+            else f"fallback stride={self.sample_stride} frame"
+        )
         return (
-            f"{self.source_kind}:{self.dataset_root} · stride={self.sample_stride} frame · "
+            f"{self.source_kind}:{self.dataset_root} · {sampling} · "
             f"local CLIP index, không dùng feature/mapping BTC{preprocessed}"
         )
 
@@ -280,7 +367,7 @@ class DirectVideoRetrievalEngine:
 
     def prepare_runtime(self) -> None:
         """Load the generated index or build it once before serving queries."""
-        if self._embeddings is not None:
+        if self._embeddings is not None or self._coarse_embeddings is not None:
             return
         if self._load_preprocessed_index():
             return
@@ -297,18 +384,23 @@ class DirectVideoRetrievalEngine:
         self._build_index()
 
     def _load_preprocessed_index(self) -> bool:
-        """Load shard artifacts produced by ``--pre-direct-video 1``."""
+        """Load full-frame shards and materialize only the coarsest RAM index."""
         if self._preprocessed_checked:
             return False
         self._preprocessed_checked = True
         videos_root = self.preprocessed_root / "videos"
         if not videos_root.is_dir():
             return False
-        vector_parts: list[np.ndarray] = []
-        records: list[DirectFrame] = []
+        coarse_entries: list[tuple[int, str, np.ndarray]] = []
+        coarse_counts = np.zeros(len(self._video_order), dtype=np.int64)
+        embedding_dimension = 0
         loaded_videos = 0
-        for video_id in track(
-            self._video_order,
+        artifact_candidates = 0
+        all_frame_videos = 0
+        frame_count = 0
+        coarse_step = self.frame_steps[0]
+        for video_position, video_id in track(
+            enumerate(self._video_order),
             desc="Nạp pre-direct CLIP shards",
             total=len(self._video_order),
             unit="video",
@@ -318,9 +410,12 @@ class DirectVideoRetrievalEngine:
             video_dir = videos_root / video_id
             clip_path = video_dir / "clip.npy"
             mapping_path = video_dir / "mapping.jsonl"
+            frame_ids_path = video_dir / "frame_ids.npy"
+            pts_times_path = video_dir / "pts_times.npy"
             marker_path = video_dir / "visual.complete.json"
             if not (clip_path.is_file() and mapping_path.is_file() and marker_path.is_file()):
                 continue
+            artifact_candidates += 1
             try:
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
                 artifact_model = str(marker.get("clip_model") or "")
@@ -328,48 +423,142 @@ class DirectVideoRetrievalEngine:
                     raise ValueError(
                         f"CLIP model artifact={artifact_model!r}, runtime={self.encoder.model_name!r}"
                     )
-                vectors = np.asarray(np.load(clip_path, mmap_mode="r"), dtype=np.float32)
-                mappings = []
-                with mapping_path.open(encoding="utf-8") as stream:
-                    for line in track(
-                        stream,
-                        desc=f"Mapping pre-direct {video_id}",
-                        unit="frame",
-                        nested=True,
-                    ):
-                        payload = json.loads(line)
-                        image = video_dir / str(payload.get("image") or "")
-                        mappings.append(
-                            DirectFrame(
-                                keyframe_number=int(payload["keyframe_number"]),
-                                frame_id=int(payload["frame_id"]),
-                                pts_time=float(payload["pts_time"]),
-                                fps=float(payload.get("fps") or 30.0),
-                                source_path=self._features[video_id],
-                                image_path=image if image.is_file() else None,
-                            )
-                        )
-                if vectors.ndim != 2 or vectors.shape[1] < 1 or len(vectors) != len(mappings):
-                    raise ValueError(f"clip={vectors.shape}, mapping={len(mappings)}")
+                vectors = np.load(clip_path, mmap_mode="r")
+                if frame_ids_path.is_file() and pts_times_path.is_file():
+                    frame_ids = np.load(frame_ids_path, mmap_mode="r")
+                    pts_times = np.load(pts_times_path, mmap_mode="r")
+                else:
+                    legacy_frame_ids: list[int] = []
+                    legacy_pts_times: list[float] = []
+                    with mapping_path.open(encoding="utf-8") as stream:
+                        for line in track(
+                            stream,
+                            desc=f"Mapping pre-direct {video_id}",
+                            unit="frame",
+                            nested=True,
+                        ):
+                            payload = json.loads(line)
+                            legacy_frame_ids.append(int(payload["frame_id"]))
+                            legacy_pts_times.append(float(payload["pts_time"]))
+                    frame_ids = np.asarray(legacy_frame_ids, dtype=np.int64)
+                    pts_times = np.asarray(legacy_pts_times, dtype=np.float32)
+                if vectors.ndim != 2 or vectors.shape[1] < 1:
+                    raise ValueError(f"clip shape không hợp lệ: {vectors.shape}")
+                if embedding_dimension and vectors.shape[1] != embedding_dimension:
+                    raise ValueError(
+                        f"CLIP dimension {vectors.shape[1]} khác shard trước {embedding_dimension}"
+                    )
+                if frame_ids.ndim != 1 or pts_times.ndim != 1:
+                    raise ValueError("frame_ids/pts_times phải là vector 1-D")
+                if len(vectors) != len(frame_ids) or len(vectors) != len(pts_times):
+                    raise ValueError(
+                        f"clip={len(vectors)}, frame_ids={len(frame_ids)}, pts={len(pts_times)}"
+                    )
+                frame_differences = np.diff(frame_ids)
+                if len(frame_ids) and np.any(frame_differences <= 0):
+                    raise ValueError("frame_ids phải tăng nghiêm ngặt")
+                fps = float(marker.get("source_fps") or 30.0)
+                marker_all_frames = bool(
+                    marker.get(
+                        "all_frames",
+                        float(marker.get("sample_fps") or -1) == 0.0,
+                    )
+                )
+                continuous_frames = bool(
+                    len(frame_ids)
+                    and int(frame_ids[0]) == 0
+                    and np.all(frame_differences == 1)
+                )
+                all_frames = marker_all_frames and continuous_frames
+                shard = _PreprocessedShard(
+                    video_id=video_id,
+                    root=video_dir,
+                    source_path=self._features[video_id],
+                    embeddings=vectors,
+                    frame_ids=frame_ids,
+                    pts_times=pts_times,
+                    fps=fps if fps > 0 else 30.0,
+                    all_frames=all_frames,
+                )
+                local_indices = np.flatnonzero(np.asarray(frame_ids) % coarse_step == 0).astype(
+                    np.int32,
+                    copy=False,
+                )
+                if not len(local_indices):
+                    raise ValueError(f"không có frame thỏa frame_id % {coarse_step} == 0")
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 print(f"[warning] Bỏ pre-direct artifact lỗi {video_id}: {error}", flush=True)
                 continue
-            vector_parts.append(vectors)
-            records.extend(mappings)
+            self._preprocessed_shards[video_id] = shard
+            embedding_dimension = int(vectors.shape[1])
+            coarse_entries.append((video_position, video_id, local_indices))
+            coarse_counts[video_position] = len(local_indices)
             loaded_videos += 1
-        if not vector_parts:
+            all_frame_videos += int(all_frames)
+            frame_count += len(vectors)
+        if not coarse_entries:
+            if artifact_candidates:
+                raise DirectVideoUnavailableError(
+                    f"Có {artifact_candidates} pre-direct shard nhưng không shard nào hợp lệ; "
+                    "không fallback sang index khác để tránh query sai corpus. Xem warning phía trên."
+                )
             return False
-        self._embeddings = self._normalize_rows(np.concatenate(vector_parts, axis=0))
-        self._set_records(records)
-        self._preprocessed_video_count = loaded_videos
+        total_coarse = int(coarse_counts.sum())
+        estimated_gib = total_coarse * embedding_dimension * 4 / (1024**3)
         print(
-            f"Đã nạp pre-direct index: {len(records):,} frame từ "
+            f"Direct coarse RAM dự kiến: {total_coarse:,} × {embedding_dimension} float32 "
+            f"≈ {estimated_gib:.2f} GiB.",
+            flush=True,
+        )
+        try:
+            self._coarse_embeddings = np.empty(
+                (total_coarse, embedding_dimension),
+                dtype=np.float32,
+            )
+            self._coarse_video_positions = np.empty(total_coarse, dtype=np.int32)
+            self._coarse_local_indices = np.empty(total_coarse, dtype=np.int32)
+        except MemoryError as error:
+            raise DirectVideoUnavailableError(
+                f"Không đủ RAM cho coarse frame %{coarse_step} (~{estimated_gib:.2f} GiB). "
+                "Khởi động lại với --direct-frame-steps 8,4,2,1 hoặc step đầu lớn hơn."
+            ) from error
+        cursor = 0
+        for video_position, video_id, local_indices in track(
+            coarse_entries,
+            desc=f"Materialize direct frame %{coarse_step}",
+            total=len(coarse_entries),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
+            end = cursor + len(local_indices)
+            shard = self._preprocessed_shards[video_id]
+            self._coarse_embeddings[cursor:end] = self._normalize_rows(
+                np.asarray(shard.embeddings[local_indices], dtype=np.float32)
+            )
+            self._coarse_video_positions[cursor:end] = video_position
+            self._coarse_local_indices[cursor:end] = local_indices
+            cursor = end
+        self._coarse_offsets = np.zeros(len(self._video_order) + 1, dtype=np.int64)
+        self._coarse_offsets[1:] = np.cumsum(coarse_counts)
+        self._preprocessed_video_count = loaded_videos
+        self._preprocessed_all_frame_videos = all_frame_videos
+        self._preprocessed_frame_count = frame_count
+        print(
+            f"Đã nạp pre-direct hierarchy: {frame_count:,} indexed frame · "
+            f"{len(self._coarse_embeddings):,} frame % {coarse_step} trong RAM · "
             f"{loaded_videos:,}/{len(self._video_order):,} video → {self.preprocessed_root}",
             flush=True,
         )
         if loaded_videos < len(self._video_order):
             print(
                 "[warning] Pre-direct index mới là một phần corpus; query chỉ phủ các shard đã hoàn tất.",
+                flush=True,
+            )
+        if all_frame_videos < loaded_videos:
+            print(
+                f"[warning] Chỉ {all_frame_videos:,}/{loaded_videos:,} shard được đánh dấu all-frame; "
+                "refinement %2/%1 không thể phục hồi frame chưa từng precompute.",
                 flush=True,
             )
         return True
@@ -565,6 +754,8 @@ class DirectVideoRetrievalEngine:
         allowed_video_ids: set[str] | None = None,
     ) -> list[_DirectCandidate]:
         self.prepare_runtime()
+        if self._preprocessed_shards:
+            return self._hierarchical_candidates(query_vector, top_k, allowed_video_ids)
         assert self._embeddings is not None
         assert self._offsets is not None
         scores = np.asarray(self._embeddings @ query_vector, dtype=np.float32)
@@ -611,9 +802,189 @@ class DirectVideoRetrievalEngine:
             )
         return candidates
 
+    @staticmethod
+    def _rank_candidates(
+        candidates: Sequence[_DirectCandidate],
+        limit: int,
+        video_positions: dict[str, int],
+    ) -> list[_DirectCandidate]:
+        return sorted(
+            candidates,
+            key=lambda item: (
+                -item.visual_score,
+                video_positions.get(item.video_id, 1 << 30),
+                item.feature_index,
+            ),
+        )[:limit]
+
+    def _score_preprocessed_rows(
+        self,
+        video_id: str,
+        local_indices: np.ndarray,
+        query_vector: np.ndarray,
+    ) -> list[_DirectCandidate]:
+        shard = self._preprocessed_shards[video_id]
+        if not len(local_indices):
+            return []
+        vectors = self._normalize_rows(
+            np.asarray(shard.embeddings[local_indices], dtype=np.float32)
+        )
+        scores = np.asarray(vectors @ query_vector, dtype=np.float32)
+        candidates: list[_DirectCandidate] = []
+        for local_index, score in track(
+            zip(local_indices, scores),
+            desc=f"Ánh xạ direct refine {video_id}",
+            total=len(local_indices),
+            unit="frame",
+            nested=True,
+        ):
+            candidates.append(
+                _DirectCandidate(video_id, int(local_index), float(score))
+            )
+        return candidates
+
+    def _hierarchical_candidates(
+        self,
+        query_vector: np.ndarray,
+        top_k: int,
+        allowed_video_ids: set[str] | None,
+    ) -> list[_DirectCandidate]:
+        """Global %N scan followed by local modulo refinement down to %1."""
+        assert self._coarse_embeddings is not None
+        assert self._coarse_video_positions is not None
+        assert self._coarse_local_indices is not None
+        assert self._coarse_offsets is not None
+        video_positions = {video_id: index for index, video_id in enumerate(self._video_order)}
+        if allowed_video_ids is not None:
+            unknown = allowed_video_ids.difference(self._features)
+            if unknown:
+                raise ValueError(f"Không có video direct: {sorted(unknown)[0]}")
+            coarse_rows: list[np.ndarray] = []
+            for video_id in track(
+                sorted(allowed_video_ids),
+                desc="Lọc coarse direct video",
+                total=len(allowed_video_ids),
+                unit="video",
+                nested=True,
+            ):
+                position = video_positions[video_id]
+                start, end = self._coarse_offsets[position : position + 2]
+                if end > start:
+                    coarse_rows.append(np.arange(int(start), int(end), dtype=np.int64))
+            selected_rows = (
+                np.concatenate(coarse_rows)
+                if coarse_rows
+                else np.empty(0, dtype=np.int64)
+            )
+        else:
+            selected_rows = np.empty(0, dtype=np.int64)
+        coarse_matrix = (
+            self._coarse_embeddings[selected_rows]
+            if allowed_video_ids is not None
+            else self._coarse_embeddings
+        )
+        if not len(coarse_matrix):
+            return []
+
+        coarse_scores = np.asarray(
+            coarse_matrix @ query_vector,
+            dtype=np.float32,
+        )
+        candidate_pool = min(
+            len(coarse_scores),
+            max(self.refine_pool, top_k * 30),
+        )
+        top_positions = self._top_indices(coarse_scores, candidate_pool)
+        current: list[_DirectCandidate] = []
+        for position in track(
+            top_positions,
+            desc=f"Direct coarse frame %{self.frame_steps[0]}",
+            total=len(top_positions),
+            unit="frame",
+            force=True,
+        ):
+            coarse_row = (
+                int(selected_rows[int(position)])
+                if allowed_video_ids is not None
+                else int(position)
+            )
+            video_position = int(self._coarse_video_positions[coarse_row])
+            current.append(
+                _DirectCandidate(
+                    self._video_order[video_position],
+                    int(self._coarse_local_indices[coarse_row]),
+                    float(coarse_scores[int(position)]),
+                )
+            )
+
+        for previous_step, next_step in zip(self.frame_steps, self.frame_steps[1:]):
+            centers_by_video: dict[str, list[int]] = {}
+            for candidate in track(
+                current,
+                desc=f"Nhóm direct %{previous_step}→%{next_step}",
+                total=len(current),
+                unit="frame",
+                nested=True,
+            ):
+                centers_by_video.setdefault(candidate.video_id, []).append(candidate.feature_index)
+            refined: list[_DirectCandidate] = []
+            for video_id, centers in track(
+                sorted(centers_by_video.items()),
+                desc=f"Direct refine frame %{next_step}",
+                total=len(centers_by_video),
+                unit="video",
+                force=True,
+            ):
+                shard = self._preprocessed_shards[video_id]
+                local_indices = temporal_modulo_indices(
+                    shard.frame_ids,
+                    centers,
+                    previous_step,
+                    next_step,
+                )
+                refined.extend(
+                    self._score_preprocessed_rows(video_id, local_indices, query_vector)
+                )
+            current = self._rank_candidates(refined, candidate_pool, video_positions)
+            if not current:
+                break
+        return current
+
     def _mapping(self, video_id: str) -> list[DirectFrame]:
         self.prepare_runtime()
+        shard = self._preprocessed_shards.get(video_id)
+        if shard is not None and video_id not in self._records_by_video:
+            records: list[DirectFrame] = []
+            for local_index in track(
+                range(len(shard.frame_ids)),
+                desc=f"Materialize direct mapping {video_id}",
+                total=len(shard.frame_ids),
+                unit="frame",
+                force=True,
+            ):
+                frame = self._frame_from_local_index(video_id, local_index)
+                if frame is not None:
+                    records.append(frame)
+            self._records_by_video[video_id] = records
         return self._records_by_video.get(video_id, [])
+
+    def _frame_from_local_index(self, video_id: str, local_index: int) -> DirectFrame | None:
+        shard = self._preprocessed_shards.get(video_id)
+        if shard is None:
+            records = self._records_by_video.get(video_id, [])
+            return records[local_index] if 0 <= local_index < len(records) else None
+        if local_index < 0 or local_index >= len(shard.frame_ids):
+            return None
+        frame_id = int(shard.frame_ids[local_index])
+        image = shard.root / "frames" / f"{frame_id:09d}.png"
+        return DirectFrame(
+            keyframe_number=local_index,
+            frame_id=frame_id,
+            pts_time=float(shard.pts_times[local_index]),
+            fps=shard.fps,
+            source_path=shard.source_path,
+            image_path=image if image.is_file() else None,
+        )
 
     def _materialize_frame(self, frame: DirectFrame) -> Path | None:
         if frame.image_path is not None and frame.image_path.is_file():
@@ -643,8 +1014,11 @@ class DirectVideoRetrievalEngine:
         """Materialize one returned frame only when a UI/model needs it."""
         if result.image_path and Path(result.image_path).is_file():
             return result.image_path
-        self._mapping(result.video_id)
-        frame = self._mapping_lookup.get(result.video_id, {}).get(result.keyframe_number)
+        if result.video_id in self._preprocessed_shards:
+            frame = self._frame_from_local_index(result.video_id, result.keyframe_number)
+        else:
+            self._mapping(result.video_id)
+            frame = self._mapping_lookup.get(result.video_id, {}).get(result.keyframe_number)
         if frame is None:
             return None
         image = self._materialize_frame(frame)
@@ -657,10 +1031,10 @@ class DirectVideoRetrievalEngine:
         *,
         materialize_image: bool = False,
     ) -> SearchResult | None:
-        mapping = self._mapping(candidate.video_id)
-        if candidate.feature_index < 0 or candidate.feature_index >= len(mapping):
+        self.prepare_runtime()
+        frame = self._frame_from_local_index(candidate.video_id, candidate.feature_index)
+        if frame is None:
             return None
-        frame = mapping[candidate.feature_index]
         result = SearchResult(
             rank=0,
             video_id=candidate.video_id,
@@ -689,8 +1063,12 @@ class DirectVideoRetrievalEngine:
         ocr_quality: float = 1.0,
         ocr_text: str = "",
     ) -> SearchResult | None:
-        self._mapping(video_id)
-        frame = self._mapping_lookup.get(video_id, {}).get(keyframe_number)
+        self.prepare_runtime()
+        if video_id in self._preprocessed_shards:
+            frame = self._frame_from_local_index(video_id, keyframe_number)
+        else:
+            self._mapping(video_id)
+            frame = self._mapping_lookup.get(video_id, {}).get(keyframe_number)
         if frame is None:
             return None
         result = SearchResult(
@@ -721,13 +1099,20 @@ class DirectVideoRetrievalEngine:
         radius: int = 1,
         query_vector: np.ndarray | None = None,
     ) -> list[tuple[int, SearchResult]]:
-        records = self._mapping(video_id)
-        center = self._mapping_positions.get(video_id, {}).get(keyframe_number)
+        self.prepare_runtime()
+        shard = self._preprocessed_shards.get(video_id)
+        if shard is not None:
+            record_count = len(shard.frame_ids)
+            center = keyframe_number if 0 <= keyframe_number < record_count else None
+        else:
+            records = self._mapping(video_id)
+            record_count = len(records)
+            center = self._mapping_positions.get(video_id, {}).get(keyframe_number)
         if center is None:
             return []
         radius = max(0, min(int(radius), 5))
         start = max(0, center - radius)
-        end = min(len(records), center + radius + 1)
+        end = min(record_count, center + radius + 1)
         output: list[tuple[int, SearchResult]] = []
         for local_index in track(
             range(start, end),
@@ -737,10 +1122,16 @@ class DirectVideoRetrievalEngine:
             nested=True,
         ):
             score = 0.0
-            if query_vector is not None and self._embeddings is not None and self._offsets is not None:
-                position = self._video_order.index(video_id)
-                global_index = int(self._offsets[position]) + local_index
-                score = float(self._embeddings[global_index] @ query_vector)
+            if query_vector is not None:
+                if shard is not None:
+                    vector = self._normalize_rows(
+                        np.asarray(shard.embeddings[local_index : local_index + 1], dtype=np.float32)
+                    )[0]
+                    score = float(vector @ query_vector)
+                elif self._embeddings is not None and self._offsets is not None:
+                    position = self._video_order.index(video_id)
+                    global_index = int(self._offsets[position]) + local_index
+                    score = float(self._embeddings[global_index] @ query_vector)
             result = self._candidate_to_result(
                 _DirectCandidate(video_id, local_index, score),
                 materialize_image=True,
@@ -899,8 +1290,6 @@ class DirectVideoRetrievalEngine:
         if len(clean_events) > 12:
             raise ValueError("Giới hạn 12 mốc để demo phản hồi nhanh.")
         self.prepare_runtime()
-        assert self._embeddings is not None
-        assert self._offsets is not None
         english_events = list(english_events or [])
         event_vectors = [
             self.encoder.encode(event, english_events[index] if index < len(english_events) else "")
@@ -913,6 +1302,10 @@ class DirectVideoRetrievalEngine:
             )
         ]
         vectors = np.stack(event_vectors)
+        if self._preprocessed_shards:
+            return self._search_trake_hierarchical(clean_events, vectors, top_videos)
+        assert self._embeddings is not None
+        assert self._offsets is not None
         candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
         for position, video_id in track(
             enumerate(self._video_order),
@@ -959,6 +1352,140 @@ class DirectVideoRetrievalEngine:
                 result.score = float(event_score)
                 frames.append(result)
             if len(frames) == len(clean_events):
+                output.append(TrakeVideoResult(rank, video_id, score, frames))
+        return output
+
+    def _search_trake_hierarchical(
+        self,
+        events: Sequence[str],
+        event_vectors: np.ndarray,
+        top_videos: int,
+    ) -> list[TrakeVideoResult]:
+        """Retrieve TRAKE videos on %N frames, then align %2/%1 locally."""
+        assert self._coarse_embeddings is not None
+        assert self._coarse_local_indices is not None
+        assert self._coarse_offsets is not None
+        candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
+        for video_position, video_id in track(
+            enumerate(self._video_order),
+            desc=f"TRAKE global frame %{self.frame_steps[0]}",
+            total=len(self._video_order),
+            unit="video",
+            force=True,
+        ):
+            if video_id not in self._preprocessed_shards:
+                continue
+            start, end = self._coarse_offsets[video_position : video_position + 2]
+            if int(end - start) < len(events):
+                continue
+            features = self._coarse_embeddings[int(start) : int(end)]
+            scores = np.asarray(features @ event_vectors.T, dtype=np.float32)
+            alignment = AICRetrievalEngine._ordered_alignment(scores)
+            if alignment is None:
+                continue
+            coarse_positions, best_scores = alignment
+            local_indices = np.asarray(
+                self._coarse_local_indices[int(start) : int(end)][coarse_positions],
+                dtype=np.int32,
+            )
+            sequence_score = 0.72 * float(best_scores.mean()) + 0.28 * float(best_scores.min())
+            candidates.append((sequence_score, video_id, local_indices, best_scores))
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        refine_count = min(
+            len(candidates),
+            max(top_videos, self.trake_refine_videos),
+        )
+        refined_candidates: list[tuple[float, str, np.ndarray, np.ndarray]] = []
+        for _coarse_score, video_id, local_indices, values in track(
+            candidates[:refine_count],
+            desc="TRAKE modulo refinement",
+            total=refine_count,
+            unit="video",
+            force=True,
+        ):
+            shard = self._preprocessed_shards[video_id]
+            selected_indices = np.asarray(local_indices, dtype=np.int32)
+            selected_scores = np.asarray(values, dtype=np.float32)
+            for previous_step, next_step in zip(self.frame_steps, self.frame_steps[1:]):
+                event_frame_indices: list[list[int]] = []
+                event_candidate_scores: list[list[float]] = []
+                for event_index, center in track(
+                    enumerate(selected_indices),
+                    desc=f"TRAKE {video_id} %{next_step}",
+                    total=len(events),
+                    unit="event",
+                    nested=True,
+                ):
+                    candidate_indices = temporal_modulo_indices(
+                        shard.frame_ids,
+                        [int(center)],
+                        previous_step,
+                        next_step,
+                    )
+                    if not len(candidate_indices):
+                        event_frame_indices.append([])
+                        event_candidate_scores.append([])
+                        continue
+                    features = self._normalize_rows(
+                        np.asarray(shard.embeddings[candidate_indices], dtype=np.float32)
+                    )
+                    scores = np.asarray(features @ event_vectors[event_index], dtype=np.float32)
+                    event_frame_indices.append([int(index) for index in candidate_indices])
+                    event_candidate_scores.append([float(score) for score in scores])
+                choices = self._ordered_candidate_alignment(
+                    event_frame_indices,
+                    event_candidate_scores,
+                )
+                if choices is None:
+                    break
+                selected_indices = np.asarray(
+                    [
+                        event_frame_indices[event_index][choice]
+                        for event_index, choice in enumerate(choices)
+                    ],
+                    dtype=np.int32,
+                )
+                selected_scores = np.asarray(
+                    [
+                        event_candidate_scores[event_index][choice]
+                        for event_index, choice in enumerate(choices)
+                    ],
+                    dtype=np.float32,
+                )
+            score = 0.72 * float(selected_scores.mean()) + 0.28 * float(selected_scores.min())
+            refined_candidates.append((score, video_id, selected_indices, selected_scores))
+
+        best_candidates = sorted(
+            refined_candidates,
+            key=lambda item: (-item[0], item[1]),
+        )[:top_videos]
+        output: list[TrakeVideoResult] = []
+        for rank, (score, video_id, indices, values) in track(
+            enumerate(best_candidates, start=1),
+            desc="Dựng hierarchical TRAKE sequences",
+            total=len(best_candidates),
+            unit="video",
+            force=True,
+        ):
+            frames: list[SearchResult] = []
+            for local_index, event_score in track(
+                zip(indices, values),
+                desc=f"Direct TRAKE {video_id}",
+                total=len(indices),
+                unit="event",
+                nested=True,
+            ):
+                result = self._candidate_to_result(
+                    _DirectCandidate(video_id, int(local_index), float(event_score)),
+                    materialize_image=True,
+                )
+                if result is None:
+                    break
+                result.rank = rank
+                result.score = float(event_score)
+                frames.append(result)
+            if len(frames) == len(events):
                 output.append(TrakeVideoResult(rank, video_id, score, frames))
         return output
 

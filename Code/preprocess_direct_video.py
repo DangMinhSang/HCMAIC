@@ -25,7 +25,7 @@ from typing import Any, Iterable, Sequence
 from progress import track
 
 
-DIRECT_PREPROCESS_SCHEMA = 1
+DIRECT_PREPROCESS_SCHEMA = 2
 DEFAULT_OUTPUT_ROOT = Path("/kaggle/working/aic_direct_preprocessed")
 
 
@@ -44,6 +44,8 @@ class VideoArtifacts:
     root: Path
     frames_dir: Path
     mapping: Path
+    frame_ids: Path
+    pts_times: Path
     clip: Path
     objects: Path
     object_scores: Path
@@ -87,6 +89,8 @@ def artifact_paths(output_root: str | Path, video_id: str) -> VideoArtifacts:
         root=root,
         frames_dir=root / "frames",
         mapping=root / "mapping.jsonl",
+        frame_ids=root / "frame_ids.npy",
+        pts_times=root / "pts_times.npy",
         clip=root / "clip.npy",
         objects=root / "objects.jsonl.gz",
         object_scores=root / "object_scores.npy",
@@ -350,6 +354,8 @@ def preprocess_visual_video(
     }
     required = (
         artifacts.mapping,
+        artifacts.frame_ids,
+        artifacts.pts_times,
         artifacts.clip,
         artifacts.objects,
         artifacts.object_scores,
@@ -453,8 +459,11 @@ def preprocess_visual_video(
         clip_image_batch.clear()
         record_batch.clear()
 
-    frame_iter: Iterable[int] = range(frame_count) if frame_count > 0 else count()
+    # CAP_PROP_FRAME_COUNT is only an estimate for some codecs. Decode until
+    # read() fails so all-frame mode never truncates a video at stale metadata.
+    frame_iter: Iterable[int] = count()
     estimated = estimated_sample_count(frame_count, source_fps, sample_fps)
+    decoded_frame_count = 0
     try:
         with gzip.open(object_temporary, "wt", encoding="utf-8") as object_stream:
             for frame_index in track(
@@ -468,6 +477,7 @@ def preprocess_visual_video(
                 ok, bgr = capture.read()
                 if not ok:
                     break
+                decoded_frame_count = frame_index + 1
                 if not sampler.accept(frame_index):
                     continue
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -517,9 +527,26 @@ def preprocess_visual_video(
         ):
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
     clip_temporary = _temporary_path(artifacts.clip)
+    frame_ids_temporary = _temporary_path(artifacts.frame_ids)
+    pts_times_temporary = _temporary_path(artifacts.pts_times)
     object_scores_temporary = _temporary_path(artifacts.object_scores)
+    frame_ids = np.empty(len(mapping_records), dtype=np.int64)
+    pts_times = np.empty(len(mapping_records), dtype=np.float32)
+    for index, record in track(
+        enumerate(mapping_records),
+        desc=f"Đóng gói frame arrays {video_id}",
+        total=len(mapping_records),
+        unit="frame",
+        force=True,
+    ):
+        frame_ids[index] = int(record["frame_id"])
+        pts_times[index] = float(record["pts_time"])
     with clip_temporary.open("wb") as stream:
         np.save(stream, clip_matrix, allow_pickle=False)
+    with frame_ids_temporary.open("wb") as stream:
+        np.save(stream, frame_ids, allow_pickle=False)
+    with pts_times_temporary.open("wb") as stream:
+        np.save(stream, pts_times, allow_pickle=False)
     with object_scores_temporary.open("wb") as stream:
         np.save(stream, object_matrix, allow_pickle=False)
     write_json_atomic(
@@ -527,6 +554,8 @@ def preprocess_visual_video(
         {"schema": DIRECT_PREPROCESS_SCHEMA, "model": object_model, "classes": names},
     )
     mapping_temporary.replace(artifacts.mapping)
+    frame_ids_temporary.replace(artifacts.frame_ids)
+    pts_times_temporary.replace(artifacts.pts_times)
     clip_temporary.replace(artifacts.clip)
     object_scores_temporary.replace(artifacts.object_scores)
     object_temporary.replace(artifacts.objects)
@@ -534,7 +563,12 @@ def preprocess_visual_video(
         **expected,
         "source_video": str(video_path),
         "source_fps": source_fps,
-        "source_frames": frame_count,
+        "source_frames": decoded_frame_count,
+        "reported_source_frames": frame_count,
+        "all_frames": bool(
+            (sample_fps <= 0 or sample_fps >= source_fps)
+            and (frame_count <= 0 or decoded_frame_count >= frame_count)
+        ),
         "estimated_samples": estimated,
         "sampled_frames": len(mapping_records),
         "clip_shape": list(clip_matrix.shape),
@@ -542,6 +576,12 @@ def preprocess_visual_video(
         "generated_at": utc_now(),
     }
     write_json_atomic(artifacts.visual_marker, marker)
+    if sample_fps <= 0 and not marker["all_frames"]:
+        print(
+            f"[warning] {video_id}: decoder dừng ở {decoded_frame_count:,}/"
+            f"{frame_count:,} frame được container báo; marker không được coi là all-frame.",
+            flush=True,
+        )
     print(
         f"Visual {video_id}: {len(mapping_records):,} PNG · CLIP {clip_matrix.shape} · "
         f"object {object_matrix.shape}",
@@ -763,7 +803,13 @@ def finalize_artifacts(
             artifacts = artifact_paths(output_root, video_dir.name)
             visual = read_json(artifacts.visual_marker)
             ocr = read_json(artifacts.ocr_marker)
-            visual_ready = bool(visual and artifacts.clip.is_file() and artifacts.mapping.is_file())
+            visual_ready = bool(
+                visual
+                and artifacts.clip.is_file()
+                and artifacts.mapping.is_file()
+                and artifacts.frame_ids.is_file()
+                and artifacts.pts_times.is_file()
+            )
             ocr_ready = bool(ocr and artifacts.ocr.is_file())
             if visual_ready and artifacts.objects.is_file():
                 object_records += _copy_jsonl_records(artifacts.objects, object_stream)
@@ -774,6 +820,7 @@ def finalize_artifacts(
                 "video_id": video_dir.name,
                 "visual_ready": visual_ready,
                 "ocr_ready": ocr_ready,
+                "all_frames": bool(visual.get("all_frames")),
                 "sampled_frames": int(visual.get("sampled_frames") or 0),
                 "ocr_scene_records": int(ocr.get("scene_text_records") or 0),
                 "updated_at": utc_now(),
@@ -785,12 +832,17 @@ def finalize_artifacts(
     object_temporary.replace(global_objects)
     complete_count = sum(item["visual_ready"] and item["ocr_ready"] for item in manifest_videos)
     visual_count = sum(item["visual_ready"] for item in manifest_videos)
+    all_frame_count = sum(item["visual_ready"] and item["all_frames"] for item in manifest_videos)
     manifest = {
         "schema": DIRECT_PREPROCESS_SCHEMA,
-        "coordinate_system": "video frame_id zero-based; keyframe_number sampled ordinal zero-based",
+        "coordinate_system": (
+            "video frame_id zero-based; keyframe_number artifact row zero-based "
+            "(equals frame_id for complete all-frame decode)"
+        ),
         "video_order": "sorted by video_id; CLI start/end are 1-based inclusive",
         "corpus_videos": window.total,
         "visual_videos": visual_count,
+        "all_frame_videos": all_frame_count,
         "complete_videos": complete_count,
         "ocr_records": ocr_records,
         "object_records": object_records,
@@ -850,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--start-video", type=int, default=1)
     parser.add_argument("--end-video", type=int, default=0)
-    parser.add_argument("--sample-fps", type=float, default=2.0, help="0 means every decoded frame")
+    parser.add_argument("--sample-fps", type=float, default=0.0, help="0 means every decoded frame (default)")
     parser.add_argument("--max-side", type=int, default=0, help="0 preserves original PNG resolution")
     parser.add_argument("--clip-model", default=os.environ.get("AIC_DIRECT_CLIP_MODEL", "ViT-B/32"))
     parser.add_argument("--clip-batch", type=int, default=int(os.environ.get("AIC_DIRECT_VIDEO_BATCH", "64")))

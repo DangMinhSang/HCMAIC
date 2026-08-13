@@ -129,6 +129,9 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_DIRECT_OBJECT_MODEL` | `yolo11m.pt` | YOLO checkpoint cho object preprocessing |
 | `AIC_DIRECT_OBJECT_CONF` | `0.20` | Ngưỡng confidence ghi object box/score |
 | `AIC_DIRECT_CLIP_MASK_OVERLAYS` | `1` | Làm mờ lower-third trong bản ảnh CLIP ở RAM; PNG gốc vẫn được giữ |
+| `AIC_DIRECT_FRAME_STEPS` | `4,2,1` | Query coarse-to-fine: global `frame_id % 4`, local `%2`, cuối cùng mọi frame `%1` |
+| `AIC_DIRECT_REFINE_POOL` | `1200` | Pool KIS tối thiểu được giữ qua các tầng modulo |
+| `AIC_DIRECT_TRAKE_REFINE_VIDEOS` | `50` | Số video TRAKE coarse được tinh chỉnh tới mọi frame |
 | `AIC_RERANKER` | `1` | Bật Qwen3-VL-Reranker |
 | `AIC_RERANKER_CANDIDATES` | `32` | Số ảnh KIS/Q&A Qwen chấm; tăng tối đa 100 |
 | `AIC_RERANKER_BATCH_SIZE` | `2` | Batch T4; OOM tự retry bằng 1 |
@@ -196,18 +199,23 @@ python -u run.py --pre-direct-video 1 \
   --start-pre-video 801 --end-pre-video 0
 ```
 
-Mặc định lấy `2.0` frame/giây. Dùng `--pre-direct-fps 0` nếu thật sự cần mọi
-frame; khối lượng PNG/OCR sẽ tăng rất lớn. `--pre-direct-max-side 0` giữ nguyên
-độ phân giải để ưu tiên OCR; có thể đặt `1280` hoặc `960` nếu shard vượt dung
-lượng Kaggle. `--force-pre-direct` dựng lại artifact dù marker cấu hình đang
-khớp. Output mặc định:
+Mặc định mới là `--pre-direct-fps 0`: decode và tiền xử lý **mọi frame**. Tham
+số FPS vẫn được giữ để chạy thí nghiệm nhỏ, nhưng artifact đã bỏ frame sẽ không
+thể được tầng `%1` phục hồi. `--pre-direct-max-side 0` giữ nguyên độ phân giải
+để ưu tiên OCR; có thể đặt `1280` hoặc `960` nếu shard vượt dung lượng Kaggle.
+`--force-pre-direct` dựng lại artifact dù marker cấu hình đang khớp. Output mặc
+định:
+
+Artifact mới dùng schema v2 và thêm `frame_ids.npy`/`pts_times.npy`. Shard v1
+đã tạo ở mặc định 2 FPS không phải full-frame; chạy lại lệnh pre-direct để nó tự
+nhận marker cũ và rebuild trước khi dùng hierarchy `%4→%2→%1`.
 
 ```text
 /kaggle/working/aic_direct_preprocessed/
 ├── video_order.json, manifest.json, ocr_index.jsonl.gz, object_index.jsonl.gz
 ├── shards/pre_0001_0100.json
 └── videos/L21_V001/
-    ├── frames/*.png, mapping.jsonl
+    ├── frames/*.png, mapping.jsonl, frame_ids.npy, pts_times.npy
     ├── clip.npy
     ├── objects.jsonl.gz, object_scores.npy, object_classes.json
     ├── ocr.jsonl.gz
@@ -216,8 +224,9 @@ khớp. Output mặc định:
 
 Mỗi video được ghi riêng và chỉ có marker sau khi file hoàn tất, nên cell bị
 ngắt có thể chạy lại an toàn. Mọi vòng decode, CLIP, YOLO, OCR và merge đều có
-`tqdm`. Với corpus lớn, nên chia shard 25–100 video, kiểm tra dung lượng rồi lưu
-thư mục output thành Kaggle Dataset trước khi đổi session.
+`tqdm`. Full-frame PNG + OCR + CLIP + object có thể rất lớn: chạy thử video
+`1..3`, đo dung lượng/thời gian thực tế, rồi chia shard khoảng 5–25 video phù
+hợp quota session. Lưu output thành Kaggle Dataset trước khi đổi session.
 
 Sau khi đã có artifact, mở dashboard bằng direct mode:
 
@@ -235,9 +244,19 @@ python run.py
 Direct mode khóa OCR/object/metadata BTC để không trộn sai keyframe id. Nếu có
 artifact direct tương ứng, engine nạp CLIP NPY, scene OCR và object của chính
 sample đó; nếu artifact mới phủ một phần corpus, dashboard cảnh báo và chỉ query
-trên phần đã hoàn tất. `frame_id` là chỉ số decoded frame zero-based của video
-raw; hãy benchmark/đối chiếu convention của BTC trước khi dùng nhánh này để xuất
-submission chính thức.
+trên phần đã hoàn tất. Với artifact full-frame, dashboard chỉ giữ embedding của
+`frame_id % 4 == 0` trong RAM để recall toàn corpus; ứng viên tốt được đọc từ
+CLIP NPY memory-map và mở rộng cục bộ qua `%2`, rồi `%1`. Vì vậy frame cuối có
+thể là bất kỳ frame nào, không bị giới hạn ở bội số 4. Có thể đổi lịch bằng:
+
+```bash
+python run.py --direct-video --direct-frame-steps 8,4,2,1
+```
+
+Step đầu lớn hơn giảm latency/RAM nhưng có thể giảm candidate recall; chỉ giữ
+sau khi benchmark R@1/5/20/50/100 và TRAKE trên Kaggle. `frame_id` là chỉ số
+decoded frame zero-based của video raw; hãy đối chiếu convention của BTC trước
+khi xuất submission chính thức.
 
 ### Đo latency thật trên Kaggle T4
 
