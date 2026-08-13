@@ -9,7 +9,9 @@ an official BTC feature/mapping artifact.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from itertools import count
@@ -20,7 +22,7 @@ import numpy as np
 
 from clip_encoder import ClipTextEncoder
 from progress import track
-from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult
+from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult, tokenize
 
 
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm"})
@@ -41,6 +43,7 @@ class DirectFrame:
     pts_time: float
     fps: float
     source_path: Path
+    image_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -176,12 +179,17 @@ class DirectVideoRetrievalEngine:
         if not self._features:
             raise DirectVideoUnavailableError(f"Không tìm thấy video trong {self.dataset_root}.")
 
-        self.encoder = encoder or ClipTextEncoder()
+        self.encoder = encoder or ClipTextEncoder(
+            model_name=os.environ.get("AIC_DIRECT_CLIP_MODEL", "ViT-B/32")
+        )
         self.sample_stride = self._bounded_int("AIC_DIRECT_VIDEO_STRIDE", 15, 1, 300)
         self.batch_size = self._bounded_int("AIC_DIRECT_VIDEO_BATCH", 64, 1, 256)
         self.max_samples_per_video = self._bounded_int("AIC_DIRECT_VIDEO_MAX_SAMPLES", 0, 0, 1000000)
         runtime_dir = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working")) / "aic_direct_video_cache"
         self.runtime_dir = runtime_dir
+        self.preprocessed_root = Path(
+            os.environ.get("AIC_DIRECT_PREPROCESSED_ROOT", "/kaggle/working/aic_direct_preprocessed")
+        ).expanduser()
         self._cache_path = runtime_dir / f"index_{self._cache_key()}.npz"
         self._frame_cache_dir = runtime_dir / f"frames_{self._cache_key()}"
         self._cv2 = None
@@ -192,6 +200,13 @@ class DirectVideoRetrievalEngine:
         self._mapping_positions: dict[str, dict[int, int]] = {}
         self._offsets: np.ndarray | None = None
         self._video_order = tuple(self._features)
+        self._preprocessed_checked = False
+        self._preprocessed_video_count = 0
+        self._direct_object_cache: dict[str, dict[int, tuple[str, ...]]] = {}
+        self._direct_object_matrices: dict[
+            str,
+            tuple[np.ndarray, tuple[str, ...]] | None,
+        ] = {}
 
     @classmethod
     def from_environment(cls, input_root: str | Path | None = None) -> "DirectVideoRetrievalEngine":
@@ -240,9 +255,14 @@ class DirectVideoRetrievalEngine:
 
     @property
     def source_description(self) -> str:
+        preprocessed = (
+            f" · preprocessed={self._preprocessed_video_count}/{len(self._video_order)} video"
+            if self._preprocessed_video_count
+            else ""
+        )
         return (
             f"{self.source_kind}:{self.dataset_root} · stride={self.sample_stride} frame · "
-            "local CLIP index, không dùng feature/mapping BTC"
+            f"local CLIP index, không dùng feature/mapping BTC{preprocessed}"
         )
 
     def _load_cv2(self):
@@ -262,6 +282,8 @@ class DirectVideoRetrievalEngine:
         """Load the generated index or build it once before serving queries."""
         if self._embeddings is not None:
             return
+        if self._load_preprocessed_index():
+            return
         if self._cache_path.is_file():
             try:
                 self._load_cache()
@@ -273,6 +295,84 @@ class DirectVideoRetrievalEngine:
             except (OSError, ValueError, KeyError) as error:
                 print(f"Direct video cache không hợp lệ ({error}); đang dựng lại…", flush=True)
         self._build_index()
+
+    def _load_preprocessed_index(self) -> bool:
+        """Load shard artifacts produced by ``--pre-direct-video 1``."""
+        if self._preprocessed_checked:
+            return False
+        self._preprocessed_checked = True
+        videos_root = self.preprocessed_root / "videos"
+        if not videos_root.is_dir():
+            return False
+        vector_parts: list[np.ndarray] = []
+        records: list[DirectFrame] = []
+        loaded_videos = 0
+        for video_id in track(
+            self._video_order,
+            desc="Nạp pre-direct CLIP shards",
+            total=len(self._video_order),
+            unit="video",
+            force=True,
+            leave=True,
+        ):
+            video_dir = videos_root / video_id
+            clip_path = video_dir / "clip.npy"
+            mapping_path = video_dir / "mapping.jsonl"
+            marker_path = video_dir / "visual.complete.json"
+            if not (clip_path.is_file() and mapping_path.is_file() and marker_path.is_file()):
+                continue
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                artifact_model = str(marker.get("clip_model") or "")
+                if artifact_model != self.encoder.model_name:
+                    raise ValueError(
+                        f"CLIP model artifact={artifact_model!r}, runtime={self.encoder.model_name!r}"
+                    )
+                vectors = np.asarray(np.load(clip_path, mmap_mode="r"), dtype=np.float32)
+                mappings = []
+                with mapping_path.open(encoding="utf-8") as stream:
+                    for line in track(
+                        stream,
+                        desc=f"Mapping pre-direct {video_id}",
+                        unit="frame",
+                        nested=True,
+                    ):
+                        payload = json.loads(line)
+                        image = video_dir / str(payload.get("image") or "")
+                        mappings.append(
+                            DirectFrame(
+                                keyframe_number=int(payload["keyframe_number"]),
+                                frame_id=int(payload["frame_id"]),
+                                pts_time=float(payload["pts_time"]),
+                                fps=float(payload.get("fps") or 30.0),
+                                source_path=self._features[video_id],
+                                image_path=image if image.is_file() else None,
+                            )
+                        )
+                if vectors.ndim != 2 or vectors.shape[1] < 1 or len(vectors) != len(mappings):
+                    raise ValueError(f"clip={vectors.shape}, mapping={len(mappings)}")
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                print(f"[warning] Bỏ pre-direct artifact lỗi {video_id}: {error}", flush=True)
+                continue
+            vector_parts.append(vectors)
+            records.extend(mappings)
+            loaded_videos += 1
+        if not vector_parts:
+            return False
+        self._embeddings = self._normalize_rows(np.concatenate(vector_parts, axis=0))
+        self._set_records(records)
+        self._preprocessed_video_count = loaded_videos
+        print(
+            f"Đã nạp pre-direct index: {len(records):,} frame từ "
+            f"{loaded_videos:,}/{len(self._video_order):,} video → {self.preprocessed_root}",
+            flush=True,
+        )
+        if loaded_videos < len(self._video_order):
+            print(
+                "[warning] Pre-direct index mới là một phần corpus; query chỉ phủ các shard đã hoàn tất.",
+                flush=True,
+            )
+        return True
 
     def _load_cache(self) -> None:
         with np.load(self._cache_path, allow_pickle=False) as payload:
@@ -516,6 +616,8 @@ class DirectVideoRetrievalEngine:
         return self._records_by_video.get(video_id, [])
 
     def _materialize_frame(self, frame: DirectFrame) -> Path | None:
+        if frame.image_path is not None and frame.image_path.is_file():
+            return frame.image_path
         target = self._frame_cache_dir / frame.source_path.stem / f"{frame.frame_id:08d}.jpg"
         if target.is_file():
             return target
@@ -570,6 +672,7 @@ class DirectVideoRetrievalEngine:
             score=candidate.visual_score,
             retrieval_score=candidate.visual_score,
             title=f"Raw video {candidate.video_id}",
+            image_path=(str(frame.image_path) if frame.image_path is not None and frame.image_path.is_file() else None),
             video_path=str(frame.source_path),
         )
         if materialize_image:
@@ -601,6 +704,7 @@ class DirectVideoRetrievalEngine:
             score=score,
             retrieval_score=score,
             title=f"Raw video {video_id}",
+            image_path=(str(frame.image_path) if frame.image_path is not None and frame.image_path.is_file() else None),
             video_path=str(frame.source_path),
             ocr_score=ocr_score,
             ocr_quality=ocr_quality,
@@ -644,6 +748,64 @@ class DirectVideoRetrievalEngine:
             if result is not None:
                 output.append((local_index, result))
         return output
+
+    def _preprocessed_object_labels(self, video_id: str, keyframe_number: int) -> tuple[str, ...]:
+        cached = self._direct_object_cache.setdefault(video_id, {})
+        if keyframe_number in cached:
+            return cached[keyframe_number]
+        matrix_bundle = self._direct_object_matrices.get(video_id)
+        if video_id not in self._direct_object_matrices:
+            video_root = self.preprocessed_root / "videos" / video_id
+            scores_path = video_root / "object_scores.npy"
+            classes_path = video_root / "object_classes.json"
+            try:
+                class_payload = json.loads(classes_path.read_text(encoding="utf-8"))
+                class_map = {
+                    int(index): str(label)
+                    for index, label in dict(class_payload.get("classes") or {}).items()
+                }
+                scores = np.load(scores_path, mmap_mode="r")
+                if scores.ndim != 2 or scores.shape[1] < 1:
+                    raise ValueError(f"object score shape không hợp lệ: {scores.shape}")
+                labels = tuple(class_map.get(index, str(index)) for index in range(scores.shape[1]))
+                matrix_bundle = (scores, labels)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                matrix_bundle = None
+            self._direct_object_matrices[video_id] = matrix_bundle
+        if matrix_bundle is not None:
+            scores, labels = matrix_bundle
+            if 0 <= keyframe_number < len(scores):
+                row = np.asarray(scores[keyframe_number], dtype=np.float32)
+                indices = np.flatnonzero(row > 0)
+                indices = indices[np.argsort(row[indices])[::-1]]
+                matched = tuple(labels[int(index)] for index in indices)
+                cached[keyframe_number] = matched
+                return matched
+
+        # Compatibility fallback for early artifacts that contain detailed
+        # JSON boxes but predate the dense score matrix.
+        path = self.preprocessed_root / "videos" / video_id / "objects.jsonl.gz"
+        if path.is_file():
+            try:
+                with gzip.open(path, "rt", encoding="utf-8") as stream:
+                    for line in track(
+                        stream,
+                        desc=f"Đọc direct objects {video_id}",
+                        unit="frame",
+                        nested=True,
+                    ):
+                        payload = json.loads(line)
+                        labels = tuple(
+                            dict.fromkeys(
+                                str(item.get("label") or "").strip()
+                                for item in payload.get("objects", [])
+                                if str(item.get("label") or "").strip()
+                            )
+                        )
+                        cached[int(payload["keyframe_number"])] = labels
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return ()
+        return cached.get(keyframe_number, ())
 
     def search(
         self,
@@ -694,6 +856,34 @@ class DirectVideoRetrievalEngine:
             chosen.append(result)
             if len(chosen) == top_k:
                 break
+        translated = getattr(getattr(self.encoder, "last_query", None), "text_for_model", "")
+        query_tokens = set(tokenize(f"{query} {english_expansion} {translated}"))
+        for result in track(
+            chosen,
+            desc="Gắn direct object labels",
+            total=len(chosen),
+            unit="frame",
+            nested=True,
+        ):
+            result.object_labels = self._preprocessed_object_labels(
+                result.video_id,
+                result.keyframe_number,
+            )
+            result.object_score = AICRetrievalEngine._object_match_score(
+                result.object_labels,
+                query_tokens,
+            )
+            result.score += 0.03 * result.object_score
+            result.retrieval_score = result.score
+        chosen.sort(key=lambda item: item.score, reverse=True)
+        for rank, result in track(
+            enumerate(chosen, start=1),
+            desc="Xếp hạng direct object",
+            total=len(chosen),
+            unit="frame",
+            nested=True,
+        ):
+            result.rank = rank
         return chosen
 
     def search_trake(

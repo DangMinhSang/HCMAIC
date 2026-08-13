@@ -1,5 +1,6 @@
 # Large AIC assets are attached as Kaggle inputs; never commit or download them.
 *.npy
+*.pt
 *.mp4
 *.jpg
 *.jpeg
@@ -7,6 +8,7 @@ data/
 datasets/
 input/
 aic_ocr_index.jsonl
+aic_direct_preprocessed/
 
 # Runtime/model caches
 .cache/

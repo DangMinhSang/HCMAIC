@@ -23,10 +23,12 @@ Trước khi mở dashboard, launcher làm trước toàn bộ phần không ph�
 7. Chỉ sau đó mới mở Gradio share URL.
 
 Direct-video là một pipeline độc lập, mặc định **tắt**. Khi bật, hệ thống đọc
-MP4 từ `/kaggle/input/datasets/doanminhtuan/video-aic`, tự lấy frame và tự tạo
-CLIP index tại `/kaggle/working/aic_direct_video_cache`; nó không đọc feature,
-mapping, keyframe gallery hay OCR index do BTC cung cấp. Chỉ khi mount không có
-video, resolver mới fallback sang `kagglehub.dataset_download("doanminhtuan/video-aic")`.
+MP4 từ `/kaggle/input/datasets/doanminhtuan/video-aic`; nó không đọc feature,
+mapping, keyframe gallery hay OCR index do BTC cung cấp. Có thể dựng trước PNG,
+CLIP embedding, PaddleOCR scene-text và YOLO object theo từng shard video để
+query chỉ nạp NPY/index vào RAM. Nếu chưa có artifact, direct mode vẫn có thể tự
+tạo local CLIP cache cũ. Chỉ khi mount raw video không tồn tại, resolver mới
+fallback sang `kagglehub.dataset_download("doanminhtuan/video-aic")`.
 
 Hot path của KIS/Q&A:
 
@@ -119,9 +121,14 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_PRELOAD_FEATURES` | `1` | Giữ ma trận CLIP đã chuẩn hóa trong RAM |
 | `AIC_DIRECT_VIDEO` | `0` | Bật pipeline raw video; tương đương `python run.py --direct-video` |
 | `AIC_DIRECT_VIDEO_ROOT` | `/kaggle/input/datasets/doanminhtuan/video-aic` | Override thư mục video direct |
+| `AIC_DIRECT_PREPROCESSED_ROOT` | `/kaggle/working/aic_direct_preprocessed` | Root chứa PNG/NPY/OCR/Object đã dựng bằng `--pre-direct-video 1` |
 | `AIC_DIRECT_VIDEO_STRIDE` | `15` | Lấy một frame mỗi N frame khi tạo local index; nhỏ hơn tăng recall và startup |
 | `AIC_DIRECT_VIDEO_BATCH` | `64` | Batch ảnh tự encode CLIP khi precompute |
 | `AIC_DIRECT_VIDEO_MAX_SAMPLES` | `0` | Giới hạn sample/video để thử nhanh; `0` là không giới hạn |
+| `AIC_DIRECT_CLIP_MODEL` | `ViT-B/32` | Checkpoint dùng đồng nhất lúc dựng image embedding và lúc encode query |
+| `AIC_DIRECT_OBJECT_MODEL` | `yolo11m.pt` | YOLO checkpoint cho object preprocessing |
+| `AIC_DIRECT_OBJECT_CONF` | `0.20` | Ngưỡng confidence ghi object box/score |
+| `AIC_DIRECT_CLIP_MASK_OVERLAYS` | `1` | Làm mờ lower-third trong bản ảnh CLIP ở RAM; PNG gốc vẫn được giữ |
 | `AIC_RERANKER` | `1` | Bật Qwen3-VL-Reranker |
 | `AIC_RERANKER_CANDIDATES` | `32` | Số ảnh KIS/Q&A Qwen chấm; tăng tối đa 100 |
 | `AIC_RERANKER_BATCH_SIZE` | `2` | Batch T4; OOM tự retry bằng 1 |
@@ -171,22 +178,66 @@ python run.py
 
 ### Chạy thử pipeline lấy trực tiếp từ video
 
-```bash
-# Mặc định không bật. Dataset đã mount nên lệnh này không tải lại dữ liệu.
-python run.py --direct-video
+Tiền xử lý theo thứ tự `video_id` đã sort. `start/end` là chỉ số **1-based,
+inclusive**; `end=0` nghĩa là video cuối. Lệnh chạy đủ ba stage visual → OCR →
+finalize rồi thoát, không mở dashboard:
 
-# Hoặc bật bằng biến môi trường; cache local sẽ được dùng ở các lần sau.
+```bash
+# Shard đầu: video thứ 1 đến 100 (bao gồm cả hai đầu).
+python -u run.py --pre-direct-video 1 \
+  --start-pre-video 1 --end-pre-video 100
+
+# Chạy tiếp shard khác trong cùng output root; video đã hoàn tất sẽ được resume/skip.
+python -u run.py --pre-direct-video 1 \
+  --start-pre-video 101 --end-pre-video 200
+
+# Từ video 801 tới cuối corpus.
+python -u run.py --pre-direct-video 1 \
+  --start-pre-video 801 --end-pre-video 0
+```
+
+Mặc định lấy `2.0` frame/giây. Dùng `--pre-direct-fps 0` nếu thật sự cần mọi
+frame; khối lượng PNG/OCR sẽ tăng rất lớn. `--pre-direct-max-side 0` giữ nguyên
+độ phân giải để ưu tiên OCR; có thể đặt `1280` hoặc `960` nếu shard vượt dung
+lượng Kaggle. `--force-pre-direct` dựng lại artifact dù marker cấu hình đang
+khớp. Output mặc định:
+
+```text
+/kaggle/working/aic_direct_preprocessed/
+├── video_order.json, manifest.json, ocr_index.jsonl.gz, object_index.jsonl.gz
+├── shards/pre_0001_0100.json
+└── videos/L21_V001/
+    ├── frames/*.png, mapping.jsonl
+    ├── clip.npy
+    ├── objects.jsonl.gz, object_scores.npy, object_classes.json
+    ├── ocr.jsonl.gz
+    └── visual.complete.json, ocr.complete.json, complete.json
+```
+
+Mỗi video được ghi riêng và chỉ có marker sau khi file hoàn tất, nên cell bị
+ngắt có thể chạy lại an toàn. Mọi vòng decode, CLIP, YOLO, OCR và merge đều có
+`tqdm`. Với corpus lớn, nên chia shard 25–100 video, kiểm tra dung lượng rồi lưu
+thư mục output thành Kaggle Dataset trước khi đổi session.
+
+Sau khi đã có artifact, mở dashboard bằng direct mode:
+
+```bash
+# Cùng session preprocessing.
+python run.py --direct-video \
+  --pre-direct-output /kaggle/working/aic_direct_preprocessed
+
+# Hoặc artifact đã được mount lại như một Kaggle Input.
 export AIC_DIRECT_VIDEO=1
-export AIC_DIRECT_VIDEO_STRIDE=15
+export AIC_DIRECT_PREPROCESSED_ROOT=/kaggle/input/my-direct-artifacts/aic_direct_preprocessed
 python run.py
 ```
 
-Direct mode hiện là nhánh thử nghiệm visual-only: OCR/object/metadata BTC bị
-khóa để không trộn sai keyframe id với frame OpenCV. `frame_id` là chỉ số frame
-decoded zero-based của video raw; hãy benchmark/đối chiếu convention của BTC
-trước khi dùng nhánh này để xuất submission chính thức. TRAKE vẫn giữ thứ tự
-thời gian và local refinement, còn ảnh candidate được giải mã lười để giảm
-disk/startup.
+Direct mode khóa OCR/object/metadata BTC để không trộn sai keyframe id. Nếu có
+artifact direct tương ứng, engine nạp CLIP NPY, scene OCR và object của chính
+sample đó; nếu artifact mới phủ một phần corpus, dashboard cảnh báo và chỉ query
+trên phần đã hoàn tất. `frame_id` là chỉ số decoded frame zero-based của video
+raw; hãy benchmark/đối chiếu convention của BTC trước khi dùng nhánh này để xuất
+submission chính thức.
 
 ### Đo latency thật trên Kaggle T4
 

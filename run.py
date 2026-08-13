@@ -33,6 +33,7 @@ RUNTIME_DIR = Path(os.environ.get("AIC_RUNTIME_DIR", "/kaggle/working"))
 RERANKER_REQUIREMENTS = CODE / "requirements-reranker.txt"
 QUERY_ANALYZER_REQUIREMENTS = CODE / "requirements-query-analyzer.txt"
 DIRECT_VIDEO_REQUIREMENTS = CODE / "requirements-direct-video.txt"
+DIRECT_VIDEO_PREPROCESS_REQUIREMENTS = CODE / "requirements-direct-video-preprocess.txt"
 # Kaggle's CPython image has no ``ensurepip``, so a virtualenv cannot be
 # bootstrapped reliably there.  Keep Paddle packages in this private directory
 # and expose it only to the pre-OCR subprocess via PYTHONPATH.
@@ -52,6 +53,7 @@ STALE_MODULES = (
     "query_analyzer",
     "multimodal_reranker",
     "direct_video_retrieval",
+    "preprocess_direct_video",
     "ranking",
     "progress",
 )
@@ -150,17 +152,28 @@ def install_direct_video_requirements() -> None:
     install_if_changed(DIRECT_VIDEO_REQUIREMENTS, ".aic_direct_video_requirements.sha256")
 
 
+def install_direct_video_preprocess_requirements() -> None:
+    """Install the object detector only for the offline raw-video job."""
+    install_if_changed(
+        DIRECT_VIDEO_PREPROCESS_REQUIREMENTS,
+        ".aic_direct_video_preprocess_requirements.sha256",
+    )
+
+
 def install_requirements(
     build_ocr: bool,
     enable_qwen_stack: bool = True,
     enable_query_analyzer: bool = True,
     enable_direct_video: bool = False,
+    enable_direct_preprocess: bool = False,
 ) -> None:
     install_if_changed(CODE / "requirements.txt", ".aic_requirements.sha256")
     if enable_query_analyzer:
         install_query_analyzer_requirements()
     if enable_direct_video:
         install_direct_video_requirements()
+    if enable_direct_preprocess:
+        install_direct_video_preprocess_requirements()
     if enable_qwen_stack:
         install_reranker_requirements()
 
@@ -325,6 +338,44 @@ def parse_arguments() -> argparse.Namespace:
             "không dùng feature/mapping BTC"
         ),
     )
+    parser.add_argument(
+        "--pre-direct-video",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        metavar="{0,1}",
+        help="1: cắt PNG + CLIP NPY + object + OCR theo shard rồi thoát; mặc định 0",
+    )
+    parser.add_argument(
+        "--start-pre-video",
+        type=int,
+        default=1,
+        help="Video đầu tiên trong thứ tự video_id, 1-based và inclusive",
+    )
+    parser.add_argument(
+        "--end-pre-video",
+        type=int,
+        default=0,
+        help="Video cuối, 1-based và inclusive; 0 nghĩa là tới video cuối corpus",
+    )
+    parser.add_argument(
+        "--pre-direct-fps",
+        type=float,
+        default=2.0,
+        help="Số frame/giây cần lưu; 0 nghĩa là lưu mọi frame",
+    )
+    parser.add_argument(
+        "--pre-direct-output",
+        type=Path,
+        default=Path("/kaggle/working/aic_direct_preprocessed"),
+    )
+    parser.add_argument(
+        "--pre-direct-max-side",
+        type=int,
+        default=0,
+        help="Resize PNG theo cạnh dài; 0 giữ nguyên độ phân giải",
+    )
+    parser.add_argument("--force-pre-direct", action="store_true", help="Tạo lại video đã có marker hoàn tất")
     parser.add_argument("--no-reranker", action="store_true", help="Không cài/chạy Qwen multimodal reranker")
     parser.add_argument("--vilt-vqa", action="store_true", help="Dùng ViLT nhẹ thay cho Qwen3-VL VQA")
     return parser.parse_args()
@@ -342,9 +393,13 @@ def warmup_dashboard(reranker_enabled: bool, direct_video_enabled: bool = False)
     engine.prepare_runtime()
     ocr_index = dashboard.get_ocr_index()
     if direct_video_enabled:
+        direct_ocr = (
+            Path(os.environ.get("AIC_DIRECT_PREPROCESSED_ROOT", "")) / "ocr_index.jsonl.gz"
+        )
         print(
-            "Direct-video mode: bỏ qua OCR index/features BTC; "
-            f"đã sẵn sàng {engine.vector_count:,} sampled frames.",
+            "Direct-video mode: bỏ qua features/OCR BTC; "
+            f"đã sẵn sàng {engine.vector_count:,} sampled frames · "
+            f"direct OCR={'đã nạp' if ocr_index else ('chưa có' if not direct_ocr.is_file() else 'rỗng')}.",
             flush=True,
         )
     print("Đang tải query analyzer nhẹ trước query đầu tiên…", flush=True)
@@ -389,12 +444,23 @@ def warmup_dashboard(reranker_enabled: bool, direct_video_enabled: bool = False)
 
 def main() -> None:
     arguments = parse_arguments()
-    direct_video_enabled = arguments.direct_video or os.environ.get("AIC_DIRECT_VIDEO", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    pre_direct_enabled = arguments.pre_direct_video == 1
+    if pre_direct_enabled:
+        if arguments.start_pre_video < 1:
+            raise ValueError("--start-pre-video dùng chỉ số 1-based và phải >= 1.")
+        if arguments.end_pre_video != 0 and arguments.end_pre_video < arguments.start_pre_video:
+            raise ValueError(
+                "--end-pre-video phải >= --start-pre-video; dùng 0 để chạy tới video cuối."
+            )
+        if arguments.pre_direct_fps < 0:
+            raise ValueError("--pre-direct-fps phải >= 0; dùng 0 để lấy tất cả frame.")
+        if arguments.pre_direct_max_side < 0:
+            raise ValueError("--pre-direct-max-side phải >= 0.")
+    direct_video_enabled = (
+        arguments.direct_video
+        or pre_direct_enabled
+        or os.environ.get("AIC_DIRECT_VIDEO", "0").lower() in {"1", "true", "yes", "on"}
+    )
     if direct_video_enabled:
         os.environ["AIC_DIRECT_VIDEO"] = "1"
         if arguments.pre_ocr or arguments.build_ocr:
@@ -449,6 +515,7 @@ def main() -> None:
     reranker_enabled = (
         not arguments.no_reranker
         and not arguments.pre_ocr
+        and not pre_direct_enabled
         and os.environ.get("AIC_RERANKER", "1").lower() not in {"0", "false", "no"}
     )
     if arguments.vilt_vqa:
@@ -457,18 +524,21 @@ def main() -> None:
     default_vqa_backend = "qwen" if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") else "vilt"
     qwen_vqa_enabled = (
         not arguments.pre_ocr
+        and not pre_direct_enabled
         and preload_vqa
         and os.environ.get("AIC_VQA_BACKEND", default_vqa_backend).lower() == "qwen"
     )
     install_requirements(
         build_ocr,
         reranker_enabled or qwen_vqa_enabled,
-        enable_query_analyzer=not arguments.pre_ocr,
+        enable_query_analyzer=not arguments.pre_ocr and not pre_direct_enabled,
         enable_direct_video=direct_video_enabled,
+        enable_direct_preprocess=pre_direct_enabled,
     )
 
     os.environ["AIC_DATA_ROOT"] = str(Path(arguments.data_root).expanduser())
     os.environ["AIC_OCR_INDEX"] = str(arguments.ocr_index)
+    os.environ["AIC_DIRECT_PREPROCESSED_ROOT"] = str(arguments.pre_direct_output.expanduser())
     os.environ["AIC_PRELOAD_FEATURES"] = "0" if arguments.no_preload_features or direct_video_enabled else "1"
     os.environ["AIC_RERANKER"] = "1" if reranker_enabled else "0"
     # Keep site-packages ahead of the app directory. The project has a
@@ -479,6 +549,40 @@ def main() -> None:
     while code_path in sys.path:
         sys.path.remove(code_path)
     sys.path.append(code_path)
+
+    if pre_direct_enabled:
+        common = [
+            sys.executable,
+            str(CODE / "preprocess_direct_video.py"),
+            "--output",
+            str(arguments.pre_direct_output.expanduser()),
+            "--start-video",
+            str(arguments.start_pre_video),
+            "--end-video",
+            str(arguments.end_pre_video),
+            "--sample-fps",
+            str(arguments.pre_direct_fps),
+            "--max-side",
+            str(arguments.pre_direct_max_side),
+        ]
+        if arguments.force_pre_direct:
+            common.append("--force")
+        print("Direct preprocess 1/3: cắt PNG, CLIP embedding và YOLO object…", flush=True)
+        command([*common, "--stage", "visual"])
+        print("Direct preprocess 2/3: PaddleOCR scene-text, loại TV overlay…", flush=True)
+        ocr_env = ensure_paddle_ocr_packages()
+        command(
+            [*common, "--stage", "ocr", "--ocr-device", arguments.ocr_device],
+            env=ocr_env,
+        )
+        print("Direct preprocess 3/3: hợp nhất manifest/OCR/object index…", flush=True)
+        command([*common, "--stage", "finalize"])
+        print(
+            f"Pre-direct-video hoàn tất đoạn [{arguments.start_pre_video}, "
+            f"{arguments.end_pre_video or 'cuối'}] → {arguments.pre_direct_output.expanduser()}",
+            flush=True,
+        )
+        return
 
     if build_ocr:
         if not arguments.ocr_device.startswith("gpu"):
@@ -510,7 +614,8 @@ def main() -> None:
         print("Direct video root:", engine.dataset_root, flush=True)
         print("Direct sampled vectors:", f"{engine.vector_count:,}", flush=True)
         print("BTC features/mapping:", "tắt trong direct-video mode", flush=True)
-        print("OCR index:", "tắt trong direct-video mode", flush=True)
+        direct_ocr_path = Path(os.environ["AIC_DIRECT_PREPROCESSED_ROOT"]) / "ocr_index.jsonl.gz"
+        print("Direct OCR index:", direct_ocr_path if direct_ocr_path.is_file() else "chưa có", flush=True)
     else:
         from data_paths import AICPaths
 

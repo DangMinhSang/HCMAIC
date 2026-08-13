@@ -280,18 +280,24 @@ def get_ocr_index() -> OCRMemoryIndex | None:
     """Load text-only OCR postings into RAM once, before the first query."""
     global OCR_INDEX, OCR_INDEX_LOADED
     with ENGINE_LOCK:
-        if direct_video_enabled():
-            # The BTC OCR index is keyed by the supplied keyframe mapping and
-            # must never be mixed with OpenCV frame ids from the raw-video path.
-            OCR_INDEX = None
-            OCR_INDEX_LOADED = True
-            return None
         if OCR_INDEX_LOADED:
             return OCR_INDEX
         OCR_INDEX_LOADED = True
-        configured = os.environ.get("AIC_OCR_INDEX")
-        default_path = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
-        index_path = Path(configured) if configured else default_path
+        if direct_video_enabled():
+            # Direct OCR is generated against the exact sampled-frame ordinal
+            # used by DirectVideoRetrievalEngine. Never mix it with the BTC
+            # keyframe index, whose coordinates belong to a different mapping.
+            direct_root = Path(
+                os.environ.get(
+                    "AIC_DIRECT_PREPROCESSED_ROOT",
+                    "/kaggle/working/aic_direct_preprocessed",
+                )
+            ).expanduser()
+            index_path = direct_root / "ocr_index.jsonl.gz"
+        else:
+            configured = os.environ.get("AIC_OCR_INDEX")
+            default_path = Path("/kaggle/working/aic_ocr_index.jsonl.gz")
+            index_path = Path(configured) if configured else default_path
         if index_path.is_file():
             OCR_INDEX = OCRMemoryIndex.load(index_path)
             if OCR_INDEX.legacy_record_count:
@@ -748,7 +754,7 @@ def make_kis_results(
             ocr_note += f" · legacy filter: {ocr_index.legacy_record_count:,} record"
     else:
         ocr_note = (
-            "Direct-video: OCR BTC tắt, score hiện tại từ local CLIP"
+            "Direct-video: chưa có direct OCR; score hiện tại từ local CLIP/object"
             if direct_video_enabled()
             else "OCR index chưa được nạp."
         )
