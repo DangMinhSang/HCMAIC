@@ -13,6 +13,8 @@ import gzip
 import hashlib
 import json
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
@@ -28,6 +30,7 @@ from retrieval import AICRetrievalEngine, SearchResult, TrakeVideoResult, tokeni
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".avi", ".mov", ".webm"})
 DEFAULT_DATASET_ID = "doanminhtuan/video-aic"
 DEFAULT_MOUNT_ROOT = Path("/kaggle/input/datasets/doanminhtuan/video-aic")
+DIRECT_ARTIFACT_SCHEMA = 3
 
 
 class DirectVideoUnavailableError(RuntimeError):
@@ -264,6 +267,9 @@ class DirectVideoRetrievalEngine:
         ).expanduser()
         self._cache_path = runtime_dir / f"index_{self._cache_key()}.npz"
         self._frame_cache_dir = runtime_dir / f"frames_{self._cache_key()}"
+        self.frame_cache_max = self._bounded_int("AIC_DIRECT_FRAME_CACHE_MAX", 512, 1, 5000)
+        self._frame_cache_lock = threading.Lock()
+        self._frame_cache_lru: OrderedDict[Path, None] | None = None
         self._cv2 = None
         self._embeddings: np.ndarray | None = None
         self._records: list[DirectFrame] = []
@@ -418,6 +424,14 @@ class DirectVideoRetrievalEngine:
             artifact_candidates += 1
             try:
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                artifact_schema = int(marker.get("schema") or 0)
+                if artifact_schema != DIRECT_ARTIFACT_SCHEMA:
+                    raise ValueError(
+                        f"artifact schema={artifact_schema}, cần schema={DIRECT_ARTIFACT_SCHEMA}; "
+                        "chạy lại --pre-direct-video 1 để migrate không cần rerun model"
+                    )
+                if marker.get("stores_frame_images") is not False:
+                    raise ValueError("artifact chưa khai báo chế độ không lưu frame image")
                 artifact_model = str(marker.get("clip_model") or "")
                 if artifact_model != self.encoder.model_name:
                     raise ValueError(
@@ -976,53 +990,162 @@ class DirectVideoRetrievalEngine:
         if local_index < 0 or local_index >= len(shard.frame_ids):
             return None
         frame_id = int(shard.frame_ids[local_index])
-        image = shard.root / "frames" / f"{frame_id:09d}.png"
         return DirectFrame(
             keyframe_number=local_index,
             frame_id=frame_id,
             pts_time=float(shard.pts_times[local_index]),
             fps=shard.fps,
             source_path=shard.source_path,
-            image_path=image if image.is_file() else None,
+            image_path=None,
         )
+
+    def _touch_frame_cache(self, preserve: Path) -> None:
+        """Maintain an in-memory LRU and a bounded on-demand JPEG directory."""
+        if self._frame_cache_lru is None:
+            def modified_time(path: Path) -> int:
+                try:
+                    return path.stat().st_mtime_ns
+                except OSError:
+                    return 0
+
+            cached = sorted(self._frame_cache_dir.glob("*/*.jpg"), key=modified_time)
+            self._frame_cache_lru = OrderedDict((path, None) for path in cached)
+        self._frame_cache_lru.pop(preserve, None)
+        self._frame_cache_lru[preserve] = None
+        overflow = max(0, len(self._frame_cache_lru) - self.frame_cache_max)
+        for _index in track(
+            range(overflow),
+            desc="Giới hạn direct frame cache",
+            total=overflow,
+            unit="frame",
+            nested=True,
+        ):
+            oldest, _value = self._frame_cache_lru.popitem(last=False)
+            oldest.unlink(missing_ok=True)
 
     def _materialize_frame(self, frame: DirectFrame) -> Path | None:
         if frame.image_path is not None and frame.image_path.is_file():
             return frame.image_path
         target = self._frame_cache_dir / frame.source_path.stem / f"{frame.frame_id:08d}.jpg"
-        if target.is_file():
-            return target
-        cv2 = self._load_cv2()
-        capture = cv2.VideoCapture(str(frame.source_path))
-        try:
-            if not capture.isOpened():
-                return None
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame.frame_id)
-            ok, bgr = capture.read()
-            if not ok:
-                return None
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_suffix(".tmp.jpg")
-            if not cv2.imwrite(str(temporary), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
-                return None
-            temporary.replace(target)
-            return target
-        finally:
-            capture.release()
+        with self._frame_cache_lock:
+            if target.is_file():
+                target.touch()
+                self._touch_frame_cache(target)
+                return target
+            cv2 = self._load_cv2()
+            capture = cv2.VideoCapture(str(frame.source_path))
+            try:
+                if not capture.isOpened():
+                    return None
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame.frame_id)
+                ok, bgr = capture.read()
+                if not ok:
+                    return None
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_suffix(".tmp.jpg")
+                if not cv2.imwrite(str(temporary), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
+                    return None
+                temporary.replace(target)
+                self._touch_frame_cache(target)
+                return target
+            finally:
+                capture.release()
+
+    def _frame_for_result(self, result: SearchResult) -> DirectFrame | None:
+        if result.video_id in self._preprocessed_shards:
+            return self._frame_from_local_index(result.video_id, result.keyframe_number)
+        self._mapping(result.video_id)
+        return self._mapping_lookup.get(result.video_id, {}).get(result.keyframe_number)
+
+    def ensure_result_images(self, results: Sequence[SearchResult]) -> None:
+        """Seek many requested frames with at most one open decoder per video."""
+        grouped: dict[Path, dict[int, tuple[DirectFrame, list[SearchResult]]]] = {}
+        for result in track(
+            results,
+            desc="Nhóm direct frame cần giải mã",
+            total=len(results),
+            unit="frame",
+            nested=True,
+        ):
+            if result.image_path and Path(result.image_path).is_file():
+                continue
+            frame = self._frame_for_result(result)
+            if frame is None:
+                continue
+            by_frame = grouped.setdefault(frame.source_path, {})
+            existing = by_frame.get(frame.frame_id)
+            if existing is None:
+                by_frame[frame.frame_id] = (frame, [result])
+            else:
+                existing[1].append(result)
+
+        with self._frame_cache_lock:
+            for source_path, frames in track(
+                grouped.items(),
+                desc="Giải mã direct video theo batch",
+                total=len(grouped),
+                unit="video",
+                nested=True,
+            ):
+                capture = None
+                next_frame_id: int | None = None
+                try:
+                    for frame_id, (frame, frame_results) in track(
+                        sorted(frames.items()),
+                        desc=f"Seek {source_path.stem}",
+                        total=len(frames),
+                        unit="frame",
+                        nested=True,
+                    ):
+                        target = (
+                            self._frame_cache_dir
+                            / frame.source_path.stem
+                            / f"{frame.frame_id:08d}.jpg"
+                        )
+                        if target.is_file():
+                            target.touch()
+                        else:
+                            cv2 = self._load_cv2()
+                            if capture is None:
+                                capture = cv2.VideoCapture(str(source_path))
+                                if not capture.isOpened():
+                                    capture.release()
+                                    capture = None
+                                    break
+                            if next_frame_id != frame_id:
+                                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+                            ok, bgr = capture.read()
+                            next_frame_id = frame_id + 1 if ok else None
+                            if not ok:
+                                continue
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            temporary = target.with_suffix(".tmp.jpg")
+                            if not cv2.imwrite(
+                                str(temporary),
+                                bgr,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+                            ):
+                                temporary.unlink(missing_ok=True)
+                                continue
+                            temporary.replace(target)
+                        self._touch_frame_cache(target)
+                        for result in track(
+                            frame_results,
+                            desc="Gắn direct image path",
+                            total=len(frame_results),
+                            unit="result",
+                            nested=True,
+                        ):
+                            result.image_path = str(target)
+                finally:
+                    if capture is not None:
+                        capture.release()
 
     def ensure_result_image(self, result: SearchResult) -> str | None:
         """Materialize one returned frame only when a UI/model needs it."""
         if result.image_path and Path(result.image_path).is_file():
             return result.image_path
-        if result.video_id in self._preprocessed_shards:
-            frame = self._frame_from_local_index(result.video_id, result.keyframe_number)
-        else:
-            self._mapping(result.video_id)
-            frame = self._mapping_lookup.get(result.video_id, {}).get(result.keyframe_number)
-        if frame is None:
-            return None
-        image = self._materialize_frame(frame)
-        result.image_path = str(image) if image is not None else None
+        self.ensure_result_images([result])
         return result.image_path
 
     def _candidate_to_result(
@@ -1088,7 +1211,6 @@ class DirectVideoRetrievalEngine:
             ocr_quality=ocr_quality,
             ocr_text=ocr_text,
         )
-        self.ensure_result_image(result)
         return result
 
     def neighboring_keyframes(
@@ -1134,10 +1256,10 @@ class DirectVideoRetrievalEngine:
                     score = float(self._embeddings[global_index] @ query_vector)
             result = self._candidate_to_result(
                 _DirectCandidate(video_id, local_index, score),
-                materialize_image=True,
             )
             if result is not None:
                 output.append((local_index, result))
+        self.ensure_result_images([result for _index, result in output])
         return output
 
     def _preprocessed_object_labels(self, video_id: str, keyframe_number: int) -> tuple[str, ...]:
@@ -1344,7 +1466,6 @@ class DirectVideoRetrievalEngine:
             ):
                 result = self._candidate_to_result(
                     _DirectCandidate(video_id, int(local_index), float(event_score)),
-                    materialize_image=True,
                 )
                 if result is None:
                     break
@@ -1478,7 +1599,6 @@ class DirectVideoRetrievalEngine:
             ):
                 result = self._candidate_to_result(
                     _DirectCandidate(video_id, int(local_index), float(event_score)),
-                    materialize_image=True,
                 )
                 if result is None:
                     break

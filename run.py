@@ -375,7 +375,7 @@ def parse_arguments() -> argparse.Namespace:
         choices=(0, 1),
         default=0,
         metavar="{0,1}",
-        help="1: cắt PNG + CLIP NPY + object + OCR theo shard rồi thoát; mặc định 0",
+        help="1: decode MP4 trực tiếp thành CLIP NPY + object + OCR, không lưu frame image; mặc định 0",
     )
     parser.add_argument(
         "--start-pre-video",
@@ -393,7 +393,7 @@ def parse_arguments() -> argparse.Namespace:
         "--pre-direct-fps",
         type=float,
         default=0.0,
-        help="Số frame/giây cần lưu; mặc định 0 = tiền xử lý mọi frame",
+        help="Số frame/giây cần tiền xử lý; mặc định 0 = mọi frame",
     )
     parser.add_argument(
         "--pre-direct-gpus",
@@ -434,7 +434,7 @@ def parse_arguments() -> argparse.Namespace:
         "--pre-direct-max-side",
         type=int,
         default=0,
-        help="Resize PNG theo cạnh dài; 0 giữ nguyên độ phân giải",
+        help="Resize frame trong RAM cho CLIP/Object; OCR luôn đọc độ phân giải video gốc",
     )
     parser.add_argument("--force-pre-direct", action="store_true", help="Tạo lại video đã có marker hoàn tất")
     parser.add_argument("--no-reranker", action="store_true", help="Không cài/chạy Qwen multimodal reranker")
@@ -668,11 +668,11 @@ def main() -> None:
         else:
             print("W&B tracking: tắt (không có --wandb-api-key).", flush=True)
         print(
-            f"Direct preprocess 1/3 ({frame_plan}): cắt PNG, CLIP embedding và YOLO object…",
+            f"Direct preprocess 1/3 ({frame_plan}): decode MP4 trong RAM, CLIP embedding và YOLO object…",
             flush=True,
         )
         command([*common, "--stage", "visual"], env=preprocess_environment)
-        print("Direct preprocess 2/3: PaddleOCR scene-text, loại TV overlay…", flush=True)
+        print("Direct preprocess 2/3: decode lại MP4 tuần tự cho PaddleOCR, loại TV overlay…", flush=True)
         ocr_env = ensure_paddle_ocr_packages()
         ocr_env.update(wandb_environment)
         command(

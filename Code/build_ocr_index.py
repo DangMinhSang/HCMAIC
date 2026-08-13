@@ -8,6 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from data_paths import AICPaths
 from ocr_regions import (
@@ -57,15 +58,35 @@ def create_reader(language: str, device: str):
     )
 
 
-def read_text(reader, image_path: Path, minimum_confidence: float) -> tuple[str, str, int, int]:
-    """Return scene and broadcast-overlay text as separate values."""
-    try:
-        from PIL import Image  # type: ignore
-    except ImportError as error:
-        raise RuntimeError("Thiếu Pillow để phân vùng OCR theo kích thước ảnh.") from error
-    with Image.open(image_path) as image:
-        image_width, image_height = image.size
-    output = reader.ocr(str(image_path), cls=False)
+def read_text(reader: Any, image_source: Any, minimum_confidence: float) -> tuple[str, str, int, int]:
+    """Return scene/overlay text from either a path or an in-memory frame."""
+    ocr_input = image_source
+    if isinstance(image_source, (str, os.PathLike)):
+        try:
+            from PIL import Image  # type: ignore
+        except ImportError as error:
+            raise RuntimeError("Thiếu Pillow để phân vùng OCR theo kích thước ảnh.") from error
+        image_path = Path(image_source)
+        with Image.open(image_path) as image:
+            image_width, image_height = image.size
+        ocr_input = str(image_path)
+    else:
+        shape = getattr(image_source, "shape", None)
+        if shape is not None and len(shape) >= 2:
+            image_height, image_width = int(shape[0]), int(shape[1])
+        else:
+            size = getattr(image_source, "size", None)
+            if not isinstance(size, tuple) or len(size) != 2:
+                raise TypeError("OCR image_source phải là path, NumPy frame hoặc PIL image.")
+            image_width, image_height = (int(size[0]), int(size[1]))
+            try:
+                import numpy as np
+            except ImportError as error:
+                raise RuntimeError("Thiếu NumPy để OCR PIL image trong RAM.") from error
+            ocr_input = np.asarray(image_source)
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("OCR frame có kích thước không hợp lệ.")
+    output = reader.ocr(ocr_input, cls=False)
     scene_lines: list[str] = []
     overlay_lines: list[str] = []
     pages = output or []

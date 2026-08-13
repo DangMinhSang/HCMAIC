@@ -266,6 +266,30 @@ Sự kiện 4 — Tiếp đất: Bắt đầu tiếp xúc trở lại với mặ
         self.assertIn("lũ quét", overlay)
         self.assertEqual((scene_count, overlay_count), (1, 1))
 
+    def test_pre_ocr_accepts_in_memory_video_frame(self) -> None:
+        observed = {}
+
+        class FakeReader:
+            @staticmethod
+            def ocr(source, cls=False):
+                observed["source"] = source
+                observed["cls"] = cls
+                return [[
+                    [
+                        [[150, 100], [490, 100], [490, 180], [150, 180]],
+                        ("BIỂN CẢNH BÁO", 0.99),
+                    ]
+                ]]
+
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        scene, overlay, scene_count, overlay_count = read_text(FakeReader(), frame, 0.45)
+
+        self.assertIs(observed["source"], frame)
+        self.assertFalse(observed["cls"])
+        self.assertEqual(scene, "BIỂN CẢNH BÁO")
+        self.assertEqual(overlay, "")
+        self.assertEqual((scene_count, overlay_count), (1, 0))
+
     def test_legacy_weather_ticker_is_suppressed(self) -> None:
         # Exact noisy PaddleOCR text from the unrelated tango frame L22_V021/204.
         ticker = "Cänh báo nguy ca lo quét sat l& dát vng núi vä trung du Bäc Bö"

@@ -112,12 +112,134 @@ class DirectVideoTests(unittest.TestCase):
             engine._records = [DirectFrame(index, index * 15, index * 0.5, 30.0, video) for index in range(5)]
             engine._set_records(engine._records)
             engine.ensure_result_image = lambda _result: None
+            engine.ensure_result_images = lambda _results: None
 
             results = engine.search("scene", top_k=3, min_frame_gap=0)
             self.assertEqual([result.frame_id for result in results], [15, 45, 60])
             sequences = engine.search_trake(["prepare", "airborne"], top_videos=1)
             self.assertEqual(len(sequences), 1)
             self.assertEqual([frame.frame_id for frame in sequences[0].frames], [15, 45])
+
+    def test_lazy_video_frames_use_a_bounded_runtime_cache(self) -> None:
+        class FakeEncoder:
+            model_name = "fake"
+
+        class FakeCapture:
+            def __init__(self, _path: str) -> None:
+                self.frame_id = 0
+
+            @staticmethod
+            def isOpened() -> bool:
+                return True
+
+            def set(self, _property: int, value: int) -> None:
+                self.frame_id = int(value)
+
+            def read(self):
+                return True, np.full((2, 2, 3), self.frame_id, dtype=np.uint8)
+
+            @staticmethod
+            def release() -> None:
+                return None
+
+        class FakeCV2:
+            CAP_PROP_POS_FRAMES = 1
+            IMWRITE_JPEG_QUALITY = 2
+            VideoCapture = FakeCapture
+
+            @staticmethod
+            def imwrite(path: str, image, _options) -> bool:
+                Path(path).write_bytes(bytes([int(image[0, 0, 0])]))
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {
+                "AIC_RUNTIME_DIR": temporary,
+                "AIC_DIRECT_FRAME_CACHE_MAX": "2",
+            },
+        ):
+            root = Path(temporary)
+            video = root / "L21_V001.mp4"
+            video.write_bytes(b"video-source")
+            engine = DirectVideoRetrievalEngine(root, [video], encoder=FakeEncoder())
+            engine._cv2 = FakeCV2
+            paths = [
+                engine._materialize_frame(DirectFrame(index, index, index / 30, 30, video))
+                for index in range(3)
+            ]
+
+            self.assertTrue(all(path is not None for path in paths))
+            self.assertEqual(len(list(engine._frame_cache_dir.glob("*/*.jpg"))), 2)
+            self.assertEqual(sum(path.exists() for path in paths), 2)
+            self.assertTrue(paths[-1].exists())
+
+    def test_batch_materialization_opens_each_video_once(self) -> None:
+        opened = []
+
+        class FakeEncoder:
+            model_name = "fake"
+
+        class FakeCapture:
+            def __init__(self, path: str) -> None:
+                opened.append(path)
+                self.position = 0
+
+            @staticmethod
+            def isOpened() -> bool:
+                return True
+
+            def set(self, _property: int, value: int) -> None:
+                self.position = int(value)
+
+            def read(self):
+                frame = np.full((2, 2, 3), self.position, dtype=np.uint8)
+                self.position += 1
+                return True, frame
+
+            @staticmethod
+            def release() -> None:
+                return None
+
+        class FakeCV2:
+            CAP_PROP_POS_FRAMES = 1
+            IMWRITE_JPEG_QUALITY = 2
+            VideoCapture = FakeCapture
+
+            @staticmethod
+            def imwrite(path: str, image, _options) -> bool:
+                Path(path).write_bytes(bytes([int(image[0, 0, 0])]))
+                return True
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"AIC_RUNTIME_DIR": temporary},
+        ):
+            root = Path(temporary)
+            video = root / "L21_V001.mp4"
+            video.write_bytes(b"video-source")
+            engine = DirectVideoRetrievalEngine(root, [video], encoder=FakeEncoder())
+            engine._cv2 = FakeCV2
+            engine._frame_for_result = lambda result: DirectFrame(
+                result.keyframe_number,
+                result.keyframe_number,
+                result.keyframe_number / 30,
+                30,
+                video,
+            )
+            results = [
+                SimpleNamespace(video_id=video.stem, keyframe_number=index, image_path=None)
+                for index in (1, 2, 5)
+            ]
+
+            engine.ensure_result_images(results)
+
+            self.assertEqual(opened, [str(video)])
+            self.assertTrue(all(result.image_path for result in results))
+            self.assertEqual(
+                [Path(result.image_path).read_bytes()[0] for result in results],
+                [1, 2, 5],
+            )
 
 
 if __name__ == "__main__":

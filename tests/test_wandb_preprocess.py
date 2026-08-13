@@ -138,7 +138,12 @@ class WandbPreprocessTests(unittest.TestCase):
                     "frames": 120,
                     "seconds": 12.5,
                     "skipped": False,
-                    "timing_seconds": {"png": 3.0, "clip": 4.0, "object": 5.0},
+                    "timing_seconds": {
+                        "decode": 2.0,
+                        "prepare": 1.0,
+                        "clip": 4.0,
+                        "object": 5.0,
+                    },
                 }
             )
             tracker.log_manifest(
@@ -156,6 +161,7 @@ class WandbPreprocessTests(unittest.TestCase):
         self.assertEqual(fake_wandb.init_arguments["resume"], "allow")
         self.assertNotIn("secret-api-key", repr(fake_wandb.init_arguments))
         self.assertEqual(fake_wandb.settings_arguments["console"], "off")
+        self.assertEqual(fake_wandb.run.logs[0]["visual/decode_seconds"], 2.0)
         self.assertEqual(fake_wandb.run.logs[0]["visual/clip_seconds"], 4.0)
         self.assertEqual(fake_wandb.run.logs[0]["video/gpu_id"], "1")
         self.assertEqual(fake_wandb.run.logs[1]["finalize/complete_videos"], 1)

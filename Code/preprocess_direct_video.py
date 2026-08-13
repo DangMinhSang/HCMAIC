@@ -2,9 +2,9 @@
 
 Artifacts are generated per video so an interrupted Kaggle session can resume
 without recomputing completed videos. The visual stage decodes each source MP4
-once, writes sampled PNG frames, then batches CLIP and YOLO inference. OCR runs
-as a separate stage because PaddleOCR is intentionally installed in an
-isolated package directory by ``run.py``.
+once and batches in-memory CLIP and YOLO inference without persisting frame
+images. OCR sequentially decodes the source video in its isolated PaddleOCR
+process, so the MP4 remains the single source of pixels.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -29,7 +30,8 @@ from typing import Any, Iterable, Sequence
 from progress import track
 
 
-DIRECT_PREPROCESS_SCHEMA = 2
+DIRECT_PREPROCESS_SCHEMA = 3
+LEGACY_DIRECT_PREPROCESS_SCHEMA = 2
 DEFAULT_OUTPUT_ROOT = Path("/kaggle/working/aic_direct_preprocessed")
 
 
@@ -50,7 +52,7 @@ class VideoWindow:
 @dataclass(frozen=True)
 class VideoArtifacts:
     root: Path
-    frames_dir: Path
+    legacy_frames_dir: Path
     mapping: Path
     frame_ids: Path
     pts_times: Path
@@ -364,7 +366,7 @@ def artifact_paths(output_root: str | Path, video_id: str) -> VideoArtifacts:
     root = Path(output_root).expanduser() / "videos" / video_id
     return VideoArtifacts(
         root=root,
-        frames_dir=root / "frames",
+        legacy_frames_dir=root / "frames",
         mapping=root / "mapping.jsonl",
         frame_ids=root / "frame_ids.npy",
         pts_times=root / "pts_times.npy",
@@ -492,6 +494,76 @@ def marker_matches(path: Path, expected: dict[str, Any], required: Sequence[Path
     return all(marker.get(key) == value for key, value in expected.items())
 
 
+def _remove_legacy_frame_storage(artifacts: VideoArtifacts) -> bool:
+    """Delete only the generated per-frame directory from schema-v2 shards."""
+    directory = artifacts.legacy_frames_dir
+    if directory.is_symlink():
+        directory.unlink()
+    elif directory.is_dir():
+        shutil.rmtree(directory)
+    else:
+        return False
+    print(
+        f"[cleanup] {artifacts.root.name}: đã xóa frame images cũ; pixel lấy từ video nguồn.",
+        flush=True,
+    )
+    return True
+
+
+def _migrate_legacy_visual_artifacts(
+    artifacts: VideoArtifacts,
+    expected: dict[str, Any],
+    required: Sequence[Path],
+) -> dict[str, Any]:
+    """Upgrade a valid v2 shard without rerunning expensive GPU models."""
+    marker = read_json(artifacts.visual_marker)
+    if (
+        marker.get("schema") != LEGACY_DIRECT_PREPROCESS_SCHEMA
+        or any(not candidate.is_file() for candidate in required)
+    ):
+        return {}
+    compatible_fields = {
+        key: value
+        for key, value in expected.items()
+        if key not in {"schema", "frame_storage", "stores_frame_images"}
+    }
+    if any(marker.get(key) != value for key, value in compatible_fields.items()):
+        return {}
+
+    _remove_legacy_frame_storage(artifacts)
+    migrated = {
+        **marker,
+        **expected,
+        "migrated_from_schema": LEGACY_DIRECT_PREPROCESS_SCHEMA,
+        "migrated_at": utc_now(),
+    }
+    write_json_atomic(artifacts.visual_marker, migrated)
+    for marker_path, required_artifact in track(
+        (
+            (artifacts.ocr_marker, artifacts.ocr),
+            (artifacts.complete_marker, artifacts.clip),
+        ),
+        desc=f"Nâng marker schema {artifacts.root.name}",
+        total=2,
+        unit="marker",
+        nested=True,
+    ):
+        dependent = read_json(marker_path)
+        if (
+            dependent.get("schema") == LEGACY_DIRECT_PREPROCESS_SCHEMA
+            and required_artifact.is_file()
+        ):
+            dependent["schema"] = DIRECT_PREPROCESS_SCHEMA
+            dependent["migrated_from_schema"] = LEGACY_DIRECT_PREPROCESS_SCHEMA
+            dependent["migrated_at"] = utc_now()
+            write_json_atomic(marker_path, dependent)
+    print(
+        f"[migrate] {artifacts.root.name}: schema v2 → v3, giữ nguyên CLIP/Object/OCR.",
+        flush=True,
+    )
+    return migrated
+
+
 def _resize_image(image: Any, max_side: int) -> Any:
     if max_side <= 0 or max(image.size) <= max_side:
         return image
@@ -504,7 +576,7 @@ def _resize_image(image: Any, max_side: int) -> Any:
 
 
 def _clip_image(image: Any, mask_overlays: bool) -> Any:
-    """Prepare an in-memory CLIP view while preserving the original PNG."""
+    """Prepare an overlay-suppressed CLIP view entirely in memory."""
     clip_image = image.copy()
     if not mask_overlays:
         return clip_image
@@ -604,7 +676,7 @@ def preprocess_visual_video(
     mask_clip_overlays: bool,
     force: bool,
 ) -> dict[str, Any]:
-    """Decode one video once and create PNG/CLIP/object artifacts."""
+    """Decode one video once and create CLIP/object artifacts in memory."""
     visual_started = time.perf_counter()
     try:
         import cv2  # type: ignore
@@ -629,6 +701,8 @@ def preprocess_visual_video(
         "object_confidence": object_confidence,
         "mask_clip_overlays": mask_clip_overlays,
         "clip_overlay_start": bottom_overlay_start() if mask_clip_overlays else None,
+        "frame_storage": "source-video",
+        "stores_frame_images": False,
     }
     required = (
         artifacts.mapping,
@@ -641,36 +715,16 @@ def preprocess_visual_video(
     )
     marker_ready = not force and marker_matches(artifacts.visual_marker, expected, required)
     marker = read_json(artifacts.visual_marker) if marker_ready else {}
-    saved_png_count = (
-        sum(1 for path in artifacts.frames_dir.glob("*.png") if path.stem.isdigit())
-        if marker_ready
-        else 0
-    )
-    if marker_ready and saved_png_count == int(marker.get("sampled_frames") or -1):
+    if not marker_ready and not force:
+        marker = _migrate_legacy_visual_artifacts(artifacts, expected, required)
+        marker_ready = bool(marker)
+    _remove_legacy_frame_storage(artifacts)
+    if marker_ready:
         print(f"[skip] Visual {video_id}: {marker.get('sampled_frames', 0):,} frame đã hoàn tất.", flush=True)
         return {**marker, "_execution_skipped": True}
-    if marker_ready:
-        print(
-            f"[rebuild] Visual {video_id}: marker có {marker.get('sampled_frames', 0)} PNG "
-            f"nhưng disk có {saved_png_count}.",
-            flush=True,
-        )
 
-    artifacts.frames_dir.mkdir(parents=True, exist_ok=True)
+    artifacts.root.mkdir(parents=True, exist_ok=True)
     artifacts.visual_marker.unlink(missing_ok=True)
-    stale_frames = [
-        path
-        for path in sorted(artifacts.frames_dir.glob("*.png"))
-        if path.stem.isdigit()
-    ]
-    for stale_frame in track(
-        stale_frames,
-        desc=f"Dọn PNG cũ {video_id}",
-        total=len(stale_frames),
-        unit="frame",
-        force=bool(stale_frames),
-    ):
-        stale_frame.unlink(missing_ok=True)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         capture.release()
@@ -693,7 +747,7 @@ def preprocess_visual_video(
     clip_image_batch: list[Any] = []
     record_batch: list[dict[str, Any]] = []
     batch_limit = max(1, min(int(clip_batch), int(object_batch)))
-    png_seconds = clip_seconds = object_seconds = 0.0
+    decode_seconds = prepare_seconds = clip_seconds = object_seconds = 0.0
 
     def flush_batch(object_stream: Any) -> None:
         nonlocal clip_seconds, object_seconds
@@ -758,21 +812,19 @@ def preprocess_visual_video(
                 force=True,
                 leave=True,
             ):
+                decode_started = time.perf_counter()
                 ok, bgr = capture.read()
+                decode_seconds += time.perf_counter() - decode_started
                 if not ok:
                     break
                 decoded_frame_count = frame_index + 1
                 if not sampler.accept(frame_index):
                     continue
+                prepare_started = time.perf_counter()
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 image = _resize_image(Image.fromarray(rgb), max_side)
-                filename = f"{frame_index:09d}.png"
-                image_path = artifacts.frames_dir / filename
-                image_temporary = image_path.with_name(f"{image_path.stem}.building.png")
-                png_started = time.perf_counter()
-                image.save(image_temporary, format="PNG", compress_level=3)
-                image_temporary.replace(image_path)
-                png_seconds += time.perf_counter() - png_started
+                clip_image = _clip_image(image, mask_clip_overlays)
+                prepare_seconds += time.perf_counter() - prepare_started
                 sample_index = len(mapping_records)
                 record = {
                     "schema": DIRECT_PREPROCESS_SCHEMA,
@@ -782,14 +834,13 @@ def preprocess_visual_video(
                     "frame_id": int(frame_index),
                     "pts_time": float(frame_index) / source_fps,
                     "fps": source_fps,
-                    "image": f"frames/{filename}",
                     "width": int(image.width),
                     "height": int(image.height),
                 }
                 mapping_records.append(record)
                 record_batch.append(record)
                 image_batch.append(image)
-                clip_image_batch.append(_clip_image(image, mask_clip_overlays))
+                clip_image_batch.append(clip_image)
                 if len(image_batch) >= batch_limit:
                     flush_batch(object_stream)
             flush_batch(object_stream)
@@ -797,7 +848,7 @@ def preprocess_visual_video(
         capture.release()
 
     if not mapping_records or not clip_parts:
-        raise RuntimeError(f"Không cắt được frame nào từ {video_path}.")
+        raise RuntimeError(f"Không decode/tiền xử lý được frame nào từ {video_path}.")
     clip_matrix = np.concatenate(clip_parts, axis=0).astype(np.float32, copy=False)
     object_matrix = np.stack(object_score_rows).astype(np.float16, copy=False)
     if len(clip_matrix) != len(mapping_records) or len(object_matrix) != len(mapping_records):
@@ -862,7 +913,8 @@ def preprocess_visual_video(
         "worker_gpu": os.environ.get("AIC_PRE_DIRECT_WORKER_GPU", ""),
         "timing_seconds": {
             "total": round(time.perf_counter() - visual_started, 3),
-            "png": round(png_seconds, 3),
+            "decode": round(decode_seconds, 3),
+            "prepare": round(prepare_seconds, 3),
             "clip": round(clip_seconds, 3),
             "object": round(object_seconds, 3),
         },
@@ -876,7 +928,7 @@ def preprocess_visual_video(
             flush=True,
         )
     print(
-        f"Visual {video_id}: {len(mapping_records):,} PNG · CLIP {clip_matrix.shape} · "
+        f"Visual {video_id}: {len(mapping_records):,} frame từ MP4 · CLIP {clip_matrix.shape} · "
         f"object {object_matrix.shape}",
         flush=True,
     )
@@ -1147,6 +1199,10 @@ def preprocess_ocr_video(
 ) -> dict[str, Any]:
     from build_ocr_index import read_text
     from ocr_regions import OCR_INDEX_SCHEMA_VERSION, bottom_overlay_start
+    try:
+        import cv2  # type: ignore
+    except ImportError as error:
+        raise RuntimeError("Direct OCR cần OpenCV để decode video tuần tự.") from error
 
     ocr_started = time.perf_counter()
     video_id = video_path.stem
@@ -1170,53 +1226,96 @@ def preprocess_ocr_video(
         return {**marker, "_execution_skipped": True}
 
     mappings = read_jsonl(artifacts.mapping)
+    if not mappings:
+        raise RuntimeError(f"Mapping visual của {video_id} rỗng.")
+    frame_ids = [int(mapping["frame_id"]) for mapping in mappings]
+    if frame_ids[0] < 0 or any(
+        current <= previous for previous, current in zip(frame_ids, frame_ids[1:])
+    ):
+        raise RuntimeError(f"Mapping {video_id} phải có frame_id tăng nghiêm ngặt.")
     temporary = _temporary_path(artifacts.ocr)
     temporary.unlink(missing_ok=True)
     records = scene_records = overlay_lines = overlay_only_frames = failures = 0
-    with gzip.open(temporary, "wt", encoding="utf-8") as stream:
-        for mapping in track(
-            mappings,
-            desc=f"PaddleOCR {video_id}",
-            total=len(mappings),
-            unit="frame",
-            force=True,
-            leave=True,
-        ):
-            image_path = artifacts.root / str(mapping.get("image") or "")
-            try:
-                text, overlay_text, scene_count, overlay_count = read_text(
-                    reader,
-                    image_path,
-                    minimum_confidence,
-                )
-            except Exception as error:
-                failures += 1
-                print(f"[skip OCR] {image_path}: {error}", file=sys.stderr, flush=True)
-                if failures >= 5 and records == 0:
-                    raise RuntimeError(f"OCR {video_id} lỗi liên tiếp từ đầu: {error}") from error
-                continue
-            records += 1
-            scene_records += int(bool(text))
-            overlay_lines += overlay_count
-            overlay_only_frames += int(bool(overlay_text and not text))
-            stream.write(
-                json.dumps(
-                    {
-                        "ocr_schema": OCR_INDEX_SCHEMA_VERSION,
-                        "video_id": video_id,
-                        "keyframe_number": int(mapping["keyframe_number"]),
-                        "frame_id": int(mapping["frame_id"]),
-                        "pts_time": float(mapping["pts_time"]),
-                        "text": text,
-                        "overlay_text": overlay_text,
-                        "scene_boxes": scene_count,
-                        "overlay_boxes": overlay_count,
-                        "text_quality": 1.0,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+    decode_seconds = inference_seconds = 0.0
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(f"Không mở được video cho OCR: {video_path}.")
+    target_position = 0
+    try:
+        with gzip.open(temporary, "wt", encoding="utf-8") as stream:
+            for frame_index in track(
+                count(),
+                desc=f"Decode + PaddleOCR {video_id}",
+                total=frame_ids[-1] + 1,
+                unit="frame",
+                force=True,
+                leave=True,
+            ):
+                decode_started = time.perf_counter()
+                ok, bgr = capture.read()
+                decode_seconds += time.perf_counter() - decode_started
+                if not ok:
+                    break
+                if frame_index < frame_ids[target_position]:
+                    continue
+                if frame_index > frame_ids[target_position]:
+                    raise RuntimeError(
+                        f"Decoder đã vượt target frame {frame_ids[target_position]} ở {video_id}."
+                    )
+                mapping = mappings[target_position]
+                target_position += 1
+                inference_started = time.perf_counter()
+                try:
+                    text, overlay_text, scene_count, overlay_count = read_text(
+                        reader,
+                        bgr,
+                        minimum_confidence,
+                    )
+                except Exception as error:
+                    failures += 1
+                    print(
+                        f"[skip OCR] {video_id} frame {frame_index}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if failures >= 5 and records == 0:
+                        raise RuntimeError(f"OCR {video_id} lỗi liên tiếp từ đầu: {error}") from error
+                else:
+                    records += 1
+                    scene_records += int(bool(text))
+                    overlay_lines += overlay_count
+                    overlay_only_frames += int(bool(overlay_text and not text))
+                    stream.write(
+                        json.dumps(
+                            {
+                                "ocr_schema": OCR_INDEX_SCHEMA_VERSION,
+                                "video_id": video_id,
+                                "keyframe_number": int(mapping["keyframe_number"]),
+                                "frame_id": int(mapping["frame_id"]),
+                                "pts_time": float(mapping["pts_time"]),
+                                "text": text,
+                                "overlay_text": overlay_text,
+                                "scene_boxes": scene_count,
+                                "overlay_boxes": overlay_count,
+                                "text_quality": 1.0,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                finally:
+                    inference_seconds += time.perf_counter() - inference_started
+                if target_position >= len(mappings):
+                    break
+    finally:
+        capture.release()
+    if target_position != len(mappings):
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"OCR {video_id} chỉ decode tới {target_position:,}/{len(mappings):,} target frame; "
+            f"thiếu frame_id {frame_ids[target_position]}."
+        )
     temporary.replace(artifacts.ocr)
     marker = {
         **expected,
@@ -1227,7 +1326,11 @@ def preprocess_ocr_video(
         "overlay_only_frames": overlay_only_frames,
         "failures": failures,
         "worker_gpu": os.environ.get("AIC_PRE_DIRECT_WORKER_GPU", ""),
-        "timing_seconds": {"total": round(time.perf_counter() - ocr_started, 3)},
+        "timing_seconds": {
+            "total": round(time.perf_counter() - ocr_started, 3),
+            "decode": round(decode_seconds, 3),
+            "inference": round(inference_seconds, 3),
+        },
         "generated_at": utc_now(),
     }
     write_json_atomic(artifacts.ocr_marker, marker)
@@ -1491,7 +1594,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Số process GPU; 0 mặc định tạo một worker cho mỗi GPU trong --gpus",
     )
     parser.add_argument("--sample-fps", type=float, default=0.0, help="0 means every decoded frame (default)")
-    parser.add_argument("--max-side", type=int, default=0, help="0 preserves original PNG resolution")
+    parser.add_argument(
+        "--max-side",
+        type=int,
+        default=0,
+        help="Resize in-memory CLIP/Object frame; OCR always decodes source resolution",
+    )
     parser.add_argument("--clip-model", default=os.environ.get("AIC_DIRECT_CLIP_MODEL", "ViT-B/32"))
     parser.add_argument("--clip-batch", type=int, default=int(os.environ.get("AIC_DIRECT_VIDEO_BATCH", "64")))
     parser.add_argument("--object-model", default=os.environ.get("AIC_DIRECT_OBJECT_MODEL", "yolo11m.pt"))

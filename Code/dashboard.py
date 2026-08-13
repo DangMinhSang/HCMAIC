@@ -235,6 +235,8 @@ def warmup_reranker() -> bool:
             if not mapping:
                 continue
             sample = engine.result_for_keyframe(video_id, mapping[0].keyframe_number)
+            if sample is not None:
+                ensure_result_images(engine, [sample])
             if sample is not None and sample.image_path:
                 reranker.score("a representative video frame", [sample])
                 build_query_profile("exact words written on a yellow warning sign", reranker)
@@ -269,6 +271,8 @@ def warmup_vqa() -> str:
         if not mapping:
             continue
         sample = engine.result_for_keyframe(video_id, mapping[0].keyframe_number)
+        if sample is not None:
+            ensure_result_images(engine, [sample])
         if sample is not None and sample.image_path:
             vqa.warmup(sample.image_path)
             return vqa.backend_name
@@ -498,6 +502,10 @@ def _merge_recall_result(
 
 def ensure_result_images(engine: Any, results: Sequence[SearchResult]) -> None:
     """Materialize lazy raw-video images only for rerank/display candidates."""
+    batch_materializer = getattr(engine, "ensure_result_images", None)
+    if callable(batch_materializer):
+        batch_materializer(results)
+        return
     materializer = getattr(engine, "ensure_result_image", None)
     if not callable(materializer):
         return
@@ -747,7 +755,6 @@ def make_kis_results(
         min_frame_gap=min_gap,
         max_per_video=maximum,
     )
-    ensure_result_images(engine, selected)
     if ocr_index:
         ocr_note = f"OCR RAM v{ocr_index.schema_version}: {len(hits)} keyframe scene-text."
         if ocr_index.legacy_record_count:
@@ -797,6 +804,11 @@ def make_qa_results(
     results = [item.result for item in stored]
     try:
         vqa = get_vqa()
+        try:
+            vqa_image_limit = max(1, min(int(os.environ.get("AIC_VQA_CANDIDATES", "8")), 12))
+        except ValueError:
+            vqa_image_limit = 8
+        ensure_result_images(engine, results[:vqa_image_limit])
         predictions = vqa.predict(question, results)
         by_rank = {prediction.rank: prediction for prediction in predictions}
         for result in track(
@@ -910,6 +922,7 @@ def make_trake_results(
                 pair_frames.append(frame)
         pair_prompt = TRAKE_STAGE_PROMPT
         try:
+            ensure_result_images(engine, pair_frames)
             pair_scores = reranker.score_pairs(
                 pair_queries,
                 pair_frames,
@@ -1360,7 +1373,11 @@ def search_status(job_id: str):
 @app.get("/media/<identifier>")
 def media(identifier: str):
     stored = current_session().results.get(identifier)
-    if stored is None or not stored.result.image_path:
+    if stored is None:
+        return "Not found", 404
+    if not stored.result.image_path or not Path(stored.result.image_path).is_file():
+        ensure_result_images(get_engine(), [stored.result])
+    if not stored.result.image_path:
         return "Not found", 404
     path = Path(stored.result.image_path)
     if not path.is_file():

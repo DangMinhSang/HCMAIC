@@ -24,11 +24,13 @@ Trước khi mở dashboard, launcher làm trước toàn bộ phần không ph�
 
 Direct-video là một pipeline độc lập, mặc định **tắt**. Khi bật, hệ thống đọc
 MP4 từ `/kaggle/input/datasets/doanminhtuan/video-aic`; nó không đọc feature,
-mapping, keyframe gallery hay OCR index do BTC cung cấp. Có thể dựng trước PNG,
-CLIP embedding, PaddleOCR scene-text và YOLO object theo từng shard video để
-query chỉ nạp NPY/index vào RAM. Nếu chưa có artifact, direct mode vẫn có thể tự
-tạo local CLIP cache cũ. Chỉ khi mount raw video không tồn tại, resolver mới
-fallback sang `kagglehub.dataset_download("doanminhtuan/video-aic")`.
+mapping, keyframe gallery hay OCR index do BTC cung cấp. Preprocessor decode MP4
+trực tiếp trong RAM để dựng CLIP embedding, PaddleOCR scene-text và YOLO object;
+**không lưu PNG/JPEG cho từng frame**. Query chỉ nạp NPY/index, còn pixel của
+ảnh kết quả được seek từ video nguồn khi thật sự cần. Nếu chưa có artifact,
+direct mode vẫn có thể tự tạo local CLIP cache cũ. Chỉ khi mount raw video không
+tồn tại, resolver mới fallback sang
+`kagglehub.dataset_download("doanminhtuan/video-aic")`.
 
 Hot path của KIS/Q&A:
 
@@ -121,7 +123,7 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_PRELOAD_FEATURES` | `1` | Giữ ma trận CLIP đã chuẩn hóa trong RAM |
 | `AIC_DIRECT_VIDEO` | `0` | Bật pipeline raw video; tương đương `python run.py --direct-video` |
 | `AIC_DIRECT_VIDEO_ROOT` | `/kaggle/input/datasets/doanminhtuan/video-aic` | Override thư mục video direct |
-| `AIC_DIRECT_PREPROCESSED_ROOT` | `/kaggle/working/aic_direct_preprocessed` | Root chứa PNG/NPY/OCR/Object đã dựng bằng `--pre-direct-video 1` |
+| `AIC_DIRECT_PREPROCESSED_ROOT` | `/kaggle/working/aic_direct_preprocessed` | Root chứa NPY/OCR/Object đã dựng bằng `--pre-direct-video 1`; không chứa frame image |
 | `AIC_PRE_DIRECT_GPUS` | `auto` | GPU vật lý cho pre-direct; Kaggle T4x2 tự phát hiện `0,1` |
 | `AIC_PRE_DIRECT_WORKERS` | `0` | Số process pre-direct; `0` = một worker cho mỗi GPU đã chọn |
 | `AIC_WANDB_PROJECT` | `hcmaic-direct-preprocess` | W&B project nhận metric pre-direct |
@@ -133,7 +135,8 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_DIRECT_CLIP_MODEL` | `ViT-B/32` | Checkpoint dùng đồng nhất lúc dựng image embedding và lúc encode query |
 | `AIC_DIRECT_OBJECT_MODEL` | `yolo11m.pt` | YOLO checkpoint cho object preprocessing |
 | `AIC_DIRECT_OBJECT_CONF` | `0.20` | Ngưỡng confidence ghi object box/score |
-| `AIC_DIRECT_CLIP_MASK_OVERLAYS` | `1` | Làm mờ lower-third trong bản ảnh CLIP ở RAM; PNG gốc vẫn được giữ |
+| `AIC_DIRECT_CLIP_MASK_OVERLAYS` | `1` | Làm mờ lower-third trong bản ảnh CLIP ở RAM; video nguồn không đổi |
+| `AIC_DIRECT_FRAME_CACHE_MAX` | `512` | Giới hạn JPEG trích xuất theo nhu cầu cho UI/Qwen; đây không phải preprocessed frame store |
 | `AIC_DIRECT_FRAME_STEPS` | `4,2,1` | Query coarse-to-fine: global `frame_id % 4`, local `%2`, cuối cùng mọi frame `%1` |
 | `AIC_DIRECT_REFINE_POOL` | `1200` | Pool KIS tối thiểu được giữ qua các tầng modulo |
 | `AIC_DIRECT_TRAKE_REFINE_VIDEOS` | `50` | Số video TRAKE coarse được tinh chỉnh tới mọi frame |
@@ -227,8 +230,8 @@ mỗi thời điểm chỉ tiến trình cha của một stage ghi metric nên k
 process ghi đồng thời cùng run. W&B nhận:
 
 - tiến độ video, GPU worker, số frame, skip/resume và thời gian thực thi;
-- breakdown visual theo PNG, CLIP và YOLO;
-- thời gian OCR và tổng số scene OCR/object sau finalize.
+- breakdown visual theo decode, chuẩn bị frame trong RAM, CLIP và YOLO;
+- breakdown OCR theo decode/inference và tổng số scene OCR/object sau finalize.
 
 Nếu thiếu key hoặc W&B lỗi mạng/timeout, pipeline chỉ cảnh báo rồi tiếp tục tạo
 artifact. Có thể đổi project/team bằng `AIC_WANDB_PROJECT` và `WANDB_ENTITY`.
@@ -236,20 +239,21 @@ artifact. Có thể đổi project/team bằng `AIC_WANDB_PROJECT` và `WANDB_EN
 Mặc định mới là `--pre-direct-fps 0`: decode và tiền xử lý **mọi frame**. Tham
 số FPS vẫn được giữ để chạy thí nghiệm nhỏ, nhưng artifact đã bỏ frame sẽ không
 thể được tầng `%1` phục hồi. `--pre-direct-max-side 0` giữ nguyên độ phân giải
-để ưu tiên OCR; có thể đặt `1280` hoặc `960` nếu shard vượt dung lượng Kaggle.
-`--force-pre-direct` dựng lại artifact dù marker cấu hình đang khớp. Output mặc
-định:
+cho CLIP/Object; có thể đặt `1280` hoặc `960` để tăng throughput. OCR luôn decode
+độ phân giải gốc trực tiếp từ MP4, không phụ thuộc tham số này.
+`--force-pre-direct` dựng lại artifact dù marker cấu hình đang khớp. Output mặc định:
 
-Artifact mới dùng schema v2 và thêm `frame_ids.npy`/`pts_times.npy`. Shard v1
-đã tạo ở mặc định 2 FPS không phải full-frame; chạy lại lệnh pre-direct để nó tự
-nhận marker cũ và rebuild trước khi dùng hierarchy `%4→%2→%1`.
+Artifact mới dùng schema v3, giữ `frame_ids.npy`/`pts_times.npy` nhưng bỏ hoàn
+toàn `frames/*.png`. Khi chạy lại cùng lệnh, shard schema v2 hợp lệ được migrate
+nhanh: xóa frame images và giữ nguyên CLIP/Object/OCR, không chạy lại model.
+Shard v1 mặc định 2 FPS vẫn phải rebuild vì không phải full-frame.
 
 ```text
 /kaggle/working/aic_direct_preprocessed/
 ├── video_order.json, manifest.json, ocr_index.jsonl.gz, object_index.jsonl.gz
 ├── shards/pre_0001_0100.json
 └── videos/L21_V001/
-    ├── frames/*.png, mapping.jsonl, frame_ids.npy, pts_times.npy
+    ├── mapping.jsonl, frame_ids.npy, pts_times.npy
     ├── clip.npy
     ├── objects.jsonl.gz, object_scores.npy, object_classes.json
     ├── ocr.jsonl.gz
@@ -258,11 +262,17 @@ nhận marker cũ và rebuild trước khi dùng hierarchy `%4→%2→%1`.
 
 Mỗi video được ghi riêng và chỉ có marker sau khi file hoàn tất, nên cell bị
 ngắt có thể chạy lại an toàn. Mọi vòng decode, CLIP, YOLO, OCR và merge đều có
-`tqdm`. Marker visual ghi riêng tổng thời gian PNG/CLIP/YOLO và marker OCR ghi
-thời gian OCR để xác định bottleneck thật trên T4x2. Full-frame PNG + OCR +
-CLIP + object có thể rất lớn: chạy thử video
-`1..3`, đo dung lượng/thời gian thực tế, rồi chia shard khoảng 5–25 video phù
-hợp quota session. Lưu output thành Kaggle Dataset trước khi đổi session.
+`tqdm`. Marker visual ghi riêng thời gian decode/prepare/CLIP/YOLO và marker OCR
+ghi decode/inference để xác định bottleneck thật trên T4x2. Full-frame CLIP +
+OCR + object vẫn có thể lớn, nhưng không còn chi phí dung lượng và nén hàng triệu
+PNG. Hãy chạy thử video `1..3`, đo dung lượng/thời gian thực tế, rồi chia shard
+khoảng 5–25 video phù hợp quota session. Lưu output thành Kaggle Dataset trước
+khi đổi session.
+
+Dashboard không dựng lại gallery toàn corpus. Nó chỉ seek các frame nằm trong
+pool Qwen hoặc Top-K từ MP4, ghi JPEG vào cache runtime giới hạn 512 ảnh theo
+LRU gần đúng, rồi tự loại ảnh cũ. Vì vậy raw-video dataset phải vẫn được mount
+khi query; NPY/OCR/Object tự thân không chứa pixel.
 
 Sau khi đã có artifact, mở dashboard bằng direct mode:
 

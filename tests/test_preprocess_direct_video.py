@@ -223,7 +223,7 @@ class DirectVideoPreprocessTests(unittest.TestCase):
     @staticmethod
     def _write_completed_video(output: Path, video_id: str) -> None:
         artifacts = artifact_paths(output, video_id)
-        artifacts.frames_dir.mkdir(parents=True)
+        artifacts.root.mkdir(parents=True)
         mappings = []
         for frame_id in range(8):
             mapping = {
@@ -234,12 +234,10 @@ class DirectVideoPreprocessTests(unittest.TestCase):
                 "frame_id": frame_id,
                 "pts_time": frame_id / 30.0,
                 "fps": 30.0,
-                "image": f"frames/{frame_id:09d}.png",
                 "width": 640,
                 "height": 360,
             }
             mappings.append(mapping)
-            (artifacts.frames_dir / f"{frame_id:09d}.png").write_bytes(b"png-placeholder")
         artifacts.mapping.write_text(
             "".join(json.dumps(mapping) + "\n" for mapping in mappings),
             encoding="utf-8",
@@ -281,6 +279,8 @@ class DirectVideoPreprocessTests(unittest.TestCase):
                 "sample_fps": 0.0,
                 "all_frames": True,
                 "sampled_frames": 8,
+                "frame_storage": "source-video",
+                "stores_frame_images": False,
             },
         )
         with gzip.open(artifacts.ocr, "wt", encoding="utf-8") as stream:
@@ -324,7 +324,117 @@ class DirectVideoPreprocessTests(unittest.TestCase):
             self.assertTrue(artifact_paths(output, "L21_V001").complete_marker.is_file())
             self.assertTrue((output / "shards" / "pre_0001_0001.json").is_file())
 
-    def test_engine_loads_preprocessed_clip_png_and_objects(self) -> None:
+    def test_schema_v2_migration_deletes_only_frames_and_keeps_features(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "preprocessed"
+            video_id = "L21_V001"
+            self._write_completed_video(output, video_id)
+            artifacts = artifact_paths(output, video_id)
+            visual = json.loads(artifacts.visual_marker.read_text(encoding="utf-8"))
+            visual["schema"] = 2
+            visual.pop("frame_storage", None)
+            visual.pop("stores_frame_images", None)
+            write_json_atomic(artifacts.visual_marker, visual)
+            ocr = json.loads(artifacts.ocr_marker.read_text(encoding="utf-8"))
+            ocr["schema"] = 2
+            write_json_atomic(artifacts.ocr_marker, ocr)
+            artifacts.legacy_frames_dir.mkdir()
+            (artifacts.legacy_frames_dir / "000000000.png").write_bytes(b"legacy")
+            clip_before = artifacts.clip.read_bytes()
+            required = (
+                artifacts.mapping,
+                artifacts.frame_ids,
+                artifacts.pts_times,
+                artifacts.clip,
+                artifacts.objects,
+                artifacts.object_scores,
+                artifacts.object_classes,
+            )
+
+            migrated = direct_preprocess._migrate_legacy_visual_artifacts(
+                artifacts,
+                {
+                    "schema": DIRECT_PREPROCESS_SCHEMA,
+                    "video_id": video_id,
+                    "frame_storage": "source-video",
+                    "stores_frame_images": False,
+                },
+                required,
+            )
+
+            self.assertEqual(migrated["schema"], DIRECT_PREPROCESS_SCHEMA)
+            self.assertEqual(migrated["migrated_from_schema"], 2)
+            self.assertFalse(artifacts.legacy_frames_dir.exists())
+            self.assertEqual(artifacts.clip.read_bytes(), clip_before)
+            self.assertEqual(
+                json.loads(artifacts.ocr_marker.read_text(encoding="utf-8"))["schema"],
+                DIRECT_PREPROCESS_SCHEMA,
+            )
+
+    def test_direct_ocr_decodes_source_video_without_frame_files(self) -> None:
+        class FakeCapture:
+            def __init__(self, _path: str) -> None:
+                self.position = 0
+
+            @staticmethod
+            def isOpened() -> bool:
+                return True
+
+            def read(self):
+                if self.position >= 8:
+                    return False, None
+                frame = np.full((360, 640, 3), self.position, dtype=np.uint8)
+                self.position += 1
+                return True, frame
+
+            @staticmethod
+            def release() -> None:
+                return None
+
+        class FakeReader:
+            def __init__(self) -> None:
+                self.frame_values = []
+
+            def ocr(self, frame, cls=False):
+                self.assert_false(cls)
+                self.frame_values.append(int(frame[0, 0, 0]))
+                return []
+
+            @staticmethod
+            def assert_false(value: bool) -> None:
+                if value:
+                    raise AssertionError("PaddleOCR cls must remain disabled")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "preprocessed"
+            video_id = "L21_V001"
+            self._write_completed_video(output, video_id)
+            artifacts = artifact_paths(output, video_id)
+            artifacts.ocr.unlink()
+            artifacts.ocr_marker.unlink()
+            video = Path(temporary) / f"{video_id}.mp4"
+            video.write_bytes(b"source-video")
+            reader = FakeReader()
+            fake_cv2 = SimpleNamespace(VideoCapture=FakeCapture)
+
+            with patch.dict(sys.modules, {"cv2": fake_cv2}):
+                marker = direct_preprocess.preprocess_ocr_video(
+                    video,
+                    output,
+                    reader=reader,
+                    language="vi",
+                    device="gpu:0",
+                    minimum_confidence=0.45,
+                    force=True,
+                )
+
+            self.assertEqual(reader.frame_values, list(range(8)))
+            self.assertEqual(marker["records"], 8)
+            self.assertIn("decode", marker["timing_seconds"])
+            self.assertIn("inference", marker["timing_seconds"])
+            self.assertFalse(artifacts.legacy_frames_dir.exists())
+
+    def test_engine_loads_preprocessed_clip_without_frame_images(self) -> None:
         class FakeEncoder:
             model_name = "fake"
             last_query = None
@@ -352,7 +462,8 @@ class DirectVideoPreprocessTests(unittest.TestCase):
             self.assertIsInstance(engine._preprocessed_shards["L21_V001"].embeddings, np.memmap)
             self.assertEqual(results[0].frame_id, 3)
             self.assertEqual(results[0].object_labels, ("person",))
-            self.assertTrue(results[0].image_path.endswith("000000003.png"))
+            self.assertIsNone(results[0].image_path)
+            self.assertFalse(artifact_paths(output, "L21_V001").legacy_frames_dir.exists())
 
     def test_trake_refines_coarse_centers_to_exact_frames(self) -> None:
         class FakeEncoder:
@@ -379,6 +490,8 @@ class DirectVideoPreprocessTests(unittest.TestCase):
                 },
             ):
                 engine = DirectVideoRetrievalEngine(root, [video], encoder=FakeEncoder())
+                engine.ensure_result_image = lambda _result: None
+                engine.ensure_result_images = lambda _results: None
                 sequences = engine.search_trake(["prepare", "land"], top_videos=1)
 
             self.assertEqual(len(sequences), 1)
