@@ -124,6 +124,9 @@ Mọi lỗi nằm trong Flask API cũng trả JSON, không trả error page HTML
 | `AIC_DIRECT_PREPROCESSED_ROOT` | `/kaggle/working/aic_direct_preprocessed` | Root chứa PNG/NPY/OCR/Object đã dựng bằng `--pre-direct-video 1` |
 | `AIC_PRE_DIRECT_GPUS` | `auto` | GPU vật lý cho pre-direct; Kaggle T4x2 tự phát hiện `0,1` |
 | `AIC_PRE_DIRECT_WORKERS` | `0` | Số process pre-direct; `0` = một worker cho mỗi GPU đã chọn |
+| `AIC_WANDB_PROJECT` | `hcmaic-direct-preprocess` | W&B project nhận metric pre-direct |
+| `AIC_WANDB_RUN_ID` | tự sinh mỗi lệnh | Đặt cố định nếu muốn resume đúng W&B run sau khi session bị ngắt |
+| `AIC_WANDB_INIT_TIMEOUT` | `30` | Số giây tối đa chờ W&B init trước khi fallback về console-only |
 | `AIC_DIRECT_VIDEO_STRIDE` | `15` | Lấy một frame mỗi N frame khi tạo local index; nhỏ hơn tăng recall và startup |
 | `AIC_DIRECT_VIDEO_BATCH` | `64` | Batch ảnh tự encode CLIP khi precompute |
 | `AIC_DIRECT_VIDEO_MAX_SAMPLES` | `0` | Giới hạn sample/video để thử nhanh; `0` là không giới hạn |
@@ -192,7 +195,8 @@ finalize rồi thoát, không mở dashboard:
 # Shard đầu: video thứ 1 đến 25 (bao gồm cả hai đầu).
 python -u run.py --pre-direct-video 1 \
   --start-pre-video 1 --end-pre-video 25 \
-  --pre-direct-gpus 0,1 --pre-direct-workers 2
+  --pre-direct-gpus 0,1 --pre-direct-workers 2 \
+  --wandb-api-key "$WANDB_API_KEY"
 
 # Chạy tiếp shard khác trong cùng output root; video đã hoàn tất sẽ được resume/skip.
 python -u run.py --pre-direct-video 1 \
@@ -214,6 +218,20 @@ nhất global OCR/object index, nên hai worker không ghi đè nhau.
 Không chạy thủ công hai lệnh `run.py --pre-direct-video` đồng thời vào cùng một
 output root. Hãy dùng worker pool tích hợp ở trên. Nếu muốn ép một GPU để so
 sánh baseline, dùng `--pre-direct-gpus 0 --pre-direct-workers 1`.
+
+`--wandb-api-key KEY` bật theo dõi W&B. Nên lưu key bằng Kaggle Secret rồi đưa
+vào biến môi trường `WANDB_API_KEY`; không ghi trực tiếp key vào notebook hoặc
+Git. `run.py` không in key và chỉ chuyển nó cho subprocess qua environment.
+Visual, OCR và finalize dùng chung một run ID theo `resume="allow"`, nhưng tại
+mỗi thời điểm chỉ tiến trình cha của một stage ghi metric nên không có hai
+process ghi đồng thời cùng run. W&B nhận:
+
+- tiến độ video, GPU worker, số frame, skip/resume và thời gian thực thi;
+- breakdown visual theo PNG, CLIP và YOLO;
+- thời gian OCR và tổng số scene OCR/object sau finalize.
+
+Nếu thiếu key hoặc W&B lỗi mạng/timeout, pipeline chỉ cảnh báo rồi tiếp tục tạo
+artifact. Có thể đổi project/team bằng `AIC_WANDB_PROJECT` và `WANDB_ENTITY`.
 
 Mặc định mới là `--pre-direct-fps 0`: decode và tiền xử lý **mọi frame**. Tham
 số FPS vẫn được giữ để chạy thí nghiệm nhỏ, nhưng artifact đã bỏ frame sẽ không

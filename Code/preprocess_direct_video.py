@@ -64,6 +64,198 @@ class VideoArtifacts:
     complete_marker: Path
 
 
+class WandbPreprocessTracker:
+    """Parent-only W&B logger shared across sequential preprocessing stages."""
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        window: VideoWindow,
+        output_root: Path,
+        arguments: argparse.Namespace,
+        dataset_root: Path,
+        source_kind: str,
+    ) -> None:
+        self.stage = stage
+        self.total = len(window.videos)
+        self.completed = 0
+        self.skipped = 0
+        self.run: Any | None = None
+        self._logging_failed = False
+        enabled_default = "1" if os.environ.get("WANDB_API_KEY", "").strip() else "0"
+        if os.environ.get("AIC_WANDB_ENABLED", enabled_default).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return
+        if not os.environ.get("WANDB_API_KEY", "").strip() and os.environ.get(
+            "WANDB_MODE", "online"
+        ).strip().lower() not in {"offline", "disabled", "dryrun"}:
+            print("[wandb] Thiếu WANDB_API_KEY; tracking bị tắt.", file=sys.stderr, flush=True)
+            return
+        try:
+            import wandb  # type: ignore
+
+            tracking_dir = Path(
+                os.environ.get("AIC_WANDB_DIR", "/kaggle/working/aic_wandb")
+            ).expanduser()
+            tracking_dir.mkdir(parents=True, exist_ok=True)
+            run_id = os.environ.get("AIC_WANDB_RUN_ID", "").strip() or None
+            project = os.environ.get("AIC_WANDB_PROJECT", "hcmaic-direct-preprocess")
+            entity = os.environ.get("WANDB_ENTITY", "").strip() or None
+            settings = wandb.Settings(
+                console="off",
+                init_timeout=float(os.environ.get("AIC_WANDB_INIT_TIMEOUT", "30")),
+            )
+            self.run = wandb.init(
+                project=project,
+                entity=entity,
+                id=run_id,
+                resume="allow" if run_id else None,
+                name=os.environ.get("AIC_WANDB_NAME", "").strip() or None,
+                group=os.environ.get("AIC_WANDB_GROUP", "").strip() or None,
+                job_type="direct-preprocess",
+                tags=("aic2026", "direct-video", "multi-gpu"),
+                dir=str(tracking_dir),
+                settings=settings,
+                config={
+                    "schema": DIRECT_PREPROCESS_SCHEMA,
+                    "source_kind": source_kind,
+                    "dataset_root": str(dataset_root),
+                    "output_root": str(output_root),
+                    "start_video": window.start,
+                    "end_video": window.end,
+                    "corpus_videos": window.total,
+                    "selected_videos": len(window.videos),
+                    "sample_fps": arguments.sample_fps,
+                    "max_side": arguments.max_side,
+                    "gpus": arguments.gpus,
+                    "workers": arguments.workers,
+                    "clip_model": arguments.clip_model,
+                    "clip_batch": arguments.clip_batch,
+                    "object_model": arguments.object_model,
+                    "object_batch": arguments.object_batch,
+                    "object_confidence": arguments.object_confidence,
+                    "mask_clip_overlays": arguments.mask_clip_overlays,
+                    "ocr_language": arguments.ocr_language,
+                    "ocr_device": arguments.ocr_device,
+                    "ocr_min_confidence": arguments.ocr_min_confidence,
+                    "force": arguments.force,
+                },
+            )
+            if self.run is None:
+                raise RuntimeError("wandb.init không trả Run object")
+            url = str(getattr(self.run, "url", "") or "")
+            print(
+                f"[wandb] stage={stage} · run={getattr(self.run, 'id', run_id) or 'new'}"
+                + (f" · {url}" if url else ""),
+                flush=True,
+            )
+        except Exception as error:
+            self.run = None
+            print(
+                f"[wandb warning] Không khởi tạo được tracking: {self._safe_error(error)}. "
+                "Preprocessing vẫn tiếp tục.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    @staticmethod
+    def _safe_error(error: BaseException) -> str:
+        message = f"{type(error).__name__}: {error}"
+        api_key = os.environ.get("WANDB_API_KEY", "")
+        if api_key:
+            message = message.replace(api_key, "<hidden>")
+        return message[:500]
+
+    @property
+    def enabled(self) -> bool:
+        return self.run is not None and not self._logging_failed
+
+    def _log(self, metrics: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        try:
+            self.run.log(metrics)
+        except Exception as error:
+            self._logging_failed = True
+            print(
+                f"[wandb warning] Dừng gửi metric: {self._safe_error(error)}. "
+                "Preprocessing vẫn tiếp tục.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def log_video(self, result: dict[str, Any]) -> None:
+        self.completed += 1
+        was_skipped = bool(result.get("skipped"))
+        self.skipped += int(was_skipped)
+        stage = str(result.get("stage") or self.stage)
+        metrics: dict[str, Any] = {
+            "progress/stage": stage,
+            "progress/completed_videos": self.completed,
+            "progress/total_videos": self.total,
+            "progress/percent": 100.0 * self.completed / max(1, self.total),
+            "video/id": str(result.get("video_id") or ""),
+            "video/ordinal": int(result.get("ordinal") or 0),
+            "video/gpu_id": str(result.get("gpu_id") or ""),
+            "video/frames": int(result.get("frames") or 0),
+            "video/execution_seconds": float(result.get("seconds") or 0.0),
+            "video/skipped": int(was_skipped),
+        }
+        if not was_skipped:
+            timing_items = tuple(dict(result.get("timing_seconds") or {}).items())
+            for name, value in track(
+                timing_items,
+                desc=f"W&B timing {stage}",
+                total=len(timing_items),
+                unit="metric",
+                nested=True,
+            ):
+                try:
+                    metrics[f"{stage}/{name}_seconds"] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        self._log(metrics)
+
+    def log_manifest(self, manifest: dict[str, Any]) -> None:
+        metrics = {
+            "progress/stage": "finalize",
+            "finalize/visual_videos": int(manifest.get("visual_videos") or 0),
+            "finalize/all_frame_videos": int(manifest.get("all_frame_videos") or 0),
+            "finalize/complete_videos": int(manifest.get("complete_videos") or 0),
+            "finalize/ocr_records": int(manifest.get("ocr_records") or 0),
+            "finalize/object_records": int(manifest.get("object_records") or 0),
+        }
+        self._log(metrics)
+
+    def log_error(self, error: BaseException) -> None:
+        self._log(
+            {
+                "progress/stage": self.stage,
+                "error/type": type(error).__name__,
+                "error/message": self._safe_error(error),
+            }
+        )
+
+    def finish(self, exit_code: int) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.summary[f"{self.stage}_completed_videos"] = self.completed
+            self.run.summary[f"{self.stage}_skipped_videos"] = self.skipped
+            self.run.finish(exit_code=exit_code)
+        except Exception as error:
+            print(
+                f"[wandb warning] Không finish được run: {self._safe_error(error)}.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 def discover_gpu_ids() -> tuple[str, ...]:
     """Return CUDA devices visible to this Kaggle process."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
@@ -456,7 +648,7 @@ def preprocess_visual_video(
     )
     if marker_ready and saved_png_count == int(marker.get("sampled_frames") or -1):
         print(f"[skip] Visual {video_id}: {marker.get('sampled_frames', 0):,} frame đã hoàn tất.", flush=True)
-        return marker
+        return {**marker, "_execution_skipped": True}
     if marker_ready:
         print(
             f"[rebuild] Visual {video_id}: marker có {marker.get('sampled_frames', 0)} PNG "
@@ -688,13 +880,14 @@ def preprocess_visual_video(
         f"object {object_matrix.shape}",
         flush=True,
     )
-    return marker
+    return {**marker, "_execution_skipped": False}
 
 
 def run_visual_stage(
     window: VideoWindow,
     output_root: Path,
     arguments: argparse.Namespace,
+    tracker: WandbPreprocessTracker | None = None,
 ) -> None:
     available = discover_gpu_ids()
     gpu_ids = resolve_worker_gpu_ids(
@@ -711,6 +904,7 @@ def run_visual_stage(
         local_initializer=_initialize_visual_worker,
         pool_initializer=_visual_pool_initializer,
         task=_visual_worker_task,
+        tracker=tracker,
     )
 
 
@@ -805,16 +999,20 @@ def _visual_worker_task(ordinal: int, total: int, video_path_value: str) -> dict
     )
     return {
         "stage": "visual",
+        "ordinal": ordinal,
         "video_id": video_path.stem,
         "gpu_id": gpu_id,
         "frames": int(marker.get("sampled_frames") or 0),
         "seconds": time.perf_counter() - started,
+        "skipped": bool(marker.get("_execution_skipped")),
+        "timing_seconds": dict(marker.get("timing_seconds") or {}),
     }
 
 
 def _print_stage_result(result: dict[str, Any]) -> None:
+    state = "skip" if result.get("skipped") else "done"
     print(
-        f"[done] {result['stage']} {result['video_id']} · GPU {result['gpu_id']} · "
+        f"[{state}] {result['stage']} {result['video_id']} · GPU {result['gpu_id']} · "
         f"{int(result.get('frames') or 0):,} frame · {float(result['seconds']):.1f}s",
         flush=True,
     )
@@ -830,6 +1028,7 @@ def _run_gpu_stage(
     local_initializer: Any,
     pool_initializer: Any,
     task: Any,
+    tracker: WandbPreprocessTracker | None = None,
 ) -> list[dict[str, Any]]:
     """Run dynamically scheduled per-video jobs with one process per GPU."""
     stage_started = time.perf_counter()
@@ -861,6 +1060,8 @@ def _run_gpu_stage(
             result = task(*job)
             results.append(result)
             _print_stage_result(result)
+            if tracker is not None:
+                tracker.log_video(result)
         elapsed = time.perf_counter() - stage_started
         print(
             f"Direct {stage} hoàn tất {len(results)}/{len(jobs)} video trong {elapsed:.1f}s.",
@@ -907,6 +1108,8 @@ def _run_gpu_stage(
             result = future.result()
             results.append(result)
             _print_stage_result(result)
+            if tracker is not None:
+                tracker.log_video(result)
     except BaseException:
         for future in track(
             futures,
@@ -964,7 +1167,7 @@ def preprocess_ocr_video(
     if not force and marker_matches(artifacts.ocr_marker, expected, (artifacts.ocr,)):
         marker = read_json(artifacts.ocr_marker)
         print(f"[skip] OCR {video_id}: {marker.get('records', 0):,} record đã hoàn tất.", flush=True)
-        return marker
+        return {**marker, "_execution_skipped": True}
 
     mappings = read_jsonl(artifacts.mapping)
     temporary = _temporary_path(artifacts.ocr)
@@ -1033,13 +1236,14 @@ def preprocess_ocr_video(
         f"bỏ {overlay_lines:,} overlay line",
         flush=True,
     )
-    return marker
+    return {**marker, "_execution_skipped": False}
 
 
 def run_ocr_stage(
     window: VideoWindow,
     output_root: Path,
     arguments: argparse.Namespace,
+    tracker: WandbPreprocessTracker | None = None,
 ) -> None:
     available = discover_gpu_ids()
     gpu_ids = resolve_worker_gpu_ids(
@@ -1056,6 +1260,7 @@ def run_ocr_stage(
         local_initializer=_initialize_ocr_worker,
         pool_initializer=_ocr_pool_initializer,
         task=_ocr_worker_task,
+        tracker=tracker,
     )
 
 
@@ -1119,10 +1324,13 @@ def _ocr_worker_task(ordinal: int, total: int, video_path_value: str) -> dict[st
     )
     return {
         "stage": "ocr",
+        "ordinal": ordinal,
         "video_id": video_path.stem,
         "gpu_id": gpu_id,
         "frames": int(marker.get("records") or 0),
         "seconds": time.perf_counter() - started,
+        "skipped": bool(marker.get("_execution_skipped")),
+        "timing_seconds": dict(marker.get("timing_seconds") or {}),
     }
 
 
@@ -1328,12 +1536,28 @@ def main() -> None:
         f"video [{window.start}, {window.end}]/{window.total} · output={output_root}",
         flush=True,
     )
-    if arguments.stage == "visual":
-        run_visual_stage(window, output_root, arguments)
-    elif arguments.stage == "ocr":
-        run_ocr_stage(window, output_root, arguments)
-    else:
-        finalize_artifacts(window, output_root)
+    tracker = WandbPreprocessTracker(
+        stage=arguments.stage,
+        window=window,
+        output_root=output_root,
+        arguments=arguments,
+        dataset_root=dataset_root,
+        source_kind=source_kind,
+    )
+    exit_code = 1
+    try:
+        if arguments.stage == "visual":
+            run_visual_stage(window, output_root, arguments, tracker)
+        elif arguments.stage == "ocr":
+            run_ocr_stage(window, output_root, arguments, tracker)
+        else:
+            tracker.log_manifest(finalize_artifacts(window, output_root))
+        exit_code = 0
+    except BaseException as error:
+        tracker.log_error(error)
+        raise
+    finally:
+        tracker.finish(exit_code)
 
 
 if __name__ == "__main__":

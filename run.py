@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 from Code.ocr_regions import OCR_INDEX_SCHEMA_VERSION
@@ -63,6 +64,35 @@ STALE_MODULES = (
 def command(arguments: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(arguments), flush=True)
     subprocess.run(arguments, check=True, env=env)
+
+
+def build_wandb_preprocess_environment(arguments: argparse.Namespace) -> dict[str, str]:
+    """Build secret-safe W&B settings shared by sequential pre-direct stages."""
+    api_key = str(arguments.wandb_api_key or "").strip()
+    if not api_key:
+        return {"AIC_WANDB_ENABLED": "0"}
+    start = int(arguments.start_pre_video)
+    end_label = "end" if int(arguments.end_pre_video) == 0 else f"{int(arguments.end_pre_video):04d}"
+    run_name = os.environ.get("AIC_WANDB_NAME", f"pre-direct-{start:04d}-{end_label}")
+    run_id = os.environ.get("AIC_WANDB_RUN_ID", "").strip() or uuid.uuid4().hex
+    project = os.environ.get("AIC_WANDB_PROJECT", "hcmaic-direct-preprocess").strip()
+    if not project:
+        raise ValueError("AIC_WANDB_PROJECT không được rỗng khi bật W&B.")
+    environment = {
+        "AIC_WANDB_ENABLED": "1",
+        "AIC_WANDB_RUN_ID": run_id,
+        "AIC_WANDB_NAME": run_name,
+        "AIC_WANDB_PROJECT": project,
+        "AIC_WANDB_GROUP": os.environ.get("AIC_WANDB_GROUP", run_name),
+        "WANDB_API_KEY": api_key,
+        # Do not upload tqdm/stdout from two GPU workers; metrics are logged by
+        # the stage parent in deterministic completion order.
+        "WANDB_CONSOLE": os.environ.get("WANDB_CONSOLE", "off"),
+    }
+    entity = os.environ.get("WANDB_ENTITY", "").strip()
+    if entity:
+        environment["WANDB_ENTITY"] = entity
+    return environment
 
 
 def update_source(skip_update: bool) -> None:
@@ -379,6 +409,12 @@ def parse_arguments() -> argparse.Namespace:
         help="Số GPU worker; 0 = một worker/GPU đã chọn",
     )
     parser.add_argument(
+        "--wandb-api-key",
+        default=os.environ.get("WANDB_API_KEY", ""),
+        metavar="KEY",
+        help="Bật W&B cho pre-direct bằng API key; key không được in ra log",
+    )
+    parser.add_argument(
         "--direct-frame-steps",
         default=os.environ.get("AIC_DIRECT_FRAME_STEPS", "4,2,1"),
         metavar="STEPS",
@@ -589,6 +625,9 @@ def main() -> None:
         )
 
     if pre_direct_enabled:
+        wandb_environment = build_wandb_preprocess_environment(arguments)
+        preprocess_environment = os.environ.copy()
+        preprocess_environment.update(wandb_environment)
         common = [
             sys.executable,
             str(CODE / "preprocess_direct_video.py"),
@@ -619,19 +658,29 @@ def main() -> None:
             f"workers={arguments.pre_direct_workers or 'auto'}.",
             flush=True,
         )
+        if wandb_environment["AIC_WANDB_ENABLED"] == "1":
+            print(
+                "W&B tracking đã bật: "
+                f"project={wandb_environment['AIC_WANDB_PROJECT']} · "
+                f"run={wandb_environment['AIC_WANDB_RUN_ID']} · API key=<hidden>.",
+                flush=True,
+            )
+        else:
+            print("W&B tracking: tắt (không có --wandb-api-key).", flush=True)
         print(
             f"Direct preprocess 1/3 ({frame_plan}): cắt PNG, CLIP embedding và YOLO object…",
             flush=True,
         )
-        command([*common, "--stage", "visual"])
+        command([*common, "--stage", "visual"], env=preprocess_environment)
         print("Direct preprocess 2/3: PaddleOCR scene-text, loại TV overlay…", flush=True)
         ocr_env = ensure_paddle_ocr_packages()
+        ocr_env.update(wandb_environment)
         command(
             [*common, "--stage", "ocr", "--ocr-device", arguments.ocr_device],
             env=ocr_env,
         )
         print("Direct preprocess 3/3: hợp nhất manifest/OCR/object index…", flush=True)
-        command([*common, "--stage", "finalize"])
+        command([*common, "--stage", "finalize"], env=preprocess_environment)
         print(
             f"Pre-direct-video hoàn tất đoạn [{arguments.start_pre_video}, "
             f"{arguments.end_pre_video or 'cuối'}] → {arguments.pre_direct_output.expanduser()}",

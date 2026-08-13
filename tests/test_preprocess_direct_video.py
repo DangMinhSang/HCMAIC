@@ -113,6 +113,14 @@ class DirectVideoPreprocessTests(unittest.TestCase):
             resolve_worker_gpu_ids("0,1", 2, discovered=("0",))
 
     def test_gpu_pool_dynamically_uses_both_workers(self) -> None:
+        class ParentTracker:
+            def __init__(self) -> None:
+                self.results = []
+
+            def log_video(self, result) -> None:
+                self.results.append(result)
+
+        tracker = ParentTracker()
         with tempfile.TemporaryDirectory() as temporary:
             videos = tuple(Path(temporary) / f"L21_V{index:03d}.mp4" for index in range(1, 9))
             window = VideoWindow(videos, 1, len(videos), len(videos))
@@ -125,11 +133,13 @@ class DirectVideoPreprocessTests(unittest.TestCase):
                 local_initializer=_initialize_fake_worker,
                 pool_initializer=_initialize_fake_pool_worker,
                 task=_run_fake_video,
+                tracker=tracker,
             )
 
         self.assertEqual(len(results), len(videos))
         self.assertEqual({result["gpu_id"] for result in results}, {"0", "1"})
         self.assertEqual({result["video_id"] for result in results}, {path.stem for path in videos})
+        self.assertEqual(tracker.results, results)
 
     def test_visual_worker_maps_physical_gpu_to_logical_zero(self) -> None:
         created = {}

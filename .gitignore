@@ -9,6 +9,8 @@ datasets/
 input/
 aic_ocr_index.jsonl
 aic_direct_preprocessed/
+wandb/
+.wandb/
 
 # Runtime/model caches
 .cache/
